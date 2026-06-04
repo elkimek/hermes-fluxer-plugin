@@ -1,0 +1,22 @@
+[project]
+name = "hermes-fluxer-plugin"
+version = "0.1.0"
+description = "Fluxer platform plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "Elkim" }
+]
+dependencies = [
+  "httpx>=0.24",
+  "websockets>=11",
+]
+
+[project.urls]
+Homepage = "https://github.com/elkimek/hermes-fluxer-plugin"
+Hermes = "https://hermes-agent.nousresearch.com/docs"
+Fluxer = "https://fluxer.app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
