@@ -4,6 +4,8 @@ Fluxer support for [Hermes Agent](https://hermes-agent.nousresearch.com/docs), p
 
 This repository lets a Hermes installation talk to Fluxer through Fluxer's bot API: Hermes can receive Fluxer gateway events, decide whether a message should wake the agent, and send replies back to Fluxer channels or DMs. You can install it without waiting for Fluxer support to land in Hermes core.
 
+If you are a human setting this up, start with **Quick start**. If you are handing the repo to an AI agent, point it at [`INSTALL_FOR_AGENTS.md`](INSTALL_FOR_AGENTS.md) first.
+
 ## What is Fluxer?
 
 Fluxer is a chat platform with Discord-like concepts: users, guilds or communities, channels, direct messages, message reactions, gateway events, and bot/application tokens. It can be used as a hosted service or as a self-hosted chat surface, depending on your deployment.
@@ -12,7 +14,7 @@ For Hermes users, Fluxer is another place where the agent can live. Once configu
 
 ## What this repo provides
 
-This repo is not Fluxer itself and it is not a full Hermes fork. It is the adapter layer between the two systems.
+This repo is not Fluxer itself and it is not a full Hermes fork. It is the adapter layer between the two systems. It does not create a Fluxer bot for you, provide a token, or know your Fluxer user/channel IDs; those come from your own Fluxer deployment.
 
 | File | Purpose |
 | --- | --- |
@@ -21,6 +23,8 @@ This repo is not Fluxer itself and it is not a full Hermes fork. It is the adapt
 | `__init__.py` | Registration shim loaded by Hermes when the plugin is enabled. |
 | `pyproject.toml` | Python package metadata and runtime dependencies. |
 | `after-install.md` | Short post-install checklist shown after plugin installation. |
+| `AGENTS.md` | Safety and execution contract for AI agents working in this repo. |
+| `INSTALL_FOR_AGENTS.md` | Short install/configure/verify runbook for agents helping users set Fluxer up. |
 | `tests/` | Source-level package and regression tests for the adapter and manifest. |
 
 ## Mental model
@@ -75,6 +79,20 @@ Deployment-dependent / best-effort:
 
 If a deployment does not support native commands or components, Hermes approval prompts still include visible text and reaction fallback paths so the user is not trapped.
 
+
+## Before you start
+
+You need four things:
+
+1. **Hermes CLI installed** on the machine where the gateway runs.
+2. **A Fluxer bot/application token** in `<applicationId>.<secret>` form.
+3. **At least one Fluxer user ID** to allow. The plugin is deny-by-default.
+4. Optional but useful: **a Fluxer channel or DM ID** for `FLUXER_HOME_CHANNEL`, so Hermes has a default place for notifications and cron-job output.
+
+For self-hosted Fluxer, also know your HTTP base URL and, if gateway discovery is not available, the WebSocket gateway URL.
+
+If you do not know the IDs yet, do not guess. Use your Fluxer UI/admin tooling/API, or temporarily use `FLUXER_ALLOW_ALL_USERS=true` only in a local/dev space long enough to identify the right IDs, then switch back to `FLUXER_ALLOWED_USERS`.
+
 ## Safety defaults
 
 The important bit: **Fluxer users are deny-by-default.**
@@ -103,7 +121,7 @@ That means channel messages need a bot mention or direct-address pattern unless 
 
 ### 1. Install the plugin
 
-After this repository's plugin branch is on `main`:
+Install from GitHub:
 
 ```bash
 hermes plugins install elkimek/hermes-fluxer-plugin --enable
@@ -120,13 +138,15 @@ hermes plugins enable fluxer-platform
 
 ### 2. Enable the Fluxer platform
 
+The install command enables the plugin package. This setting enables the actual Fluxer platform adapter:
+
 ```bash
 hermes config set platforms.fluxer.enabled true
 ```
 
 ### 3. Add Fluxer credentials
 
-Put your token in `~/.hermes/.env`:
+Put your token in `~/.hermes/.env`. Append to the file; do not replace an existing `.env` wholesale:
 
 ```bash
 FLUXER_BOT_TOKEN=your_application_id.your_secret
@@ -180,6 +200,19 @@ send_message(target="fluxer", message="Fluxer home delivery works.")
 ```
 
 Then test inbound by sending a Fluxer message from an allowed user. In a group/channel, mention the bot unless you configured free-response behavior.
+
+## Hand this repo to an agent
+
+This README is written for humans, but the repo also includes an agent runbook:
+
+- [`AGENTS.md`](AGENTS.md) — execution contract and safety boundaries for AI agents working in this repo.
+- [`INSTALL_FOR_AGENTS.md`](INSTALL_FOR_AGENTS.md) — short install/configure/verify checklist for a Hermes agent helping a user set Fluxer up.
+
+Useful instruction to paste to an agent:
+
+```text
+Install elkimek/hermes-fluxer-plugin into my Hermes setup. Read INSTALL_FOR_AGENTS.md first. Do not print or overwrite secrets. Do not replace my existing ~/.hermes/.env or config.yaml. Ask me for the Fluxer bot token, allowed user IDs, and optional home channel ID if they are missing. Restart the Hermes gateway only after telling me what will change. Verify with hermes plugins list, hermes config get platforms.fluxer.enabled, and a test send_message call.
+```
 
 ## Configuration reference
 
@@ -236,11 +269,17 @@ By default Hermes should not jump into every group conversation. Useful knobs:
 | `FLUXER_STRICT_MENTION` | `false` | Require a fresh mention on every channel message instead of remembering mentioned threads. |
 | `FLUXER_FREE_RESPONSE_CHANNELS` | empty | Channels where Hermes may respond without a mention. |
 | `FLUXER_MENTION_PATTERNS` | empty | Extra comma-separated regexes that count as bot mentions/direct address patterns. |
+| `FLUXER_HOME_GUILD_ID` / `FLUXER_HOME_GUILDS` | empty | One or more trusted guild/community IDs used with `FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD`. |
 
 For a trusted home guild/community where Hermes may respond naturally:
 
 ```bash
+# one home guild/community
 FLUXER_HOME_GUILD_ID=guild_id
+
+# or several home guilds/communities
+FLUXER_HOME_GUILDS=guild_id_1,guild_id_2
+
 FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD=true
 FLUXER_MENTION_GATED_CHANNELS=channel_id_that_still_requires_mention
 ```
@@ -326,7 +365,7 @@ Expected: `true`.
 
 ### Bot connects but never responds
 
-Most common cause: no allowed users are configured.
+Most common cause: no allowed users are configured, or the message is in a group/channel and does not mention the bot.
 
 Set one:
 

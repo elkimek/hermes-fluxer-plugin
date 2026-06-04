@@ -10,7 +10,7 @@ hermes config set platforms.fluxer.enabled true
 
 ## 2. Add your bot token
 
-Add this to `~/.hermes/.env`:
+Append this to `~/.hermes/.env`. Do not replace an existing `.env` file wholesale:
 
 ```bash
 FLUXER_BOT_TOKEN=your_application_id.your_secret
