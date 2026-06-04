@@ -1,8 +1,8 @@
 # Hermes Fluxer Plugin
 
-Fluxer support for [Hermes Agent](https://hermes-agent.nousresearch.com/docs), packaged as a standalone community plugin.
+Fluxer support for [Hermes Agent](https://hermes-agent.nousresearch.com/docs), packaged as a standalone community plugin for [Fluxer](https://fluxer.app).
 
-This repository lets a Hermes installation talk to Fluxer through Fluxer's bot API: Hermes can receive Fluxer gateway events, decide whether a message should wake the agent, and send replies back to Fluxer channels or DMs. You can install it without waiting for Fluxer support to land in Hermes core.
+This repository lets a Hermes installation talk to [Fluxer](https://fluxer.app) through Fluxer's bot API: Hermes can receive Fluxer gateway events, decide whether a message should wake the agent, and send replies back to Fluxer channels or DMs. You can install it without waiting for Fluxer support to land in Hermes core.
 
 If you are a human setting this up, start with **Quick start**. If you are handing the repo to an AI agent, point it at [`INSTALL_FOR_AGENTS.md`](INSTALL_FOR_AGENTS.md) first.
 
