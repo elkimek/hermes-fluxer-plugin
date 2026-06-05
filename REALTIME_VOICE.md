@@ -73,7 +73,7 @@ Status: implemented in this repo.
 
 ### Phase 3 — LiveKit smoke bridge
 
-Status: audible smoke verified against hosted Fluxer on 2026-06-05.
+Status: TTS clip publishing verified against hosted Fluxer on 2026-06-05.
 
 - Added `livekit_bridge.py`, a minimal transport-only smoke bridge that can connect to the Fluxer LiveKit room from a raw `VOICE_SERVER_UPDATE` payload and disconnect cleanly.
 - The bridge uses the ephemeral token only as the local `Room.connect(endpoint, token, ...)` argument; it never stores, returns, or logs the token.
@@ -81,7 +81,8 @@ Status: audible smoke verified against hosted Fluxer on 2026-06-05.
 - Added `scripts/fluxer_livekit_smoke.py` to run real probes against a configured Fluxer voice channel; it joins muted/deaf by default, can publish a short low-amplitude sine tone, prints only safe metadata, then leaves.
 - Verified the smoke probe against hosted Fluxer: the bot received a sanitized `VOICE_SERVER_UPDATE`, connected to `wss://*.fluxer.media`, entered `guild_..._channel_...` with a LiveKit participant identity, then left cleanly. Token presence was reported only as `has_token: true`.
 - Verified audible publishing against hosted Fluxer: the probe joined unmuted/deaf, published a short low-amplitude test tone with `tone_published: true`, then disconnected.
-- Next: publish a short TTS clip into the room, then subscribe to allowed user audio.
+- Added mono 16-bit PCM WAV publishing and verified a generated Žofka TTS clip against hosted Fluxer with `wav_published: true`.
+- Next: subscribe to allowed user audio and feed it into a realtime/STT backend.
 
 ### Phase 4 — real-time Žofka loop
 

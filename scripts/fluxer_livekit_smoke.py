@@ -63,6 +63,8 @@ async def run(args: argparse.Namespace) -> int:
                     frequency_hz=args.tone_hz,
                     amplitude=args.tone_amplitude,
                 )
+            if args.wav_path:
+                await bridge.publish_wav_file(args.wav_path)
             result["safe_update"] = safe_update
             result["connection"] = {
                 "endpoint": info.endpoint,
@@ -72,6 +74,7 @@ async def run(args: argparse.Namespace) -> int:
                 "room_name": info.room_name,
                 "participant_identity": info.participant_identity,
                 "tone_published": args.tone_seconds > 0,
+                "wav_published": bool(args.wav_path),
             }
             connected.set()
         except Exception as exc:  # token intentionally not included
@@ -122,6 +125,7 @@ def main() -> int:
     parser.add_argument("--tone-seconds", type=float, default=0.0, help="Publish a short sine tone after joining; 0 disables audio publishing")
     parser.add_argument("--tone-hz", type=float, default=440.0, help="Sine tone frequency for --tone-seconds")
     parser.add_argument("--tone-amplitude", type=float, default=0.18, help="Sine tone amplitude, 0.0-1.0")
+    parser.add_argument("--wav-path", help="Publish a mono 16-bit PCM WAV clip after joining")
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 

@@ -20,6 +20,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Added a muted/deaf `scripts/fluxer_livekit_smoke.py` probe for the first real Fluxer voice-room presence test.
 - Verified the presence-only LiveKit smoke path against hosted Fluxer without logging or storing the ephemeral token.
 - Added and verified low-amplitude sine-tone publishing to hosted Fluxer LiveKit for the first audible bot smoke path.
+- Added mono 16-bit PCM WAV publishing and verified a generated Žofka TTS clip through hosted Fluxer LiveKit.
 
 ## [0.1.1] - 2026-06-05
 

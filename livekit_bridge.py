@@ -12,7 +12,9 @@ import asyncio
 import inspect
 import logging
 import math
+import wave
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
 logger = logging.getLogger(__name__)
@@ -214,6 +216,49 @@ class FluxerLiveKitSmokeBridge:
         close = getattr(source, "aclose", None)
         if close is not None:
             await _maybe_await(close())
+
+    async def publish_wav_file(
+        self,
+        wav_path: str | Path,
+        *,
+        frame_ms: int = 20,
+        track_name: str = "zofka-tts-smoke",
+    ) -> None:
+        """Publish a mono 16-bit PCM WAV file into the connected LiveKit room."""
+
+        if self._room is None:
+            raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
+        if frame_ms <= 0:
+            raise ValueError("frame_ms must be positive")
+
+        path = Path(wav_path)
+        with wave.open(str(path), "rb") as wav:
+            channels = wav.getnchannels()
+            sample_width = wav.getsampwidth()
+            sample_rate = wav.getframerate()
+            if channels != 1 or sample_width != 2:
+                raise ValueError("publish_wav_file requires mono 16-bit PCM WAV input")
+
+            rtc = _load_livekit_audio_helpers()
+            source = rtc.AudioSource(sample_rate, 1)
+            track = rtc.LocalAudioTrack.create_audio_track(track_name, source)
+            options = rtc.TrackPublishOptions()
+            options.source = rtc.TrackSource.SOURCE_MICROPHONE
+            publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
+            logger.info("Fluxer LiveKit smoke bridge published WAV track sid=%s", getattr(publication, "sid", "<none>"))
+
+            frame_samples = max(1, sample_rate * frame_ms // 1000)
+            while True:
+                pcm = wav.readframes(frame_samples)
+                if not pcm:
+                    break
+                samples = len(pcm) // 2
+                frame = rtc.AudioFrame(pcm, sample_rate, 1, samples)
+                await _maybe_await(source.capture_frame(frame))
+            await _maybe_await(source.wait_for_playout())
+            close = getattr(source, "aclose", None)
+            if close is not None:
+                await _maybe_await(close())
 
     async def disconnect(self) -> None:
         room = self._room

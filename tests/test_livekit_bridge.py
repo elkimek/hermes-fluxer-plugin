@@ -176,3 +176,46 @@ async def test_publish_test_tone_requires_connected_room():
 
     with pytest.raises(RuntimeError, match="not connected"):
         await bridge.publish_test_tone()
+
+@pytest.mark.asyncio
+async def test_publish_wav_file_publishes_pcm_audio_frames(monkeypatch, tmp_path):
+    import wave
+
+    FakeAudioSource.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FakeRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+    wav_path = tmp_path / "zofka.wav"
+    with wave.open(str(wav_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(1000)
+        wav.writeframes(b"\x00\x00" * 40)
+
+    await bridge.publish_wav_file(wav_path, frame_ms=20)
+
+    source = FakeAudioSource.instances[0]
+    assert room.local_participant.published[0][0] == {"name": "zofka-tts-smoke", "source": source}
+    assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
+    assert source.waited is True
+    assert source.closed is True
+
+
+@pytest.mark.asyncio
+async def test_publish_wav_file_rejects_non_mono_pcm(monkeypatch, tmp_path):
+    import wave
+
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FakeRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+    wav_path = tmp_path / "stereo.wav"
+    with wave.open(str(wav_path), "wb") as wav:
+        wav.setnchannels(2)
+        wav.setsampwidth(2)
+        wav.setframerate(1000)
+        wav.writeframes(b"\x00\x00" * 80)
+
+    with pytest.raises(ValueError, match="mono 16-bit PCM"):
+        await bridge.publish_wav_file(wav_path)
