@@ -50,11 +50,11 @@ def test_safe_stt_summary_drops_extra_provider_payload():
     }
 
 
-def test_parse_args_defaults_to_fast_local_stt_and_fixed_capture():
+def test_parse_args_defaults_to_accurate_local_stt_and_fixed_capture():
     args = parse_args(["--channel-id", "voice-room"])
 
     assert args.stt_provider == "local"
-    assert args.stt_model == "tiny.en"
+    assert args.stt_model == "medium.en"
     assert args.capture_mode == "fixed"
     assert args.capture_window_seconds == 3.0
     assert args.silence_ms == 500

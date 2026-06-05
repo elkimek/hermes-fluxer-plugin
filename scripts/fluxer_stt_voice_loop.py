@@ -294,7 +294,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-segment-seconds", type=float, default=6.0)
     parser.add_argument("--voice", default="eve")
     parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai"), default="local")
-    parser.add_argument("--stt-model", default="tiny.en", help="STT model; local default tiny.en, Groq default whisper-large-v3-turbo")
+    parser.add_argument("--stt-model", default="medium.en", help="STT model; local default medium.en for accuracy, Groq default whisper-large-v3-turbo")
     parser.add_argument("--xai-timeout", type=float, default=45.0)
     parser.add_argument("--xai-first-audio-timeout", type=float, default=12.0)
     parser.add_argument("--connect-timeout", type=float, default=30.0)
