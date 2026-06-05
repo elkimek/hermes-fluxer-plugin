@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+import os
+import wave
+
+from scripts.fluxer_stt_voice_loop import build_answer_prompt, load_env_file, safe_stt_summary, write_pcm16_wav
+
+
+def test_build_answer_prompt_grounds_latest_transcript_and_history():
+    prompt = build_answer_prompt(
+        "Shevka, what is two past two?",
+        history=[{"user": "hello", "assistant": "Hi."}],
+    )
+
+    assert "Latest STT transcript from Elkim: 'Shevka, what is two past two?'" in prompt
+    assert "Elkim: hello" in prompt
+    assert "Žofka: Hi." in prompt
+    assert "past" in prompt and "plus" in prompt
+    assert "No filler greetings" in prompt
+
+
+def test_safe_stt_summary_drops_extra_provider_payload():
+    summary = safe_stt_summary(
+        {
+            "success": True,
+            "transcript": "hello",
+            "provider": "local",
+            "model": "medium.en",
+            "error": None,
+            "raw": {"large": "payload"},
+        }
+    )
+
+    assert summary == {
+        "success": True,
+        "transcript": "hello",
+        "provider": "local",
+        "model": "medium.en",
+        "error": None,
+    }
+
+
+def test_write_pcm16_wav_roundtrip(tmp_path):
+    path = tmp_path / "voice.wav"
+    write_pcm16_wav(path, b"\x01\x00\x02\x00", sample_rate=24_000)
+
+    with wave.open(str(path), "rb") as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        assert wav.getframerate() == 24_000
+        assert wav.readframes(2) == b"\x01\x00\x02\x00"
+
+
+def test_load_env_file_does_not_override_existing_or_shell_source(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("KEEP=from_file\nNEW_VALUE='ok'\nBAD LINE WITHOUT EQUALS\n", encoding="utf-8")
+    monkeypatch.setenv("KEEP", "existing")
+    monkeypatch.delenv("NEW_VALUE", raising=False)
+
+    load_env_file(env_file)
+
+    assert os.environ["KEEP"] == "existing"
+    assert os.environ["NEW_VALUE"] == "ok"
