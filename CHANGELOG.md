@@ -38,6 +38,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Reduced STT-backed loop latency by shortening the reliable fixed capture window to 3s and streaming text-grounded xAI voice deltas directly into LiveKit instead of waiting for a full WAV before publishing; after live Groq/xAI tests proved fast but less accurate on Fluxer room captures, the default STT was restored to local `medium.en` for accuracy, with `--stt-provider groq|xai` still available as explicit overrides.
 - Added LiveKit participant-identity-prefix filtering so realtime capture can target Elkim's Fluxer user track (`user_<id>_*`) instead of listening to every remote audio source; targeted fixed-window STT verified the captured prompt as "Shevka, what is two past two?" while the unfiltered/VAD path produced generic/empty understanding.
 - Added explicit `--stt-provider elevenlabs` support for ElevenLabs Scribe (`scribe_v2`) alongside local/Groq/xAI STT; live test was very fast (~0.86s STT) but misheard the Fluxer room capture as "Asia FC", confirming provider swaps are not enough and the next focus should be LiveKit capture timing/quality.
+- Hardened the STT-backed loop against non-spoken recalled-context wrappers by stripping `<memory-context>` and `[System note: ...]` blocks before prompting Hermes or writing safe turn summaries; this keeps live voice answers focused on what Elkim actually said.
 
 ## [0.1.1] - 2026-06-05
 
