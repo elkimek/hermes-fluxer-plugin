@@ -34,7 +34,7 @@ Append missing keys to `~/.hermes/.env`. Do not replace the file.
 Minimum live configuration:
 
 ```bash
-FLUXER_BOT_TOKEN=your_application_id.your_secret
+FLUXER_BOT_TOKEN=<fluxer-bot-token>
 FLUXER_ALLOWED_USERS=your_fluxer_user_id
 ```
 
