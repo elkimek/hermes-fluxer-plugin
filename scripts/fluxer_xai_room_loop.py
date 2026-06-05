@@ -385,11 +385,12 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 track_name=f"zofka-xai-room-loop-{turn_no}",
             )
             await publisher.__aenter__()
-            if not args.disable_barge_in:
+            arm_barge_after_first_audio = bool(getattr(args, "barge_in_after_first_audio_only", False))
+            if not args.disable_barge_in and not arm_barge_after_first_audio:
                 barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
 
             async def publish_delta(chunk: bytes) -> None:
-                nonlocal first_audio_seconds, barge_in_seconds
+                nonlocal first_audio_seconds, barge_in_seconds, barge_in_task
                 assert publisher is not None
 
                 async def should_interrupt() -> bool:
@@ -404,6 +405,8 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     raise BargeInInterrupt("user interrupted assistant speech")
                 if first_audio_seconds is None:
                     first_audio_seconds = time.monotonic() - xai_started
+                    if arm_barge_after_first_audio and not args.disable_barge_in and barge_in_task is None:
+                        barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
                 write_interruptible = getattr(publisher, "write_interruptible", None)
                 if write_interruptible is not None:
                     interrupted = await write_interruptible(chunk, should_interrupt)
@@ -422,7 +425,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     )
                 )
                 barge_event_task: asyncio.Task[Any] | None = None
-                if not args.disable_barge_in:
+                if not args.disable_barge_in and not arm_barge_after_first_audio:
                     barge_event_task = asyncio.create_task(barge_in_capture.event.wait())
                 try:
                     if barge_event_task is None:
@@ -805,6 +808,7 @@ def main() -> int:
     parser.add_argument("--wake-gate-instructions", default=WAKE_GATE_INSTRUCTIONS)
     parser.add_argument("--disable-wake-gate", action="store_true", help="Answer every captured speech segment")
     parser.add_argument("--disable-barge-in", action="store_true", help="Do not monitor for user interruption while assistant audio is streaming")
+    parser.add_argument("--barge-in-after-first-audio-only", action="store_true", help="Test mode: arm barge-in only after first assistant audio so the initial user utterance tail cannot cancel before playback")
     parser.add_argument("--barge-in-energy-threshold", type=int, default=700)
     parser.add_argument("--barge-in-min-ms", type=int, default=240)
     parser.add_argument("--barge-in-capture-timeout", type=float, default=2.0, help="How long to wait for the interrupting utterance to finish so it can become the next prompt")
