@@ -33,8 +33,11 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Verification
 
-- `PYTHONPATH=. python -m py_compile adapter.py tests/test_plugin_package.py`
-- `PYTHONPATH=. pytest -q` → 20 passed
+- `python -m pytest -q` → 25 passed
+- `python -m compileall -q .`
+- `python -m ruff check .`
+- `git diff --check`
+- Strict secret-shape scan → 0 hits
 - Live Fluxer smoke test: a post-restart Fluxer voice message was transcribed and delivered into the Hermes prompt.
 
 ## [0.1.0] - 2026-06-04
