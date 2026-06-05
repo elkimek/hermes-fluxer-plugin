@@ -539,6 +539,9 @@ def test_continuous_room_loop_script_has_noise_and_language_guardrails():
     assert "BargeInInterrupt" in source
     assert "--disable-barge-in" in source
     assert "barge_in_min_ms" in source
+    assert "--diagnose-barge-in" in source
+    assert "barge probe chunk" in source
+    assert "xAI response/publish failed for turn %s: %s: %s" in source
 
 
 def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():

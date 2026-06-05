@@ -31,6 +31,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Added and live-verified barge-in interruption: sustained user speech during assistant output clears the LiveKit audio queue, stops further xAI delta publishing, records an interrupted turn, and resumes listening.
 - Added barge-in carryover: the interrupting utterance is captured as short-lived PCM, surfaced only as byte/duration diagnostics, and fed directly into the next xAI turn so Elkim does not need to repeat the interruption after Žofka stops.
 - Hardened barge-in interruption after live testing showed assistant speech could continue: streamed xAI deltas are now checked between 20ms LiveKit frames, and interrupt stops/unpublishes the local LiveKit track in addition to clearing the audio queue.
+- Added `--diagnose-barge-in`, a silent LiveKit-only probe that keeps a local output track active while measuring remote mic RMS/detection, plus richer xAI failure messages for first-audio latency/debugging.
 
 ## [0.1.1] - 2026-06-05
 

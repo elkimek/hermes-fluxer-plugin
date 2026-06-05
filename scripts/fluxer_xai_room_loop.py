@@ -418,14 +418,15 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 break
             continue
         except Exception as exc:
-            logger.warning("xAI response/publish failed for turn %s: %s", turn_no, type(exc).__name__)
+            error_text = str(exc) or repr(exc)
+            logger.warning("xAI response/publish failed for turn %s: %s: %s", turn_no, type(exc).__name__, error_text)
             turns.append(
                 {
                     "turn": turn_no,
                     "captured_pcm_bytes": len(pcm),
                     "gate_transcript": gate_transcript,
                     "published": False,
-                    "error": f"{type(exc).__name__}: response failed",
+                    "error": f"{type(exc).__name__}: {error_text}",
                     "from_barge_in_carryover": from_barge_in_carryover,
                     "timing": {
                         "capture_seconds": round(capture_seconds, 3),
@@ -463,6 +464,99 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
             break
     return {"turns": turns, "turn_count": len(turns)}
+
+
+async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmokeBridge) -> dict[str, Any]:
+    """Probe whether remote user audio is received while a local LiveKit track is active."""
+
+    started = time.monotonic()
+    chunks = bridge.iter_remote_audio_pcm16(
+        sample_rate=args.sample_rate,
+        frame_size_ms=args.frame_ms,
+        participant_identity=args.participant_identity,
+    )
+    publisher = bridge.pcm16_publisher(
+        sample_rate=args.sample_rate,
+        frame_ms=args.frame_ms,
+        track_name="zofka-barge-diagnostic-silence",
+    )
+    frame_samples = max(1, args.sample_rate * args.frame_ms // 1000)
+    silence_frame = b"\x00\x00" * frame_samples
+    max_rms = 0
+    voiced_ms = 0
+    chunks_seen = 0
+    detected_at: float | None = None
+    first_chunk_at: float | None = None
+
+    async def publish_silence() -> None:
+        await publisher.__aenter__()
+        end_at = time.monotonic() + args.diagnose_seconds
+        while time.monotonic() < end_at and detected_at is None:
+            await publisher.write(silence_frame)
+            await asyncio.sleep(args.frame_ms / 1000)
+
+    publish_task = asyncio.create_task(publish_silence())
+    iterator = chunks.__aiter__()
+    try:
+        while True:
+            remaining = args.diagnose_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            try:
+                chunk = await asyncio.wait_for(anext(iterator), timeout=min(1.0, remaining))
+            except TimeoutError:
+                continue
+            except StopAsyncIteration:
+                break
+            now = time.monotonic()
+            if first_chunk_at is None:
+                first_chunk_at = now - started
+            chunks_seen += 1
+            rms = _pcm16_rms(chunk)
+            max_rms = max(max_rms, rms)
+            if rms >= args.barge_in_energy_threshold:
+                voiced_ms += args.frame_ms
+            else:
+                voiced_ms = 0
+            logger.info(
+                "barge probe chunk=%s rms=%s max_rms=%s voiced_ms=%s threshold=%s",
+                chunks_seen,
+                rms,
+                max_rms,
+                voiced_ms,
+                args.barge_in_energy_threshold,
+            )
+            if voiced_ms >= args.barge_in_min_ms:
+                detected_at = now - started
+                await publisher.interrupt()
+                break
+            if now - started >= args.diagnose_seconds:
+                break
+    finally:
+        close_chunks = getattr(chunks, "aclose", None)
+        if close_chunks is not None:
+            await close_chunks()
+        publish_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await publish_task
+        if not getattr(publisher, "interrupted", False):
+            await publisher.close(wait_for_playout=False, flush_remainder=False)
+
+    return {
+        "mode": "barge_in_diagnostic",
+        "diagnose_seconds": args.diagnose_seconds,
+        "sample_rate": args.sample_rate,
+        "frame_ms": args.frame_ms,
+        "threshold": args.barge_in_energy_threshold,
+        "min_ms": args.barge_in_min_ms,
+        "chunks_seen": chunks_seen,
+        "first_chunk_seconds": round(first_chunk_at, 3) if first_chunk_at is not None else None,
+        "max_rms": max_rms,
+        "detected": detected_at is not None,
+        "detected_seconds": round(detected_at, 3) if detected_at is not None else None,
+        "publisher_interrupted": getattr(publisher, "interrupted", False),
+        "bytes_published": getattr(publisher, "bytes_published", 0),
+    }
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -532,6 +626,11 @@ async def run(args: argparse.Namespace) -> int:
         if result.get("error"):
             print(json.dumps(result, indent=2, sort_keys=True))
             return 1
+        if args.diagnose_barge_in:
+            diagnostic_result = await asyncio.wait_for(_diagnose_barge_in(args, bridge), timeout=args.diagnose_seconds + 30)
+            result.update(diagnostic_result)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if diagnostic_result.get("detected") else 1
         loop_result = await asyncio.wait_for(_conversation_loop(args, bridge), timeout=args.max_runtime_seconds + 30)
         result.update(loop_result)
         result["published_turn_count"] = sum(1 for turn in result.get("turns", []) if turn.get("published"))
@@ -575,6 +674,8 @@ def main() -> int:
     parser.add_argument("--barge-in-energy-threshold", type=int, default=700)
     parser.add_argument("--barge-in-min-ms", type=int, default=240)
     parser.add_argument("--barge-in-capture-timeout", type=float, default=2.0, help="How long to wait for the interrupting utterance to finish so it can become the next prompt")
+    parser.add_argument("--diagnose-barge-in", action="store_true", help="Run a silent LiveKit-only barge-in receive/publish diagnostic instead of xAI conversation")
+    parser.add_argument("--diagnose-seconds", type=float, default=20.0, help="Seconds to run --diagnose-barge-in")
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 
