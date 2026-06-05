@@ -112,13 +112,15 @@ async def test_smoke_bridge_requires_endpoint_and_token_without_leaking_token():
 class FakeAudioSource:
     instances = []
 
-    def __init__(self, sample_rate, num_channels):
+    def __init__(self, sample_rate, num_channels, queue_size_ms=1000):
         self.sample_rate = sample_rate
         self.num_channels = num_channels
+        self.queue_size_ms = queue_size_ms
         self.frames = []
         self.waited = False
         self.cleared = False
         self.closed = False
+        self.queued_duration = 0.42
         FakeAudioSource.instances.append(self)
 
     async def capture_frame(self, frame):
@@ -129,6 +131,7 @@ class FakeAudioSource:
 
     def clear_queue(self):
         self.cleared = True
+        self.queued_duration = 0.0
 
     async def aclose(self):
         self.closed = True
@@ -265,6 +268,7 @@ async def test_pcm16_publisher_streams_chunks_and_flushes_remainder(monkeypatch)
     assert room.local_participant.published[0][0].name == "zofka-stream"
     assert room.local_participant.published[0][0].source is source
     assert room.local_participant.published[0][1].source == FakeTrackSource.SOURCE_MICROPHONE
+    assert source.queue_size_ms == 120
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20, 5]
     assert publisher.bytes_published == 90
     assert source.waited is True
@@ -289,6 +293,8 @@ async def test_pcm16_publisher_interrupt_clears_queue_without_playout(monkeypatc
     track = room.local_participant.published[0][0]
     assert publisher.interrupted is True
     assert source.cleared is True
+    assert publisher.last_queue_duration_before_interrupt == pytest.approx(0.42)
+    assert publisher.last_queue_duration_after_clear == pytest.approx(0.0)
     assert source.waited is False
     assert source.closed is True
     assert track.stopped is True
@@ -321,6 +327,8 @@ async def test_pcm16_publisher_interruptible_write_stops_mid_chunk(monkeypatch):
     assert interrupted is True
     assert publisher.interrupted is True
     assert source.cleared is True
+    assert publisher.last_queue_duration_before_interrupt == pytest.approx(0.42)
+    assert publisher.last_queue_duration_after_clear == pytest.approx(0.0)
     assert source.closed is True
     assert room.local_participant.unpublished == ["track-sid"]
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20]

@@ -494,6 +494,14 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "published": False,
                     "interrupted": True,
                     "partial_response_bytes": getattr(publisher, "bytes_published", 0),
+                    "publisher_queue_before_interrupt_seconds": round(
+                        getattr(publisher, "last_queue_duration_before_interrupt", 0.0) or 0.0,
+                        3,
+                    ),
+                    "publisher_queue_after_clear_seconds": round(
+                        getattr(publisher, "last_queue_duration_after_clear", 0.0) or 0.0,
+                        3,
+                    ),
                     "barge_in_carryover_pcm_bytes": len(raw_carryover_pcm),
                     "barge_in_carryover_discarded": carryover_discarded,
                     "barge_in_diagnostic": {

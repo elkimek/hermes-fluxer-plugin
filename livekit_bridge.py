@@ -110,6 +110,7 @@ class _LiveKitPcm16Publisher:
         sample_rate: int,
         frame_ms: int,
         track_name: str,
+        queue_size_ms: int = 120,
     ) -> None:
         self._room = room
         self._rtc = rtc
@@ -117,6 +118,7 @@ class _LiveKitPcm16Publisher:
         self._frame_samples = max(1, sample_rate * frame_ms // 1000)
         self._frame_bytes = self._frame_samples * 2
         self._track_name = track_name
+        self._queue_size_ms = max(frame_ms, queue_size_ms)
         self._source: Any = None
         self._track: Any = None
         self._publication: Any = None
@@ -124,9 +126,11 @@ class _LiveKitPcm16Publisher:
         self.bytes_published = 0
         self.frames_published = 0
         self.interrupted = False
+        self.last_queue_duration_before_interrupt: float | None = None
+        self.last_queue_duration_after_clear: float | None = None
 
     async def __aenter__(self) -> "_LiveKitPcm16Publisher":
-        self._source = self._rtc.AudioSource(self._sample_rate, 1)
+        self._source = self._rtc.AudioSource(self._sample_rate, 1, queue_size_ms=self._queue_size_ms)
         self._track = self._rtc.LocalAudioTrack.create_audio_track(self._track_name, self._source)
         options = self._rtc.TrackPublishOptions()
         options.source = self._rtc.TrackSource.SOURCE_MICROPHONE
@@ -207,9 +211,19 @@ class _LiveKitPcm16Publisher:
             return
         self.interrupted = True
         self._buffer.clear()
+        self.last_queue_duration_before_interrupt = float(getattr(source, "queued_duration", 0.0) or 0.0)
         clear_queue = getattr(source, "clear_queue", None)
         if clear_queue is not None:
             await _maybe_await(clear_queue())
+        self.last_queue_duration_after_clear = float(getattr(source, "queued_duration", 0.0) or 0.0)
+        logger.info(
+            "Fluxer LiveKit PCM publisher interrupted track=%s bytes=%s frames=%s queued_before=%.3fs queued_after=%.3fs",
+            self._track_name,
+            self.bytes_published,
+            self.frames_published,
+            self.last_queue_duration_before_interrupt,
+            self.last_queue_duration_after_clear,
+        )
         await self.close(wait_for_playout=False, flush_remainder=False)
 
     async def _capture_chunk(self, chunk: bytes) -> None:
