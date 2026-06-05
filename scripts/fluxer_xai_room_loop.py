@@ -157,16 +157,21 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
             break
         remaining = args.max_runtime_seconds - (time.monotonic() - started) if args.max_runtime_seconds else 30.0
         try:
+            capture_started = time.monotonic()
             pcm = await _capture_one_speech_segment(args, bridge, timeout=max(1.0, remaining))
+            capture_seconds = time.monotonic() - capture_started
         except TimeoutError:
             break
         turn_no = len(turns) + 1
         logger.info("Captured speech turn %s bytes=%s rms=%s", turn_no, len(pcm), _pcm16_rms(pcm))
         gate_transcript = ""
+        gate_seconds = 0.0
         if not args.disable_wake_gate:
             gate_wav = str(Path(tempfile.gettempdir()) / f"zofka_xai_room_loop_gate_{turn_no}.wav")
             try:
+                gate_started = time.monotonic()
                 gate_result = await gate_xai.audio_response_from_pcm16(pcm, gate_wav, timeout=args.xai_timeout)
+                gate_seconds = time.monotonic() - gate_started
                 gate_transcript = gate_result.transcript.strip()
                 gate_decision = gate_transcript.upper().strip().split()
                 should_respond = bool(gate_decision and gate_decision[0] == "RESPOND")
@@ -182,6 +187,10 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                         "gate_transcript": gate_transcript,
                         "published": False,
                         "ignored": True,
+                        "timing": {
+                            "capture_seconds": round(capture_seconds, 3),
+                            "gate_seconds": round(gate_seconds, 3),
+                        },
                     }
                 )
                 if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
@@ -190,8 +199,12 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
 
         output_wav = str(Path(tempfile.gettempdir()) / f"zofka_xai_room_loop_turn_{turn_no}.wav")
         try:
+            xai_started = time.monotonic()
             xai_result = await xai.audio_response_from_pcm16(pcm, output_wav, timeout=args.xai_timeout)
+            xai_seconds = time.monotonic() - xai_started
+            publish_started = time.monotonic()
             await bridge.publish_wav_file(output_wav, track_name=f"zofka-xai-room-loop-{turn_no}")
+            publish_seconds = time.monotonic() - publish_started
         except Exception as exc:
             logger.warning("xAI response/publish failed for turn %s: %s", turn_no, type(exc).__name__)
             turns.append(
@@ -201,6 +214,10 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "gate_transcript": gate_transcript,
                     "published": False,
                     "error": f"{type(exc).__name__}: response failed",
+                    "timing": {
+                        "capture_seconds": round(capture_seconds, 3),
+                        "gate_seconds": round(gate_seconds, 3),
+                    },
                 }
             )
             if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
@@ -215,6 +232,13 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 "xai_transcript": xai_result.transcript,
                 "xai_events_tail": list(xai_result.events_seen[-5:]),
                 "published": True,
+                "timing": {
+                    "capture_seconds": round(capture_seconds, 3),
+                    "gate_seconds": round(gate_seconds, 3),
+                    "xai_seconds": round(xai_seconds, 3),
+                    "publish_seconds": round(publish_seconds, 3),
+                    "after_capture_seconds": round(gate_seconds + xai_seconds + publish_seconds, 3),
+                },
             }
         )
         if args.max_turns and sum(1 for turn in turns if turn.get("published")) >= args.max_turns:
