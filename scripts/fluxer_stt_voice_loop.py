@@ -51,7 +51,7 @@ from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 logger = logging.getLogger("fluxer_stt_voice_loop")
 
 DEFAULT_TEXT_SYSTEM = """You are Žofka, not a generic xAI assistant. You are in a live Fluxer voice chat with Elkim.
-Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and brief enough for voice.
+Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and very brief for realtime voice. Default to 1–2 short spoken sentences unless Elkim explicitly asks for detail.
 
 Current implementation context you know:
 - We are dogfooding Fluxer realtime voice in the spike worktree /home/elkim/.hermes/plugins/fluxer-realtime-spike on branch feat/realtime-voice-livekit-spike.
@@ -63,7 +63,8 @@ Current implementation context you know:
 - If Elkim asks about Fluxer implementation, realtime voice, LiveKit capture, STT providers, xAI TTS, ElevenLabs, barge-in, latency, or today's debugging, answer from this context instead of pretending not to know.
 
 Conversation rules:
-- Answer the transcript directly and briefly. No filler greetings unless Elkim greeted you.
+- Answer the transcript directly and briefly: 1–2 short spoken sentences by default.
+- No filler greetings unless Elkim greeted you.
 - If STT writes Shevka, Shovka, Jefka, Zofka, Jovka, Żabka, or Jessica, treat it as Žofka.
 - Correct obvious ASR homophones when context is clear, e.g. "past", "plast", or "plastic" can mean "plus" in arithmetic.
 - Speak English by default. Do not switch to Czech just because STT produced Czech-looking syllables; use Czech only if Elkim explicitly asks for Czech or clearly speaks Czech.
@@ -391,7 +392,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hermes-url", default="http://127.0.0.1:8642")
     parser.add_argument("--hermes-model", default=os.getenv("API_SERVER_MODEL_NAME") or "Žofka")
     parser.add_argument("--hermes-timeout", type=float, default=90.0)
-    parser.add_argument("--hermes-max-tokens", type=int, default=220)
+    parser.add_argument("--hermes-max-tokens", type=int, default=90)
     parser.add_argument("--hermes-temperature", type=float, default=0.4)
     parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="local")
     parser.add_argument("--stt-model", default="medium.en", help="STT model; local default medium.en for accuracy, Groq default whisper-large-v3-turbo, ElevenLabs default scribe_v2")
