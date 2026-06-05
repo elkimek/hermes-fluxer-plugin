@@ -29,5 +29,8 @@ test = [
   "tomli>=2; python_version < '3.11'",
 ]
 
+[tool.setuptools]
+py-modules = ["adapter", "livekit_bridge"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
