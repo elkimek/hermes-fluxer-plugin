@@ -358,6 +358,69 @@ def test_zero_duration_attachment_without_waveform_is_not_voice_message():
     assert fluxer_adapter._is_voice_message(data) is False
 
 
+def test_voice_state_update_payload_matches_fluxer_livekit_handshake_shape():
+    payload = fluxer_adapter._build_voice_state_update_payload(
+        channel_id="voice-chan",
+        guild_id="guild-1",
+        connection_id="conn-1",
+        self_mute=True,
+        self_deaf=False,
+    )
+
+    assert payload == {
+        "op": 4,
+        "d": {
+            "guild_id": "guild-1",
+            "channel_id": "voice-chan",
+            "self_mute": True,
+            "self_deaf": False,
+            "self_video": False,
+            "self_stream": False,
+            "viewer_stream_keys": [],
+            "connection_id": "conn-1",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_fluxer_adapter_can_send_voice_state_update_over_gateway(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, raw):
+            self.sent.append(raw)
+
+    fake_ws = FakeWebSocket()
+    adapter._ws = fake_ws
+
+    result = await adapter.send_voice_state_update("voice-chan", guild_id="guild-1", connection_id="conn-1")
+
+    assert result is True
+    assert fake_ws.sent == [
+        '{"op": 4, "d": {"guild_id": "guild-1", "channel_id": "voice-chan", "self_mute": false, "self_deaf": true, "self_video": false, "self_stream": false, "viewer_stream_keys": [], "connection_id": "conn-1"}}'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fluxer_adapter_voice_state_update_fails_closed_without_gateway(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+
+    result = await adapter.send_voice_state_update("voice-chan")
+
+    assert result is False
+
+
 @pytest.mark.asyncio
 async def test_send_voice_uploads_fluxer_voice_message_payload(monkeypatch, tmp_path):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
@@ -389,3 +452,13 @@ def test_pyproject_has_runtime_dependencies():
 
     assert any(dep.startswith("httpx") for dep in deps)
     assert any(dep.startswith("websockets") for dep in deps)
+
+
+def test_realtime_voice_spike_doc_records_fluxer_livekit_flow():
+    doc = (ROOT / "REALTIME_VOICE.md").read_text()
+
+    assert "opcode 4" in doc
+    assert "VOICE_SERVER_UPDATE" in doc
+    assert "LiveKit" in doc
+    assert "xAI Realtime" in doc
+    assert "standalone plugin" in doc

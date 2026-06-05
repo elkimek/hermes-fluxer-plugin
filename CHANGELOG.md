@@ -8,6 +8,13 @@ This project uses simple semantic versioning while the plugin is young:
 - minor versions for new user-visible capabilities;
 - major versions only for breaking configuration or runtime behavior.
 
+## Unreleased
+
+### Added
+
+- Started the Fluxer realtime voice spike with `REALTIME_VOICE.md`, documenting the discovered LiveKit/opcode-4 voice handshake and the staged path toward a live Žofka voice-room bridge.
+- Added tested gateway seams for future realtime voice work: `_build_voice_state_update_payload(...)` and `send_voice_state_update(...)` can now send Fluxer `VOICE_STATE_UPDATE` payloads over the existing gateway websocket.
+
 ## [0.1.1] - 2026-06-05
 
 ### Added

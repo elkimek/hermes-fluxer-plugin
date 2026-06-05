@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 4000
 _DEFAULT_BASE_URL = "https://api.fluxer.app/v1"
 _GATEWAY_VERSION = 1
+_VOICE_STATE_UPDATE_OPCODE = 4
 _VOICE_MESSAGE_FLAG = 1 << 13
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
@@ -98,6 +99,39 @@ def _build_identify_payload(bot_token: str) -> Dict[str, Any]:
                 "browser": "hermes",
                 "device": "hermes",
             },
+        },
+    }
+
+
+def _build_voice_state_update_payload(
+    *,
+    channel_id: Optional[str],
+    guild_id: Optional[str] = None,
+    connection_id: Optional[str] = None,
+    self_mute: bool = False,
+    self_deaf: bool = True,
+    self_video: bool = False,
+    self_stream: bool = False,
+    viewer_stream_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build Fluxer's opcode-4 voice state update payload.
+
+    Fluxer's LiveKit voice handshake starts on the main gateway: the client
+    sends VOICE_STATE_UPDATE, then waits for VOICE_SERVER_UPDATE with a LiveKit
+    endpoint/token. This helper intentionally does not touch audio media yet;
+    it is the tested seam a future realtime bridge can call.
+    """
+    return {
+        "op": _VOICE_STATE_UPDATE_OPCODE,
+        "d": {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "self_mute": self_mute,
+            "self_deaf": self_deaf,
+            "self_video": self_video,
+            "self_stream": self_stream,
+            "viewer_stream_keys": list(viewer_stream_keys or []),
+            "connection_id": connection_id,
         },
     }
 
@@ -1699,6 +1733,43 @@ class FluxerAdapter(BasePlatformAdapter):
         self._last_heartbeat_sent_at = time.monotonic()
         self._awaiting_heartbeat_ack = True
         await self._ws.send(json.dumps({"op": 1, "d": self._last_seq}))
+
+    async def _send_gateway_payload(self, payload: Dict[str, Any]) -> bool:
+        """Send a raw Fluxer gateway payload if the websocket is available."""
+        if self._ws is None:
+            return False
+        await self._ws.send(json.dumps(payload))
+        return True
+
+    async def send_voice_state_update(
+        self,
+        channel_id: Optional[str],
+        *,
+        guild_id: Optional[str] = None,
+        connection_id: Optional[str] = None,
+        self_mute: bool = False,
+        self_deaf: bool = True,
+        self_video: bool = False,
+        self_stream: bool = False,
+        viewer_stream_keys: Optional[List[str]] = None,
+    ) -> bool:
+        """Ask Fluxer to join/update/leave a voice channel on the main gateway.
+
+        This is the first half of Fluxer's LiveKit flow. A successful send should
+        be followed by gateway VOICE_SERVER_UPDATE containing endpoint/token;
+        the future realtime bridge can then connect to LiveKit and publish audio.
+        """
+        payload = _build_voice_state_update_payload(
+            channel_id=channel_id,
+            guild_id=guild_id,
+            connection_id=connection_id,
+            self_mute=self_mute,
+            self_deaf=self_deaf,
+            self_video=self_video,
+            self_stream=self_stream,
+            viewer_stream_keys=viewer_stream_keys,
+        )
+        return await self._send_gateway_payload(payload)
 
     async def _heartbeat_loop(self, interval_ms: int) -> None:
         interval_s = max(interval_ms, 1000) / 1000
