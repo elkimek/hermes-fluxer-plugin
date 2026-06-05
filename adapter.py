@@ -23,7 +23,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
@@ -595,7 +595,6 @@ class FluxerAdapter(BasePlatformAdapter):
         self._pending_reaction_actions: Dict[str, Dict[str, Any]] = {}
         self._pending_voice_joins: Dict[str, Dict[str, Any]] = {}
         self._last_voice_server_update: Optional[Dict[str, Any]] = None
-        self._voice_server_update_handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Any]] = None
 
     async def connect(self) -> bool:
         if not self.bot_token:
@@ -1998,17 +1997,6 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.debug("Fluxer application-command defer response failed: %s", exc)
         await self.handle_message(MessageEvent(text=text, message_type=MessageType.TEXT, source=source, raw_message={"interaction": data}, message_id=str(data.get("id") or "") or None))
 
-    def set_voice_server_update_handler(
-        self,
-        handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Any]],
-    ) -> None:
-        """Register an in-memory LiveKit bridge handoff for VOICE_SERVER_UPDATE.
-
-        The handler receives `(raw_update, safe_update)`. `raw_update` may contain
-        the ephemeral LiveKit token and must not be stored by the adapter.
-        """
-        self._voice_server_update_handler = handler
-
     async def _handle_voice_server_update(self, data: Dict[str, Any]) -> None:
         """Capture Fluxer LiveKit server metadata without retaining the token."""
         guild_id = data.get("guild_id")
@@ -2027,18 +2015,6 @@ class FluxerAdapter(BasePlatformAdapter):
             safe_update.get("guild_id") or "<dm>",
             safe_update.get("connection_id") or "<none>",
         )
-        if self._voice_server_update_handler is not None:
-            try:
-                result = self._voice_server_update_handler(dict(data), dict(safe_update))
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception:
-                logger.error(
-                    "Fluxer voice server update bridge handler failed channel=%s guild=%s connection=%s",
-                    safe_update.get("channel_id") or "<none>",
-                    safe_update.get("guild_id") or "<dm>",
-                    safe_update.get("connection_id") or "<none>",
-                )
 
     async def _handle_gateway_dispatch(self, payload: Dict[str, Any]) -> None:
         op = payload.get("op")
