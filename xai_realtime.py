@@ -162,6 +162,33 @@ class XAIRealtimeVoiceClient:
         finally:
             await ws.close()
 
+    async def force_message_to_sink(
+        self,
+        text: str,
+        on_audio_delta: Callable[[bytes], Awaitable[None]],
+        *,
+        timeout: float = 30.0,
+        first_audio_timeout: Optional[float] = None,
+        interruptible: bool = False,
+    ) -> XAIRealtimeAudioResult:
+        """Use xAI `force_message` for verbatim TTS and stream PCM deltas to a sink."""
+
+        if not self.api_key:
+            raise RuntimeError("XAI_API_KEY is required for xAI Realtime")
+        if not text.strip():
+            raise ValueError("text must not be empty")
+        ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
+        try:
+            await self._send_force_message_request(ws, text, interruptible=interruptible)
+            return await self._collect_audio_to_sink(
+                ws,
+                on_audio_delta,
+                timeout=timeout,
+                first_audio_timeout=first_audio_timeout,
+            )
+        finally:
+            await ws.close()
+
     async def _configure_session(self, ws: Any) -> None:
         await ws.send(
             json.dumps(
@@ -307,6 +334,10 @@ class XAIRealtimeVoiceClient:
         *,
         interruptible: bool,
     ) -> XAIRealtimeAudioResult:
+        await self._send_force_message_request(ws, text, interruptible=interruptible)
+        return await self._collect_audio_to_wav(ws, output_path)
+
+    async def _send_force_message_request(self, ws: Any, text: str, *, interruptible: bool) -> None:
         await self._configure_session(ws)
         await ws.send(
             json.dumps(
@@ -321,7 +352,6 @@ class XAIRealtimeVoiceClient:
                 }
             )
         )
-        return await self._collect_audio_to_wav(ws, output_path)
 
     async def _collect_audio_to_wav(self, ws: Any, output_path: str | Path) -> XAIRealtimeAudioResult:
         pcm_parts: list[bytes] = []

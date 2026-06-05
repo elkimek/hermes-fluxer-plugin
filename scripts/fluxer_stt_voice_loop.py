@@ -25,6 +25,7 @@ import os
 import sys
 import tempfile
 import time
+import urllib.request
 import wave
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,48 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
         f"Latest STT transcript from Elkim: {transcript!r}\n\n"
         "Speak Žofka's next reply now. Use the latest transcript, relevant voice history, and the implementation context above."
     )
+
+
+def build_hermes_messages(transcript: str, *, history: list[dict[str, str]], system: str = DEFAULT_TEXT_SYSTEM) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": system}]
+    for item in history[-8:]:
+        user = (item.get("user") or "").strip()
+        assistant = (item.get("assistant") or "").strip()
+        if user:
+            messages.append({"role": "user", "content": user})
+        if assistant:
+            messages.append({"role": "assistant", "content": assistant})
+    messages.append({"role": "user", "content": transcript.strip()})
+    return messages
+
+
+def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], args: argparse.Namespace) -> str:
+    api_key = os.getenv("API_SERVER_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("API_SERVER_KEY is required for Hermes brain mode")
+    payload = json.dumps(
+        {
+            "model": args.hermes_model,
+            "messages": build_hermes_messages(transcript, history=history),
+            "max_tokens": args.hermes_max_tokens,
+            "temperature": args.hermes_temperature,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        args.hermes_url.rstrip("/") + "/v1/chat/completions",
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=args.hermes_timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    content = data["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Hermes API returned empty assistant content")
+    return content.strip()
 
 
 def transcribe_with_provider(file_path: str, *, provider: str, model: str | None) -> dict[str, Any]:
@@ -229,7 +272,15 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         break
                     continue
 
-                prompt = build_answer_prompt(transcript, history=history)
+                brain_started = time.monotonic()
+                if args.brain_provider == "hermes":
+                    reply_text = hermes_chat_completion(transcript, history=history, args=args)
+                    prompt = reply_text
+                else:
+                    prompt = build_answer_prompt(transcript, history=history)
+                    reply_text = ""
+                brain_seconds = time.monotonic() - brain_started
+
                 voice = XAIRealtimeVoiceClient(
                     sample_rate=args.sample_rate,
                     voice=args.voice,
@@ -251,25 +302,37 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     await publisher.write(chunk)
 
                 try:
-                    xai_result = await voice.text_response_to_sink(
-                        prompt,
-                        publish_delta,
-                        timeout=args.xai_timeout,
-                        first_audio_timeout=args.xai_first_audio_timeout,
-                    )
+                    if args.brain_provider == "hermes":
+                        xai_result = await voice.force_message_to_sink(
+                            prompt,
+                            publish_delta,
+                            timeout=args.xai_timeout,
+                            first_audio_timeout=args.xai_first_audio_timeout,
+                        )
+                    else:
+                        xai_result = await voice.text_response_to_sink(
+                            prompt,
+                            publish_delta,
+                            timeout=args.xai_timeout,
+                            first_audio_timeout=args.xai_first_audio_timeout,
+                        )
                 finally:
                     await publisher.__aexit__(None, None, None)
                 xai_seconds = time.monotonic() - xai_started
-                history.append({"user": transcript, "assistant": xai_result.transcript})
+                spoken_reply = reply_text or xai_result.transcript
+                history.append({"user": transcript, "assistant": spoken_reply})
                 turn.update(
                     {
                         "published": True,
-                        "reply_transcript": xai_result.transcript,
+                        "brain_provider": args.brain_provider,
+                        "brain_seconds": round(brain_seconds, 3),
+                        "reply_transcript": spoken_reply,
                         "reply_bytes": xai_result.bytes_written,
                         "xai_events_tail": list(xai_result.events_seen[-5:]),
                         "timing": {
                             "turn_seconds": round(time.monotonic() - turn_started, 3),
                             "stt_seconds": round(stt_seconds, 3),
+                            "brain_seconds": round(brain_seconds, 3),
                             "xai_first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
                             "xai_seconds": round(xai_seconds, 3),
                         },
@@ -324,6 +387,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-segment-ms", type=int, default=500)
     parser.add_argument("--max-segment-seconds", type=float, default=6.0)
     parser.add_argument("--voice", default="eve")
+    parser.add_argument("--brain-provider", choices=("hermes", "xai"), default="hermes")
+    parser.add_argument("--hermes-url", default="http://127.0.0.1:8642")
+    parser.add_argument("--hermes-model", default=os.getenv("API_SERVER_MODEL_NAME") or "Žofka")
+    parser.add_argument("--hermes-timeout", type=float, default=90.0)
+    parser.add_argument("--hermes-max-tokens", type=int, default=220)
+    parser.add_argument("--hermes-temperature", type=float, default=0.4)
     parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="local")
     parser.add_argument("--stt-model", default="medium.en", help="STT model; local default medium.en for accuracy, Groq default whisper-large-v3-turbo, ElevenLabs default scribe_v2")
     parser.add_argument("--xai-timeout", type=float, default=45.0)

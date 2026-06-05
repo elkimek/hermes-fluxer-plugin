@@ -6,6 +6,7 @@ import wave
 from scripts.fluxer_stt_voice_loop import (
     append_jsonl,
     build_answer_prompt,
+    build_hermes_messages,
     load_env_file,
     parse_args,
     safe_stt_summary,
@@ -32,6 +33,21 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
     assert "Speak English by default" in prompt
     assert "Do not switch to Czech" in prompt
     assert "No filler greetings" in prompt
+
+
+def test_build_hermes_messages_preserves_history_and_latest_transcript():
+    messages = build_hermes_messages(
+        "what are we building?",
+        history=[{"user": "hello", "assistant": "Hi."}],
+        system="system context",
+    )
+
+    assert messages == [
+        {"role": "system", "content": "system context"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "Hi."},
+        {"role": "user", "content": "what are we building?"},
+    ]
 
 
 def test_append_jsonl_writes_one_turn_per_line(tmp_path):
@@ -74,6 +90,8 @@ def test_parse_args_defaults_to_accurate_local_stt_and_fixed_capture():
     assert args.stt_model == "medium.en"
     assert args.capture_mode == "fixed"
     assert args.capture_window_seconds == 3.0
+    assert args.brain_provider == "hermes"
+    assert args.hermes_url == "http://127.0.0.1:8642"
     assert args.silence_ms == 500
 
 

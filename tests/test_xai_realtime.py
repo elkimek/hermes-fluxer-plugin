@@ -100,6 +100,24 @@ async def test_xai_realtime_force_message_does_not_send_response_create(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_xai_realtime_force_message_streams_deltas_to_sink():
+    ws = FakeRealtimeWebSocket([pcm_delta(b"\x01\x00"), {"type": "response.done"}])
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")
+    chunks = []
+
+    async def sink(chunk: bytes):
+        chunks.append(chunk)
+
+    await client._send_force_message_request(ws, "exact words", interruptible=False)
+    result = await client._collect_audio_to_sink(ws, sink, timeout=5)
+
+    assert ws.sent[1]["item"]["type"] == "force_message"
+    assert ws.sent[1]["item"]["content"][0] == {"type": "output_text", "text": "exact words"}
+    assert chunks == [b"\x01\x00"]
+    assert result.bytes_written == 2
+
+
+@pytest.mark.asyncio
 async def test_xai_realtime_text_response_streams_deltas_to_sink():
     ws = FakeRealtimeWebSocket(
         [
