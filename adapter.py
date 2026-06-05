@@ -136,22 +136,6 @@ def _build_voice_state_update_payload(
     }
 
 
-def _voice_join_key(guild_id: Optional[str], channel_id: Optional[str]) -> str:
-    return f"{guild_id or ''}:{channel_id or ''}"
-
-
-def _sanitize_voice_server_update(data: Dict[str, Any], *, matched_pending_join: bool) -> Dict[str, Any]:
-    """Return non-secret voice-server metadata safe for logs/state."""
-    return {
-        "guild_id": data.get("guild_id"),
-        "channel_id": data.get("channel_id"),
-        "connection_id": data.get("connection_id"),
-        "endpoint": data.get("endpoint"),
-        "has_token": bool(data.get("token")),
-        "matched_pending_join": matched_pending_join,
-    }
-
-
 def _headers(bot_token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bot {bot_token}",
@@ -593,8 +577,6 @@ class FluxerAdapter(BasePlatformAdapter):
         self._pending_exec_approvals: Dict[str, Dict[str, Any]] = {}
         self._pending_component_actions: Dict[str, Dict[str, Any]] = {}
         self._pending_reaction_actions: Dict[str, Dict[str, Any]] = {}
-        self._pending_voice_joins: Dict[str, Dict[str, Any]] = {}
-        self._last_voice_server_update: Optional[Dict[str, Any]] = None
 
     async def connect(self) -> bool:
         if not self.bot_token:
@@ -1787,14 +1769,7 @@ class FluxerAdapter(BasePlatformAdapter):
             self_stream=self_stream,
             viewer_stream_keys=viewer_stream_keys,
         )
-        sent = await self._send_gateway_payload(payload)
-        if sent and channel_id:
-            self._pending_voice_joins[_voice_join_key(guild_id, channel_id)] = {
-                "guild_id": guild_id,
-                "channel_id": channel_id,
-                "connection_id": connection_id,
-            }
-        return sent
+        return await self._send_gateway_payload(payload)
 
     async def _heartbeat_loop(self, interval_ms: int) -> None:
         interval_s = max(interval_ms, 1000) / 1000
@@ -1997,25 +1972,6 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.debug("Fluxer application-command defer response failed: %s", exc)
         await self.handle_message(MessageEvent(text=text, message_type=MessageType.TEXT, source=source, raw_message={"interaction": data}, message_id=str(data.get("id") or "") or None))
 
-    async def _handle_voice_server_update(self, data: Dict[str, Any]) -> None:
-        """Capture Fluxer LiveKit server metadata without retaining the token."""
-        guild_id = data.get("guild_id")
-        channel_id = data.get("channel_id")
-        key = _voice_join_key(str(guild_id) if guild_id is not None else None, str(channel_id) if channel_id is not None else None)
-        pending = self._pending_voice_joins.pop(key, None)
-        matched = pending is not None
-        safe_update = _sanitize_voice_server_update(data, matched_pending_join=matched)
-        self._last_voice_server_update = safe_update
-        logger.info(
-            "Fluxer voice server update captured endpoint=%s has_token=%s matched_pending_join=%s channel=%s guild=%s connection=%s",
-            safe_url_for_log(str(safe_update.get("endpoint") or "")),
-            safe_update.get("has_token"),
-            matched,
-            safe_update.get("channel_id") or "<none>",
-            safe_update.get("guild_id") or "<dm>",
-            safe_update.get("connection_id") or "<none>",
-        )
-
     async def _handle_gateway_dispatch(self, payload: Dict[str, Any]) -> None:
         op = payload.get("op")
         self._last_seq = _event_seq(payload) or self._last_seq
@@ -2054,9 +2010,6 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         if event_name == "INTERACTION_CREATE":
             await self._handle_interaction_create(data)
-            return
-        if event_name == "VOICE_SERVER_UPDATE":
-            await self._handle_voice_server_update(data)
             return
         if event_name in {"MESSAGE_REACTION_ADD", "REACTION_ADD", "MESSAGE_REACTION_CREATE"}:
             await self._handle_reaction_add(data)
