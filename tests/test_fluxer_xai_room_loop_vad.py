@@ -298,9 +298,9 @@ async def test_conversation_loop_reuses_barge_in_pcm_as_next_turn(monkeypatch):
 
         async def audio_response_from_pcm16_to_sink(self, pcm, sink, **kwargs):
             self.prompts.append(pcm)
-            await sink(pcm16(300, 20))
-            await room_loop.asyncio.sleep(0)
-            await sink(pcm16(300, 20))
+            for _ in range(6):
+                await sink(pcm16(300, 20))
+                await room_loop.asyncio.sleep(0)
             return FakeXAIResult(pcm)
 
     monkeypatch.setattr(room_loop, "XAIRealtimeVoiceClient", FakeXAI)
@@ -311,4 +311,33 @@ async def test_conversation_loop_reuses_barge_in_pcm_as_next_turn(monkeypatch):
     assert [turn.get("interrupted") for turn in result["turns"]] == [True, None]
     assert FakeXAI.prompts == [first_prompt, interrupt_prompt]
     assert result["turns"][0]["barge_in_carryover_pcm_bytes"] == len(interrupt_prompt)
+    assert result["turns"][0]["barge_in_carryover_discarded"] is False
     assert result["turns"][1]["from_barge_in_carryover"] is True
+
+
+def test_barge_in_carryover_decision_discards_tiny_interrupt_fragment():
+    args = argparse.Namespace(min_segment_ms=750)
+    tiny_stop_fragment = pcm16(900, 260)
+    usable, discarded, duration = room_loop._barge_in_carryover_decision(
+        args,
+        tiny_stop_fragment,
+        sample_rate=1000,
+    )
+
+    assert usable is None
+    assert discarded is True
+    assert duration == pytest.approx(0.26)
+
+
+def test_barge_in_carryover_decision_reuses_full_interrupt_utterance():
+    args = argparse.Namespace(min_segment_ms=750)
+    full_utterance = pcm16(900, 900)
+    usable, discarded, duration = room_loop._barge_in_carryover_decision(
+        args,
+        full_utterance,
+        sample_rate=1000,
+    )
+
+    assert usable == full_utterance
+    assert discarded is False
+    assert duration == pytest.approx(0.9)

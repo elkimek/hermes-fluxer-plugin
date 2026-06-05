@@ -92,6 +92,19 @@ def _pcm16_duration_seconds(pcm: bytes, *, sample_rate: int) -> float:
     return (len(pcm) // 2) / sample_rate
 
 
+def _barge_in_carryover_decision(args: argparse.Namespace, pcm: bytes, *, sample_rate: int) -> tuple[bytes | None, bool, float]:
+    """Return usable carryover PCM, discard flag, and duration.
+
+    Very short barge-in snippets are useful as an interruption signal but are
+    too partial to send to xAI as the next user turn. Re-listen instead.
+    """
+
+    duration = _pcm16_duration_seconds(pcm, sample_rate=sample_rate)
+    min_seconds = getattr(args, "min_segment_ms", 750) / 1000
+    discarded = bool(pcm and duration < min_seconds)
+    return (None if discarded else (pcm or None), discarded, duration)
+
+
 async def _speech_segments(
     chunks: AsyncIterator[bytes],
     *,
@@ -430,7 +443,20 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
             publish_seconds = time.monotonic() - publish_started
         except BargeInInterrupt:
             logger.info("Barge-in interrupted turn %s", turn_no)
-            carryover_pcm = barge_in_capture.pcm or None
+            raw_carryover_pcm = barge_in_capture.pcm or b""
+            carryover_pcm, carryover_discarded, raw_carryover_seconds = _barge_in_carryover_decision(
+                args,
+                raw_carryover_pcm,
+                sample_rate=args.sample_rate,
+            )
+            min_carryover_seconds = getattr(args, "min_segment_ms", 750) / 1000
+            if carryover_discarded:
+                logger.info(
+                    "Discarding short barge-in carryover for turn %s duration=%.3fs min=%.3fs",
+                    turn_no,
+                    raw_carryover_seconds,
+                    min_carryover_seconds,
+                )
             turns.append(
                 {
                     "turn": turn_no,
@@ -439,7 +465,8 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "published": False,
                     "interrupted": True,
                     "partial_response_bytes": getattr(publisher, "bytes_published", 0),
-                    "barge_in_carryover_pcm_bytes": len(carryover_pcm or b""),
+                    "barge_in_carryover_pcm_bytes": len(raw_carryover_pcm),
+                    "barge_in_carryover_discarded": carryover_discarded,
                     "barge_in_diagnostic": {
                         "chunks_seen": barge_in_capture.chunks_seen,
                         "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
