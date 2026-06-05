@@ -256,17 +256,29 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
 
             for turn_no in range(1, args.max_turns + 1):
                 turn_started = time.monotonic()
-                if args.capture_mode == "vad":
-                    pcm = await _capture_one_speech_segment(args, bridge, timeout=args.capture_timeout)
-                else:
-                    pcm = await bridge.collect_remote_audio_pcm16(
-                        duration_seconds=args.capture_window_seconds,
-                        sample_rate=args.sample_rate,
-                        frame_size_ms=args.frame_ms,
-                        participant_identity=args.participant_identity,
-                        participant_identity_prefix=args.participant_identity_prefix,
-                        timeout=args.capture_timeout,
-                    )
+                try:
+                    if args.capture_mode == "vad":
+                        pcm = await _capture_one_speech_segment(args, bridge, timeout=args.capture_timeout)
+                    else:
+                        pcm = await bridge.collect_remote_audio_pcm16(
+                            duration_seconds=args.capture_window_seconds,
+                            sample_rate=args.sample_rate,
+                            frame_size_ms=args.frame_ms,
+                            participant_identity=args.participant_identity,
+                            participant_identity_prefix=args.participant_identity_prefix,
+                            timeout=args.capture_timeout,
+                        )
+                except TimeoutError:
+                    turn = {
+                        "turn": turn_no,
+                        "published": False,
+                        "reason": "capture_timeout",
+                        "capture_timeout_seconds": args.capture_timeout,
+                    }
+                    result["ignored_turn_count"] += 1
+                    result["turns"].append(turn)
+                    append_jsonl(args.turn_log_jsonl, turn)
+                    continue
                 wav_path = Path(tempfile.gettempdir()) / f"zofka_stt_loop_input_{turn_no}.wav"
                 write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
                 stt_started = time.monotonic()
