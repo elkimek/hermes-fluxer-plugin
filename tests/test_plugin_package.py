@@ -536,6 +536,9 @@ def test_continuous_room_loop_script_has_noise_and_language_guardrails():
     assert "audio_response_from_pcm16_to_sink" in source
     assert "pcm16_publisher" in source
     assert "first_audio_seconds" in source
+    assert "BargeInInterrupt" in source
+    assert "--disable-barge-in" in source
+    assert "barge_in_min_ms" in source
 
 
 def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():

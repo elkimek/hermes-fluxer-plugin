@@ -121,6 +121,7 @@ class _LiveKitPcm16Publisher:
         self._buffer = bytearray()
         self.bytes_published = 0
         self.frames_published = 0
+        self.interrupted = False
 
     async def __aenter__(self) -> "_LiveKitPcm16Publisher":
         self._source = self._rtc.AudioSource(self._sample_rate, 1)
@@ -145,21 +146,35 @@ class _LiveKitPcm16Publisher:
             del self._buffer[: self._frame_bytes]
             await self._capture_chunk(chunk)
 
-    async def close(self) -> None:
+    async def close(self, *, wait_for_playout: bool = True, flush_remainder: bool = True) -> None:
         source = self._source
         if source is None:
             return
-        if self._buffer:
+        if flush_remainder and self._buffer:
             if len(self._buffer) % 2:
                 self._buffer.pop()
             if self._buffer:
                 await self._capture_chunk(bytes(self._buffer))
-            self._buffer.clear()
+        self._buffer.clear()
         self._source = None
-        await _maybe_await(source.wait_for_playout())
+        if wait_for_playout:
+            await _maybe_await(source.wait_for_playout())
         close = getattr(source, "aclose", None)
         if close is not None:
             await _maybe_await(close())
+
+    async def interrupt(self) -> None:
+        """Stop queued bot speech immediately and discard buffered PCM."""
+
+        source = self._source
+        if source is None:
+            return
+        self.interrupted = True
+        self._buffer.clear()
+        clear_queue = getattr(source, "clear_queue", None)
+        if clear_queue is not None:
+            await _maybe_await(clear_queue())
+        await self.close(wait_for_playout=False, flush_remainder=False)
 
     async def _capture_chunk(self, chunk: bytes) -> None:
         if self._source is None:

@@ -89,7 +89,8 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Tightened end-of-turn capture defaults after live testing: the loop now waits for `600ms` silence, keeps only `180ms` final silence in the PCM sent to xAI, and requires `750ms` minimum captured audio to avoid false/too-short bursts. Timing now reports both wall-clock `capture_seconds` and `captured_audio_seconds`.
 - Tightened realtime answer instructions to default to one short sentence and avoid multiple follow-up questions, reducing generated-audio length.
 - Added `--xai-first-audio-timeout` so a provider turn that emits no audio delta fails fast and the room can resume listening instead of waiting for the full response timeout.
-- Next: add real barge-in/interruption rather than queueing speech while Žofka is answering.
+- Added first barge-in support: while assistant audio is streaming, a fresh sustained user speech detector clears the LiveKit `AudioSource` queue, aborts further xAI audio deltas, marks the turn as interrupted, and reopens listening. Live smoke verified `interrupted_turn_count: 1` followed by a newly captured response turn.
+- Next: tune barge-in echo/noise thresholds and carry the interrupted utterance directly into the next turn rather than requiring a fresh post-interrupt capture.
 
 ### Phase 4 — real-time Žofka loop
 

@@ -28,6 +28,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Tuned live VAD defaults to reduce end-of-turn latency while avoiding false bursts: 600ms silence stop, 180ms retained final silence, and 750ms minimum segment; diagnostics now separate wall-clock capture time from captured audio duration.
 - Tightened realtime voice instructions to one short default answer and no multiple follow-up questions.
 - Added a first-audio timeout for streamed xAI responses so no-audio provider turns fail fast instead of blocking the room until the full response timeout.
+- Added and live-verified barge-in interruption: sustained user speech during assistant output clears the LiveKit audio queue, stops further xAI delta publishing, records an interrupted turn, and resumes listening.
 
 ## [0.1.1] - 2026-06-05
 

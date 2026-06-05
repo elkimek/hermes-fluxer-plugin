@@ -113,6 +113,7 @@ class FakeAudioSource:
         self.num_channels = num_channels
         self.frames = []
         self.waited = False
+        self.cleared = False
         self.closed = False
         FakeAudioSource.instances.append(self)
 
@@ -121,6 +122,9 @@ class FakeAudioSource:
 
     async def wait_for_playout(self):
         self.waited = True
+
+    def clear_queue(self):
+        self.cleared = True
 
     async def aclose(self):
         self.closed = True
@@ -247,6 +251,30 @@ async def test_pcm16_publisher_streams_chunks_and_flushes_remainder(monkeypatch)
     assert publisher.bytes_published == 90
     assert source.waited is True
     assert source.closed is True
+
+
+@pytest.mark.asyncio
+async def test_pcm16_publisher_interrupt_clears_queue_without_playout(monkeypatch):
+    FakeAudioSource.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FakeRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+
+    publisher = bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="zofka-stream")
+    await publisher.__aenter__()
+    await publisher.write(b"\x01\x00" * 40)
+    await publisher.write(b"\x02\x00" * 5)
+    await publisher.interrupt()
+
+    source = FakeAudioSource.instances[0]
+    assert publisher.interrupted is True
+    assert source.cleared is True
+    assert source.waited is False
+    assert source.closed is True
+    assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
+    with pytest.raises(RuntimeError, match="not open"):
+        await publisher.write(b"\x03\x00" * 20)
 
 
 class FakeAudioFrameEvent:

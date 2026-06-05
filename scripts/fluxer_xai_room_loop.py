@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -35,6 +36,11 @@ from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 logger = logging.getLogger("fluxer_xai_room_loop")
+
+
+class BargeInInterrupt(Exception):
+    """Raised when fresh user speech interrupts assistant playback."""
+
 
 DEFAULT_INSTRUCTIONS = """You are Žofka speaking with Elkim in a Fluxer voice room.
 Always answer in English unless Elkim explicitly asks for Czech. Do not answer in Spanish.
@@ -159,6 +165,37 @@ async def _capture_one_speech_segment(
             await close_chunks()
 
 
+async def _wait_for_barge_in(
+    args: argparse.Namespace,
+    bridge: FluxerLiveKitSmokeBridge,
+    stop_event: asyncio.Event,
+) -> None:
+    """Set stop_event when sustained fresh user speech arrives during assistant output."""
+
+    chunks = bridge.iter_remote_audio_pcm16(
+        sample_rate=args.sample_rate,
+        frame_size_ms=args.frame_ms,
+        participant_identity=args.participant_identity,
+    )
+    voiced_ms = 0
+    try:
+        async for chunk in chunks:
+            if stop_event.is_set():
+                return
+            rms = _pcm16_rms(chunk)
+            if rms >= args.barge_in_energy_threshold:
+                voiced_ms += args.frame_ms
+                if voiced_ms >= args.barge_in_min_ms:
+                    stop_event.set()
+                    return
+            else:
+                voiced_ms = 0
+    finally:
+        close_chunks = getattr(chunks, "aclose", None)
+        if close_chunks is not None:
+            await close_chunks()
+
+
 async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmokeBridge) -> dict[str, Any]:
     turns: list[dict[str, Any]] = []
     started = time.monotonic()
@@ -221,18 +258,29 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     break
                 continue
 
+        first_audio_seconds: float | None = None
+        barge_in_seconds: float | None = None
+        publisher: Any | None = None
         try:
             xai_started = time.monotonic()
-            first_audio_seconds: float | None = None
+            barge_in_event = asyncio.Event()
+            barge_in_task: asyncio.Task[Any] | None = None
             publisher = bridge.pcm16_publisher(
                 sample_rate=args.sample_rate,
                 frame_ms=args.frame_ms,
                 track_name=f"zofka-xai-room-loop-{turn_no}",
             )
             await publisher.__aenter__()
+            if not args.disable_barge_in:
+                barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_event))
 
             async def publish_delta(chunk: bytes) -> None:
-                nonlocal first_audio_seconds
+                nonlocal first_audio_seconds, barge_in_seconds
+                assert publisher is not None
+                if barge_in_event.is_set():
+                    barge_in_seconds = time.monotonic() - xai_started
+                    await publisher.interrupt()
+                    raise BargeInInterrupt("user interrupted assistant speech")
                 if first_audio_seconds is None:
                     first_audio_seconds = time.monotonic() - xai_started
                 await publisher.write(chunk)
@@ -245,10 +293,45 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     first_audio_timeout=args.xai_first_audio_timeout,
                 )
                 xai_seconds = time.monotonic() - xai_started
+                if barge_in_event.is_set():
+                    assert publisher is not None
+                    barge_in_seconds = time.monotonic() - xai_started
+                    await publisher.interrupt()
+                    raise BargeInInterrupt("user interrupted assistant speech")
             finally:
+                if barge_in_task is not None:
+                    barge_in_event.set()
+                    barge_in_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await barge_in_task
                 publish_started = time.monotonic()
-                await publisher.close()
+                if publisher is not None and publisher.interrupted:
+                    await publisher.close(wait_for_playout=False, flush_remainder=False)
+                elif publisher is not None:
+                    await publisher.close()
             publish_seconds = time.monotonic() - publish_started
+        except BargeInInterrupt:
+            logger.info("Barge-in interrupted turn %s", turn_no)
+            turns.append(
+                {
+                    "turn": turn_no,
+                    "captured_pcm_bytes": len(pcm),
+                    "gate_transcript": gate_transcript,
+                    "published": False,
+                    "interrupted": True,
+                    "partial_response_bytes": getattr(publisher, "bytes_published", 0),
+                    "timing": {
+                        "capture_seconds": round(capture_seconds, 3),
+                        "captured_audio_seconds": round(captured_audio_seconds, 3),
+                        "gate_seconds": round(gate_seconds, 3),
+                        "first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
+                        "barge_in_seconds": round(barge_in_seconds, 3) if barge_in_seconds is not None else None,
+                    },
+                }
+            )
+            if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
+                break
+            continue
         except Exception as exc:
             logger.warning("xAI response/publish failed for turn %s: %s", turn_no, type(exc).__name__)
             turns.append(
@@ -360,8 +443,9 @@ async def run(args: argparse.Namespace) -> int:
         result.update(loop_result)
         result["published_turn_count"] = sum(1 for turn in result.get("turns", []) if turn.get("published"))
         result["ignored_turn_count"] = sum(1 for turn in result.get("turns", []) if turn.get("ignored"))
+        result["interrupted_turn_count"] = sum(1 for turn in result.get("turns", []) if turn.get("interrupted"))
         print(json.dumps(result, indent=2, sort_keys=True))
-        return 0 if result.get("published_turn_count", 0) > 0 else 1
+        return 0 if result.get("published_turn_count", 0) > 0 or result.get("interrupted_turn_count", 0) > 0 else 1
     finally:
         try:
             await adapter.send_voice_state_update(None, guild_id=args.guild_id)
@@ -394,6 +478,9 @@ def main() -> int:
     parser.add_argument("--xai-instructions", default=DEFAULT_INSTRUCTIONS)
     parser.add_argument("--wake-gate-instructions", default=WAKE_GATE_INSTRUCTIONS)
     parser.add_argument("--disable-wake-gate", action="store_true", help="Answer every captured speech segment")
+    parser.add_argument("--disable-barge-in", action="store_true", help="Do not monitor for user interruption while assistant audio is streaming")
+    parser.add_argument("--barge-in-energy-threshold", type=int, default=700)
+    parser.add_argument("--barge-in-min-ms", type=int, default=240)
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 

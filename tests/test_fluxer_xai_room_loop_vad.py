@@ -1,3 +1,5 @@
+import argparse
+
 import pytest
 
 from scripts import fluxer_xai_room_loop as room_loop
@@ -10,6 +12,32 @@ def pcm16(value: int, samples: int) -> bytes:
 async def chunks(*items: bytes):
     for item in items:
         yield item
+
+
+class FakeChunkIterator:
+    def __init__(self, items):
+        self.items = list(items)
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.items:
+            raise StopAsyncIteration
+        return self.items.pop(0)
+
+    async def aclose(self):
+        self.closed = True
+
+
+class FakeBargeBridge:
+    def __init__(self, items):
+        self.iterator = FakeChunkIterator(items)
+
+    def iter_remote_audio_pcm16(self, **kwargs):
+        self.kwargs = kwargs
+        return self.iterator
 
 
 @pytest.mark.asyncio
@@ -72,3 +100,55 @@ async def test_speech_segments_reject_invalid_end_padding():
             max_segment_seconds=5.0,
         )
         await anext(segments)
+
+
+@pytest.mark.asyncio
+async def test_barge_in_requires_sustained_voice_and_closes_listener():
+    args = argparse.Namespace(
+        sample_rate=1000,
+        frame_ms=20,
+        participant_identity="user-a",
+        barge_in_energy_threshold=700,
+        barge_in_min_ms=60,
+    )
+    bridge = FakeBargeBridge(
+        [
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(900, 20),
+            pcm16(900, 20),
+        ]
+    )
+    stop_event = room_loop.asyncio.Event()
+
+    await room_loop._wait_for_barge_in(args, bridge, stop_event)
+
+    assert stop_event.is_set()
+    assert bridge.iterator.closed is True
+    assert bridge.kwargs["participant_identity"] == "user-a"
+
+
+@pytest.mark.asyncio
+async def test_barge_in_resets_on_short_noise_gap():
+    args = argparse.Namespace(
+        sample_rate=1000,
+        frame_ms=20,
+        participant_identity=None,
+        barge_in_energy_threshold=700,
+        barge_in_min_ms=60,
+    )
+    bridge = FakeBargeBridge(
+        [
+            pcm16(900, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(900, 20),
+        ]
+    )
+    stop_event = room_loop.asyncio.Event()
+
+    await room_loop._wait_for_barge_in(args, bridge, stop_event)
+
+    assert not stop_event.is_set()
+    assert bridge.iterator.closed is True
