@@ -189,22 +189,13 @@ class XAIRealtimeVoiceClient:
             raise ValueError("pcm_audio must not be empty")
         ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
         try:
-            try:
-                return await asyncio.wait_for(
-                    self._audio_response_from_pcm16_to_sink_on_ws(
-                        ws,
-                        pcm_audio,
-                        on_audio_delta,
-                        first_audio_timeout=first_audio_timeout,
-                    ),
-                    timeout=timeout,
-                )
-            except TimeoutError as exc:
-                raise XAIRealtimeStreamError(
-                    f"xAI Realtime response did not finish within {timeout}s",
-                    events_seen=(),
-                    cause=exc,
-                ) from exc
+            return await self._audio_response_from_pcm16_to_sink_on_ws(
+                ws,
+                pcm_audio,
+                on_audio_delta,
+                timeout=timeout,
+                first_audio_timeout=first_audio_timeout,
+            )
         finally:
             await ws.close()
 
@@ -240,22 +231,31 @@ class XAIRealtimeVoiceClient:
         pcm_audio: bytes,
         on_audio_delta: Callable[[bytes], Awaitable[None]],
         *,
+        timeout: float = 45.0,
         first_audio_timeout: Optional[float] = None,
     ) -> XAIRealtimeAudioResult:
         await self._send_audio_response_request(ws, pcm_audio)
-        return await self._collect_audio_to_sink(ws, on_audio_delta, first_audio_timeout=first_audio_timeout)
+        return await self._collect_audio_to_sink(ws, on_audio_delta, timeout=timeout, first_audio_timeout=first_audio_timeout)
 
     async def _send_audio_response_request(self, ws: Any, pcm_audio: bytes) -> None:
         await self._configure_session(ws)
         await ws.send(
             json.dumps(
                 {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(pcm_audio).decode("ascii"),
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "audio": base64.b64encode(pcm_audio).decode("ascii"),
+                            }
+                        ],
+                    },
                 }
             )
         )
-        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         await ws.send(json.dumps({"type": "response.create"}))
 
     async def _force_message_to_wav_on_ws(
@@ -304,23 +304,32 @@ class XAIRealtimeVoiceClient:
         ws: Any,
         on_audio_delta: Callable[[bytes], Awaitable[None]],
         *,
+        timeout: Optional[float] = None,
         first_audio_timeout: Optional[float] = None,
     ) -> XAIRealtimeAudioResult:
         bytes_written = 0
         events: list[str] = []
         transcript_parts: list[str] = []
         iterator = ws.__aiter__()
+        started = asyncio.get_running_loop().time()
         while True:
             try:
+                remaining_timeout = None
+                if timeout is not None:
+                    remaining_timeout = max(0.001, timeout - (asyncio.get_running_loop().time() - started))
+                read_timeout = remaining_timeout
                 if bytes_written == 0 and first_audio_timeout is not None:
-                    raw = await asyncio.wait_for(anext(iterator), timeout=first_audio_timeout)
-                else:
-                    raw = await anext(iterator)
+                    read_timeout = min(first_audio_timeout, remaining_timeout) if remaining_timeout is not None else first_audio_timeout
+                raw = await asyncio.wait_for(anext(iterator), timeout=read_timeout) if read_timeout is not None else await anext(iterator)
             except StopAsyncIteration:
                 break
             except TimeoutError as exc:
+                if bytes_written == 0:
+                    message = f"xAI Realtime emitted no audio within {first_audio_timeout}s"
+                else:
+                    message = f"xAI Realtime response did not finish within {timeout}s"
                 raise XAIRealtimeStreamError(
-                    f"xAI Realtime emitted no audio within {first_audio_timeout}s",
+                    message,
                     events_seen=events,
                     cause=exc,
                 ) from exc

@@ -28,10 +28,13 @@ This project uses simple semantic versioning while the plugin is young:
 - Tuned live VAD defaults to reduce end-of-turn latency while avoiding false bursts: 600ms silence stop, 180ms retained final silence, and 750ms minimum segment; diagnostics now separate wall-clock capture time from captured audio duration.
 - Tightened realtime voice instructions to one short default answer and no multiple follow-up questions.
 - Added a first-audio timeout for streamed xAI responses so no-audio provider turns fail fast instead of blocking the room until the full response timeout.
-- Added and live-verified barge-in interruption: sustained user speech during assistant output clears the LiveKit audio queue, stops further xAI delta publishing, records an interrupted turn, and resumes listening.
+- Added barge-in interruption plumbing: sustained user speech during assistant output can clear the LiveKit audio queue, stop further xAI delta publishing, record an interrupted turn, and resume listening.
 - Added barge-in carryover: the interrupting utterance is captured as short-lived PCM, surfaced only as byte/duration diagnostics, and fed directly into the next xAI turn so Elkim does not need to repeat the interruption after Žofka stops.
 - Hardened barge-in interruption after live testing showed assistant speech could continue: streamed xAI deltas are now checked between 20ms LiveKit frames, and interrupt stops/unpublishes the local LiveKit track in addition to clearing the audio queue.
-- Added `--diagnose-barge-in`, a silent LiveKit-only probe that keeps a local output track active while measuring remote mic RMS/detection, plus richer xAI failure messages for first-audio latency/debugging.
+- Added `--diagnose-barge-in`, an audible LiveKit-only probe that keeps a local output track active while measuring remote mic RMS/detection, plus richer xAI failure messages for first-audio latency/debugging.
+- Fixed the xAI realtime audio-input path for captured Fluxer voice by sending captured PCM as an explicit `conversation.item.create` `input_audio` item before `response.create`; the older `input_audio_buffer.append`/`commit` path committed speech but did not produce responses for live Fluxer captures.
+- Added LiveKit subscriber confirmation before streaming local audio frames, so smoke tests now distinguish "track published" from "Fluxer client subscribed and can hear it".
+- Corrected realtime voice status: post-reload Fluxer playout, xAI streaming, and one-turn room-loop responses are live-verified; barge-in detection remains a tuning target because current live interruption attempts only produced short 20ms RMS bursts below sustained-detection requirements.
 
 ## [0.1.1] - 2026-06-05
 

@@ -86,6 +86,13 @@ async def _wait_for_livekit_subscription(publication: Any, *, timeout: float = 5
         return False
     try:
         await asyncio.wait_for(_maybe_await(wait_for_subscription()), timeout=timeout)
+        logger.info(
+            "Fluxer LiveKit local track subscriber confirmed sid=%s source=%s kind=%s muted=%s",
+            getattr(publication, "sid", "<none>"),
+            getattr(publication, "source", "<unknown>"),
+            getattr(publication, "kind", "<unknown>"),
+            getattr(publication, "muted", "<unknown>"),
+        )
         return True
     except TimeoutError:
         logger.warning(
