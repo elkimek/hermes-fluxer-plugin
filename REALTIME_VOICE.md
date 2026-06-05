@@ -78,7 +78,8 @@ Status: started in this repo.
 - Added `livekit_bridge.py`, a minimal transport-only smoke bridge that can connect to the Fluxer LiveKit room from a raw `VOICE_SERVER_UPDATE` payload and disconnect cleanly.
 - The bridge uses the ephemeral token only as the local `Room.connect(endpoint, token, ...)` argument; it never stores, returns, or logs the token.
 - Added optional dependency group: `pip install 'hermes-fluxer-plugin[realtime]'` installs the Python LiveKit SDK.
-- Next: trigger a real Fluxer voice join, feed the raw gateway update into this bridge, and confirm the bot appears in the room before publishing/listening to audio.
+- Added `scripts/fluxer_livekit_smoke.py` to run the first real presence-only probe against a configured Fluxer voice channel; it joins muted/deaf by default, connects LiveKit once, prints only safe metadata, then leaves.
+- Next: run the smoke probe with a real Fluxer voice-channel id and confirm the bot appears in the room before publishing/listening to audio.
 
 ### Phase 4 — real-time Žofka loop
 

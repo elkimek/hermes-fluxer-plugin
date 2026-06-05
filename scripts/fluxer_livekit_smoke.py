@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Join a Fluxer voice channel and connect to its LiveKit room once.
+
+Usage:
+  FLUXER_BOT_TOKEN=... python scripts/fluxer_livekit_smoke.py --channel-id <voice-channel-id> [--guild-id <guild-id>]
+
+This script is intentionally a smoke probe, not the realtime Žofka loop. It:
+1. connects the standalone Fluxer adapter gateway,
+2. sends opcode-4 VOICE_STATE_UPDATE for the requested channel,
+3. waits for VOICE_SERVER_UPDATE,
+4. connects the LiveKit SDK using the ephemeral token,
+5. prints only non-secret metadata, then leaves/disconnects.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from adapter import FluxerAdapter  # noqa: E402
+from gateway.config import PlatformConfig  # noqa: E402
+from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
+
+
+async def run(args: argparse.Namespace) -> int:
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(message)s")
+    token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
+    if not token:
+        print("FLUXER_BOT_TOKEN is required", file=sys.stderr)
+        return 2
+
+    adapter = FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": token,
+                "base_url": os.getenv("FLUXER_BASE_URL", ""),
+                "gateway_url": os.getenv("FLUXER_GATEWAY_URL", ""),
+                "allow_all_users": True,
+            },
+        )
+    )
+    bridge = FluxerLiveKitSmokeBridge(auto_subscribe=args.auto_subscribe)
+    connected = asyncio.Event()
+    result: dict[str, Any] = {}
+
+    async def handle_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
+        try:
+            info = await bridge.connect_from_voice_server_update(raw_update)
+            result["safe_update"] = safe_update
+            result["connection"] = {
+                "endpoint": info.endpoint,
+                "guild_id": info.guild_id,
+                "channel_id": info.channel_id,
+                "connection_id": info.connection_id,
+                "room_name": info.room_name,
+                "participant_identity": info.participant_identity,
+            }
+            connected.set()
+        except Exception as exc:  # token intentionally not included
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            connected.set()
+
+    adapter.set_voice_server_update_handler(handle_voice_server_update)
+    try:
+        if not await adapter.connect():
+            print("Fluxer adapter did not connect to gateway", file=sys.stderr)
+            return 1
+        sent = await adapter.send_voice_state_update(
+            args.channel_id,
+            guild_id=args.guild_id,
+            self_mute=not args.unmute,
+            self_deaf=not args.listen,
+        )
+        if not sent:
+            print("Failed to send Fluxer VOICE_STATE_UPDATE", file=sys.stderr)
+            return 1
+        try:
+            await asyncio.wait_for(connected.wait(), timeout=args.timeout)
+        except asyncio.TimeoutError:
+            print(f"Timed out waiting {args.timeout:.1f}s for VOICE_SERVER_UPDATE/LiveKit connect", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if "error" not in result else 1
+    finally:
+        try:
+            await adapter.send_voice_state_update(None, guild_id=args.guild_id)
+        except Exception:
+            pass
+        await bridge.disconnect()
+        await adapter.disconnect()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fluxer LiveKit presence-only smoke probe")
+    parser.add_argument("--channel-id", required=True, help="Fluxer voice channel id to join")
+    parser.add_argument("--guild-id", default=None, help="Fluxer guild/server id, omit for DM/group call")
+    parser.add_argument("--timeout", type=float, default=20.0, help="Seconds to wait for VOICE_SERVER_UPDATE")
+    parser.add_argument("--unmute", action="store_true", help="Join unmuted; default is muted for smoke safety")
+    parser.add_argument("--listen", action="store_true", help="Join undeafened/listening; default is deaf for smoke safety")
+    parser.add_argument("--auto-subscribe", action="store_true", help="Ask LiveKit SDK to auto-subscribe to room tracks")
+    parser.add_argument("--verbose", action="store_true")
+    return asyncio.run(run(parser.parse_args()))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
