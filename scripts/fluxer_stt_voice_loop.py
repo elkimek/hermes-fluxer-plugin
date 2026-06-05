@@ -52,7 +52,7 @@ from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 logger = logging.getLogger("fluxer_stt_voice_loop")
 
 DEFAULT_TEXT_SYSTEM = """You are Žofka, not a generic xAI assistant. You are in a live Fluxer voice chat with Elkim.
-Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and very brief for realtime voice. Default to 1–2 short spoken sentences unless Elkim explicitly asks for detail.
+Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and very brief for realtime voice. Default to one short spoken sentence under 12 words unless Elkim explicitly asks for detail.
 
 Current implementation context you know:
 - We are dogfooding Fluxer realtime voice in the spike worktree /home/elkim/.hermes/plugins/fluxer-realtime-spike on branch feat/realtime-voice-livekit-spike.
@@ -64,7 +64,7 @@ Current implementation context you know:
 - If Elkim asks about Fluxer implementation, realtime voice, LiveKit capture, STT providers, xAI TTS, ElevenLabs, barge-in, latency, or today's debugging, answer from this context instead of pretending not to know.
 
 Conversation rules:
-- Answer the transcript directly and briefly: 1–2 short spoken sentences by default.
+- Answer the transcript directly and briefly: one short spoken sentence by default, under 12 words when possible.
 - No filler greetings unless Elkim greeted you.
 - If STT writes Shevka, Shovka, Jefka, Zofka, Jovka, Żabka, or Jessica, treat it as Žofka.
 - Correct obvious ASR homophones when context is clear, e.g. "past", "plast", or "plastic" can mean "plus" in arithmetic.
@@ -116,6 +116,27 @@ def normalize_voice_transcript(transcript: str) -> str:
     return " ".join(cleaned.split()).strip()
 
 
+def load_voice_context_cache(path: str | None) -> str:
+    if not path:
+        return ""
+    target = Path(path).expanduser()
+    if not target.exists():
+        return ""
+    return target.read_text(encoding="utf-8", errors="ignore").strip()
+
+
+def compose_system_prompt(base: str = DEFAULT_TEXT_SYSTEM, *, voice_context_cache: str = "") -> str:
+    voice_context_cache = voice_context_cache.strip()
+    if not voice_context_cache:
+        return base
+    return (
+        f"{base}\n\n"
+        "Cached in-RAM Žofka/Elkim context loaded once at voice-loop startup. "
+        "Use it as background, but answer the latest spoken transcript, not the cache itself.\n"
+        f"{voice_context_cache}"
+    )
+
+
 def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], system: str = DEFAULT_TEXT_SYSTEM) -> str:
     """Build a compact text prompt for a voice answer grounded in STT text."""
 
@@ -157,7 +178,11 @@ def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], ar
     payload = json.dumps(
         {
             "model": args.hermes_model,
-            "messages": build_hermes_messages(transcript, history=history),
+            "messages": build_hermes_messages(
+                transcript,
+                history=history,
+                system=getattr(args, "voice_system_prompt", DEFAULT_TEXT_SYSTEM),
+            ),
             "max_tokens": args.hermes_max_tokens,
             "temperature": args.hermes_temperature,
         }
@@ -222,6 +247,9 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     if not os.getenv("XAI_API_KEY", "").strip():
         raise RuntimeError("XAI_API_KEY is required")
 
+    voice_context_cache = load_voice_context_cache(args.voice_context_file)
+    args.voice_system_prompt = compose_system_prompt(voice_context_cache=voice_context_cache)
+
     adapter = FluxerAdapter(
         PlatformConfig(enabled=True, extra={"bot_token": bot_token, "allow_all_users": True})
     )
@@ -234,6 +262,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         "published_turn_count": 0,
         "ignored_turn_count": 0,
         "turns": [],
+        "voice_context_cache_chars": len(voice_context_cache),
     }
     history: list[dict[str, str]] = []
 
@@ -313,7 +342,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     reply_text = hermes_chat_completion(transcript, history=history, args=args)
                     prompt = reply_text
                 else:
-                    prompt = build_answer_prompt(transcript, history=history)
+                    prompt = build_answer_prompt(transcript, history=history, system=args.voice_system_prompt)
                     reply_text = ""
                 brain_seconds = time.monotonic() - brain_started
 
@@ -423,7 +452,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-segment-ms", type=int, default=500)
     parser.add_argument("--max-segment-seconds", type=float, default=6.0)
     parser.add_argument("--voice", default="eve")
-    parser.add_argument("--brain-provider", choices=("hermes", "xai"), default="hermes")
+    parser.add_argument("--brain-provider", choices=("xai-fast", "xai", "hermes"), default="xai-fast")
     parser.add_argument("--hermes-url", default="http://127.0.0.1:8642")
     parser.add_argument("--hermes-model", default=os.getenv("API_SERVER_MODEL_NAME") or "Žofka")
     parser.add_argument("--hermes-timeout", type=float, default=90.0)
@@ -436,6 +465,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--connect-timeout", type=float, default=30.0)
     parser.add_argument("--max-runtime-seconds", type=float, default=180.0)
     parser.add_argument("--env-file", default="/home/elkim/.hermes/.env")
+    parser.add_argument(
+        "--voice-context-file",
+        default=str(ROOT / "VOICE_CONTEXT_CACHE.md"),
+        help="Compact Žofka/Elkim context loaded once into RAM at startup for fast voice mode",
+    )
     parser.add_argument("--stop-on-empty-stt", action="store_true")
     parser.add_argument(
         "--turn-log-jsonl",

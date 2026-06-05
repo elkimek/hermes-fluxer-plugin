@@ -7,7 +7,9 @@ from scripts.fluxer_stt_voice_loop import (
     append_jsonl,
     build_answer_prompt,
     build_hermes_messages,
+    compose_system_prompt,
     load_env_file,
+    load_voice_context_cache,
     normalize_voice_transcript,
     parse_args,
     safe_stt_summary,
@@ -49,6 +51,22 @@ def test_build_hermes_messages_preserves_history_and_latest_transcript():
         {"role": "assistant", "content": "Hi."},
         {"role": "user", "content": "what are we building?"},
     ]
+
+
+def test_compose_system_prompt_appends_cached_context():
+    prompt = compose_system_prompt("base", voice_context_cache="Elkim likes direct answers")
+
+    assert "base" in prompt
+    assert "Cached in-RAM" in prompt
+    assert "Elkim likes direct answers" in prompt
+
+
+def test_load_voice_context_cache_reads_file_once(tmp_path):
+    path = tmp_path / "voice-context.md"
+    path.write_text("cached facts", encoding="utf-8")
+
+    assert load_voice_context_cache(str(path)) == "cached facts"
+    assert load_voice_context_cache(str(tmp_path / "missing.md")) == ""
 
 
 def test_normalize_voice_transcript_strips_recalled_memory_context():
@@ -107,8 +125,9 @@ def test_parse_args_defaults_to_realtime_voice_stack():
     assert args.stt_model == "medium.en"
     assert args.capture_mode == "vad"
     assert args.capture_window_seconds == 3.0
-    assert args.brain_provider == "hermes"
+    assert args.brain_provider == "xai-fast"
     assert args.hermes_url == "http://127.0.0.1:8642"
+    assert args.voice_context_file.endswith("VOICE_CONTEXT_CACHE.md")
     assert args.silence_ms == 500
 
 
