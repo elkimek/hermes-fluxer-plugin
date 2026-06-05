@@ -226,6 +226,29 @@ async def test_publish_wav_file_rejects_non_mono_pcm(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="mono 16-bit PCM"):
         await bridge.publish_wav_file(wav_path)
 
+@pytest.mark.asyncio
+async def test_pcm16_publisher_streams_chunks_and_flushes_remainder(monkeypatch):
+    FakeAudioSource.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FakeRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+
+    async with bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="zofka-stream") as publisher:
+        await publisher.write(b"\x01\x00" * 15)
+        assert publisher.frames_published == 0
+        await publisher.write(b"\x02\x00" * 30)
+        assert publisher.frames_published == 2
+
+    source = FakeAudioSource.instances[0]
+    assert room.local_participant.published[0][0] == {"name": "zofka-stream", "source": source}
+    assert room.local_participant.published[0][1].source == FakeTrackSource.SOURCE_MICROPHONE
+    assert [frame.samples_per_channel for frame in source.frames] == [20, 20, 5]
+    assert publisher.bytes_published == 90
+    assert source.waited is True
+    assert source.closed is True
+
+
 class FakeAudioFrameEvent:
     def __init__(self, data):
         self.frame = type("Frame", (), {"data": data})()

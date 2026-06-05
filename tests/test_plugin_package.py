@@ -533,8 +533,9 @@ def test_continuous_room_loop_script_has_noise_and_language_guardrails():
     assert "IGNORE" in source
     assert "def _speech_segments" in source
     assert "iter_remote_audio_pcm16" in source
-    assert "audio_response_from_pcm16" in source
-    assert "publish_wav_file" in source
+    assert "audio_response_from_pcm16_to_sink" in source
+    assert "pcm16_publisher" in source
+    assert "first_audio_seconds" in source
 
 
 def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():
@@ -542,4 +543,5 @@ def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():
 
     assert "def iter_remote_audio_pcm16" in source
     assert "async def publish_pcm16" in source
+    assert "def pcm16_publisher" in source
     assert "AsyncIterator[bytes]" in source

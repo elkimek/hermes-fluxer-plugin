@@ -14,14 +14,14 @@ import os
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 _XAI_REALTIME_URL = "wss://api.x.ai/v1/realtime"
 
 
 @dataclass(frozen=True)
 class XAIRealtimeAudioResult:
-    wav_path: Path
+    wav_path: Optional[Path]
     sample_rate: int
     bytes_written: int
     events_seen: tuple[str, ...]
@@ -158,6 +158,28 @@ class XAIRealtimeVoiceClient:
         finally:
             await ws.close()
 
+    async def audio_response_from_pcm16_to_sink(
+        self,
+        pcm_audio: bytes,
+        on_audio_delta: Callable[[bytes], Awaitable[None]],
+        *,
+        timeout: float = 45.0,
+    ) -> XAIRealtimeAudioResult:
+        """Stream xAI Realtime output PCM deltas to a sink as soon as they arrive."""
+
+        if not self.api_key:
+            raise RuntimeError("XAI_API_KEY is required for xAI Realtime")
+        if not pcm_audio:
+            raise ValueError("pcm_audio must not be empty")
+        ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
+        try:
+            return await asyncio.wait_for(
+                self._audio_response_from_pcm16_to_sink_on_ws(ws, pcm_audio, on_audio_delta),
+                timeout=timeout,
+            )
+        finally:
+            await ws.close()
+
     async def _text_response_to_wav_on_ws(self, ws: Any, text: str, output_path: str | Path) -> XAIRealtimeAudioResult:
         await self._configure_session(ws)
         await ws.send(
@@ -181,6 +203,19 @@ class XAIRealtimeVoiceClient:
         pcm_audio: bytes,
         output_path: str | Path,
     ) -> XAIRealtimeAudioResult:
+        await self._send_audio_response_request(ws, pcm_audio)
+        return await self._collect_audio_to_wav(ws, output_path)
+
+    async def _audio_response_from_pcm16_to_sink_on_ws(
+        self,
+        ws: Any,
+        pcm_audio: bytes,
+        on_audio_delta: Callable[[bytes], Awaitable[None]],
+    ) -> XAIRealtimeAudioResult:
+        await self._send_audio_response_request(ws, pcm_audio)
+        return await self._collect_audio_to_sink(ws, on_audio_delta)
+
+    async def _send_audio_response_request(self, ws: Any, pcm_audio: bytes) -> None:
         await self._configure_session(ws)
         await ws.send(
             json.dumps(
@@ -192,7 +227,6 @@ class XAIRealtimeVoiceClient:
         )
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         await ws.send(json.dumps({"type": "response.create"}))
-        return await self._collect_audio_to_wav(ws, output_path)
 
     async def _force_message_to_wav_on_ws(
         self,
@@ -220,6 +254,27 @@ class XAIRealtimeVoiceClient:
 
     async def _collect_audio_to_wav(self, ws: Any, output_path: str | Path) -> XAIRealtimeAudioResult:
         pcm_parts: list[bytes] = []
+
+        async def append_delta(chunk: bytes) -> None:
+            pcm_parts.append(chunk)
+
+        result = await self._collect_audio_to_sink(ws, append_delta)
+        pcm = b"".join(pcm_parts)
+        wav_path = _write_pcm16_wav(output_path, pcm, sample_rate=self.sample_rate)
+        return XAIRealtimeAudioResult(
+            wav_path=wav_path,
+            sample_rate=result.sample_rate,
+            bytes_written=result.bytes_written,
+            events_seen=result.events_seen,
+            transcript=result.transcript,
+        )
+
+    async def _collect_audio_to_sink(
+        self,
+        ws: Any,
+        on_audio_delta: Callable[[bytes], Awaitable[None]],
+    ) -> XAIRealtimeAudioResult:
+        bytes_written = 0
         events: list[str] = []
         transcript_parts: list[str] = []
         async for raw in ws:
@@ -233,21 +288,20 @@ class XAIRealtimeVoiceClient:
             if event_type == "response.output_audio.delta":
                 chunk = _decode_audio_delta(event)
                 if chunk:
-                    pcm_parts.append(chunk)
+                    await on_audio_delta(chunk)
+                    bytes_written += len(chunk)
             elif event_type == "response.output_audio_transcript.delta":
                 delta = event.get("delta")
                 if isinstance(delta, str):
                     transcript_parts.append(delta)
             elif event_type == "response.done":
                 break
-        pcm = b"".join(pcm_parts)
-        if not pcm:
+        if bytes_written <= 0:
             raise RuntimeError(f"xAI Realtime returned no audio; events={events}")
-        wav_path = _write_pcm16_wav(output_path, pcm, sample_rate=self.sample_rate)
         return XAIRealtimeAudioResult(
-            wav_path=wav_path,
+            wav_path=None,
             sample_rate=self.sample_rate,
-            bytes_written=len(pcm),
+            bytes_written=bytes_written,
             events_seen=tuple(events),
             transcript="".join(transcript_parts),
         )

@@ -197,13 +197,32 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     break
                 continue
 
-        output_wav = str(Path(tempfile.gettempdir()) / f"zofka_xai_room_loop_turn_{turn_no}.wav")
         try:
             xai_started = time.monotonic()
-            xai_result = await xai.audio_response_from_pcm16(pcm, output_wav, timeout=args.xai_timeout)
-            xai_seconds = time.monotonic() - xai_started
-            publish_started = time.monotonic()
-            await bridge.publish_wav_file(output_wav, track_name=f"zofka-xai-room-loop-{turn_no}")
+            first_audio_seconds: float | None = None
+            publisher = bridge.pcm16_publisher(
+                sample_rate=args.sample_rate,
+                frame_ms=args.frame_ms,
+                track_name=f"zofka-xai-room-loop-{turn_no}",
+            )
+            await publisher.__aenter__()
+
+            async def publish_delta(chunk: bytes) -> None:
+                nonlocal first_audio_seconds
+                if first_audio_seconds is None:
+                    first_audio_seconds = time.monotonic() - xai_started
+                await publisher.write(chunk)
+
+            try:
+                xai_result = await xai.audio_response_from_pcm16_to_sink(
+                    pcm,
+                    publish_delta,
+                    timeout=args.xai_timeout,
+                )
+                xai_seconds = time.monotonic() - xai_started
+            finally:
+                publish_started = time.monotonic()
+                await publisher.close()
             publish_seconds = time.monotonic() - publish_started
         except Exception as exc:
             logger.warning("xAI response/publish failed for turn %s: %s", turn_no, type(exc).__name__)
@@ -236,7 +255,8 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "capture_seconds": round(capture_seconds, 3),
                     "gate_seconds": round(gate_seconds, 3),
                     "xai_seconds": round(xai_seconds, 3),
-                    "publish_seconds": round(publish_seconds, 3),
+                    "first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
+                    "playout_drain_seconds": round(publish_seconds, 3),
                     "after_capture_seconds": round(gate_seconds + xai_seconds + publish_seconds, 3),
                 },
             }

@@ -101,6 +101,78 @@ def _string_or_none(value: Any) -> Optional[str]:
     return text or None
 
 
+class _LiveKitPcm16Publisher:
+    def __init__(
+        self,
+        *,
+        room: LiveKitRoomLike,
+        rtc: Any,
+        sample_rate: int,
+        frame_ms: int,
+        track_name: str,
+    ) -> None:
+        self._room = room
+        self._rtc = rtc
+        self._sample_rate = sample_rate
+        self._frame_samples = max(1, sample_rate * frame_ms // 1000)
+        self._frame_bytes = self._frame_samples * 2
+        self._track_name = track_name
+        self._source: Any = None
+        self._buffer = bytearray()
+        self.bytes_published = 0
+        self.frames_published = 0
+
+    async def __aenter__(self) -> "_LiveKitPcm16Publisher":
+        self._source = self._rtc.AudioSource(self._sample_rate, 1)
+        track = self._rtc.LocalAudioTrack.create_audio_track(self._track_name, self._source)
+        options = self._rtc.TrackPublishOptions()
+        options.source = self._rtc.TrackSource.SOURCE_MICROPHONE
+        publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
+        logger.info("Fluxer LiveKit bridge opened streaming PCM track sid=%s", getattr(publication, "sid", "<none>"))
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        await self.close()
+
+    async def write(self, pcm: bytes) -> None:
+        if self._source is None:
+            raise RuntimeError("Fluxer LiveKit PCM publisher is not open")
+        if not pcm:
+            return
+        self._buffer.extend(pcm)
+        while len(self._buffer) >= self._frame_bytes:
+            chunk = bytes(self._buffer[: self._frame_bytes])
+            del self._buffer[: self._frame_bytes]
+            await self._capture_chunk(chunk)
+
+    async def close(self) -> None:
+        source = self._source
+        if source is None:
+            return
+        if self._buffer:
+            if len(self._buffer) % 2:
+                self._buffer.pop()
+            if self._buffer:
+                await self._capture_chunk(bytes(self._buffer))
+            self._buffer.clear()
+        self._source = None
+        await _maybe_await(source.wait_for_playout())
+        close = getattr(source, "aclose", None)
+        if close is not None:
+            await _maybe_await(close())
+
+    async def _capture_chunk(self, chunk: bytes) -> None:
+        if self._source is None:
+            raise RuntimeError("Fluxer LiveKit PCM publisher is not open")
+        samples = len(chunk) // 2
+        if samples <= 0:
+            return
+        frame = self._rtc.AudioFrame(chunk, self._sample_rate, 1, samples)
+        await _maybe_await(self._source.capture_frame(frame))
+        self.bytes_published += len(chunk)
+        self.frames_published += 1
+
+
 class FluxerLiveKitSmokeBridge:
     """Connect/disconnect proof for Fluxer's LiveKit voice-room handoff."""
 
@@ -305,6 +377,29 @@ class FluxerLiveKitSmokeBridge:
         close = getattr(source, "aclose", None)
         if close is not None:
             await _maybe_await(close())
+
+    def pcm16_publisher(
+        self,
+        *,
+        sample_rate: int = 24_000,
+        frame_ms: int = 20,
+        track_name: str = "zofka-realtime-response",
+    ) -> _LiveKitPcm16Publisher:
+        """Open a LiveKit PCM16 sink for realtime chunk-by-chunk publishing."""
+
+        if self._room is None:
+            raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
+        if sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        if frame_ms <= 0:
+            raise ValueError("frame_ms must be positive")
+        return _LiveKitPcm16Publisher(
+            room=self._room,
+            rtc=_load_livekit_audio_helpers(),
+            sample_rate=sample_rate,
+            frame_ms=frame_ms,
+            track_name=track_name,
+        )
 
     def iter_remote_audio_pcm16(
         self,

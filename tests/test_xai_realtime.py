@@ -89,6 +89,33 @@ async def test_xai_realtime_audio_response_appends_commits_and_creates_response(
 
 
 @pytest.mark.asyncio
+async def test_xai_realtime_audio_response_streams_deltas_to_sink(tmp_path):
+    ws = FakeRealtimeWebSocket(
+        [
+            pcm_delta(b"\x02\x00"),
+            {"type": "response.output_audio_transcript.delta", "delta": "ok"},
+            pcm_delta(b"\x03\x00\x04\x00"),
+            {"type": "response.done"},
+        ]
+    )
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
+    chunks = []
+
+    async def sink(chunk: bytes):
+        chunks.append(chunk)
+
+    result = await client._audio_response_from_pcm16_to_sink_on_ws(ws, b"\x10\x00", sink)
+
+    assert ws.sent[1]["type"] == "input_audio_buffer.append"
+    assert ws.sent[2] == {"type": "input_audio_buffer.commit"}
+    assert ws.sent[3] == {"type": "response.create"}
+    assert chunks == [b"\x02\x00", b"\x03\x00\x04\x00"]
+    assert result.wav_path is None
+    assert result.bytes_written == 6
+    assert result.transcript == "ok"
+
+
+@pytest.mark.asyncio
 async def test_xai_realtime_raises_on_error_event(tmp_path):
     ws = FakeRealtimeWebSocket([{"type": "error", "error": {"message": "bad request"}}])
     client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")
