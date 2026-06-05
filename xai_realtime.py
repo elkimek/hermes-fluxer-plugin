@@ -189,15 +189,22 @@ class XAIRealtimeVoiceClient:
             raise ValueError("pcm_audio must not be empty")
         ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
         try:
-            return await asyncio.wait_for(
-                self._audio_response_from_pcm16_to_sink_on_ws(
-                    ws,
-                    pcm_audio,
-                    on_audio_delta,
-                    first_audio_timeout=first_audio_timeout,
-                ),
-                timeout=timeout,
-            )
+            try:
+                return await asyncio.wait_for(
+                    self._audio_response_from_pcm16_to_sink_on_ws(
+                        ws,
+                        pcm_audio,
+                        on_audio_delta,
+                        first_audio_timeout=first_audio_timeout,
+                    ),
+                    timeout=timeout,
+                )
+            except TimeoutError as exc:
+                raise XAIRealtimeStreamError(
+                    f"xAI Realtime response did not finish within {timeout}s",
+                    events_seen=(),
+                    cause=exc,
+                ) from exc
         finally:
             await ws.close()
 

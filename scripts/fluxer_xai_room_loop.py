@@ -52,6 +52,11 @@ class BargeInCapture:
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     pcm: bytes = b""
     captured_audio_seconds: float = 0.0
+    chunks_seen: int = 0
+    first_chunk_seconds: float | None = None
+    max_rms: int = 0
+    voiced_ms: int = 0
+    detected_seconds: float | None = None
 
 
 DEFAULT_INSTRUCTIONS = """You are Žofka speaking with Elkim in a Fluxer voice room.
@@ -207,6 +212,13 @@ async def _wait_for_barge_in(
     trailing_silence = 0
     voiced_ms = 0
     in_segment = False
+    started = time.monotonic()
+    logger.debug(
+        "barge listener started threshold=%s min_ms=%s participant_identity=%s",
+        args.barge_in_energy_threshold,
+        args.barge_in_min_ms,
+        args.participant_identity,
+    )
     try:
         async for chunk in chunks:
             if capture.stop_event.is_set():
@@ -214,13 +226,38 @@ async def _wait_for_barge_in(
             if not chunk:
                 continue
             rms = _pcm16_rms(chunk)
+            now = time.monotonic()
+            capture.chunks_seen += 1
+            if capture.first_chunk_seconds is None:
+                capture.first_chunk_seconds = now - started
+                logger.debug("barge listener first chunk after %.3fs", capture.first_chunk_seconds)
+            capture.max_rms = max(capture.max_rms, rms)
             voiced = rms >= args.barge_in_energy_threshold
             if voiced:
                 in_segment = True
                 trailing_silence = 0
                 voiced_ms += args.frame_ms
+                capture.voiced_ms = voiced_ms
                 segment.extend(chunk)
+                if getattr(args, "verbose", False):
+                    logger.debug(
+                        "barge listener voiced chunk=%s rms=%s max_rms=%s voiced_ms=%s threshold=%s",
+                        capture.chunks_seen,
+                        rms,
+                        capture.max_rms,
+                        voiced_ms,
+                        args.barge_in_energy_threshold,
+                    )
                 if voiced_ms >= args.barge_in_min_ms:
+                    if not capture.event.is_set():
+                        capture.detected_seconds = time.monotonic() - started
+                        logger.info(
+                            "Barge-in detected after %.3fs chunks=%s max_rms=%s voiced_ms=%s",
+                            capture.detected_seconds,
+                            capture.chunks_seen,
+                            capture.max_rms,
+                            voiced_ms,
+                        )
                     capture.event.set()
             elif in_segment:
                 voiced_ms = 0
@@ -403,6 +440,17 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "interrupted": True,
                     "partial_response_bytes": getattr(publisher, "bytes_published", 0),
                     "barge_in_carryover_pcm_bytes": len(carryover_pcm or b""),
+                    "barge_in_diagnostic": {
+                        "chunks_seen": barge_in_capture.chunks_seen,
+                        "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
+                        if barge_in_capture.first_chunk_seconds is not None
+                        else None,
+                        "max_rms": barge_in_capture.max_rms,
+                        "voiced_ms": barge_in_capture.voiced_ms,
+                        "detected_seconds": round(barge_in_capture.detected_seconds, 3)
+                        if barge_in_capture.detected_seconds is not None
+                        else None,
+                    },
                     "from_barge_in_carryover": from_barge_in_carryover,
                     "timing": {
                         "capture_seconds": round(capture_seconds, 3),
@@ -427,6 +475,17 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "gate_transcript": gate_transcript,
                     "published": False,
                     "error": f"{type(exc).__name__}: {error_text}",
+                    "barge_in_diagnostic": {
+                        "chunks_seen": barge_in_capture.chunks_seen,
+                        "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
+                        if barge_in_capture.first_chunk_seconds is not None
+                        else None,
+                        "max_rms": barge_in_capture.max_rms,
+                        "voiced_ms": barge_in_capture.voiced_ms,
+                        "detected_seconds": round(barge_in_capture.detected_seconds, 3)
+                        if barge_in_capture.detected_seconds is not None
+                        else None,
+                    },
                     "from_barge_in_carryover": from_barge_in_carryover,
                     "timing": {
                         "capture_seconds": round(capture_seconds, 3),
@@ -446,6 +505,17 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 "xai_response_bytes": xai_result.bytes_written,
                 "xai_transcript": xai_result.transcript,
                 "xai_events_tail": list(xai_result.events_seen[-5:]),
+                "barge_in_diagnostic": {
+                    "chunks_seen": barge_in_capture.chunks_seen,
+                    "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
+                    if barge_in_capture.first_chunk_seconds is not None
+                    else None,
+                    "max_rms": barge_in_capture.max_rms,
+                    "voiced_ms": barge_in_capture.voiced_ms,
+                    "detected_seconds": round(barge_in_capture.detected_seconds, 3)
+                    if barge_in_capture.detected_seconds is not None
+                    else None,
+                },
                 "published": True,
                 "from_barge_in_carryover": from_barge_in_carryover,
                 "timing": {
