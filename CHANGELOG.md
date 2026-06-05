@@ -8,6 +8,16 @@ This project uses simple semantic versioning while the plugin is young:
 - minor versions for new user-visible capabilities;
 - major versions only for breaking configuration or runtime behavior.
 
+## Unreleased
+
+### Added
+
+- Continued the Fluxer realtime voice spike with `REALTIME_VOICE.md`, documenting the discovered LiveKit/opcode-4 voice handshake and the staged path toward a live Žofka voice-room bridge.
+- Added tested gateway seams for future realtime voice work: `_build_voice_state_update_payload(...)` and `send_voice_state_update(...)` can send Fluxer `VOICE_STATE_UPDATE` payloads over the existing gateway websocket.
+- Added safe `VOICE_SERVER_UPDATE` capture for the spike path: the adapter tracks pending voice joins, records non-secret LiveKit endpoint/connection metadata, and only stores token presence — never the token itself.
+- Added an in-memory `VOICE_SERVER_UPDATE` bridge hook so a future LiveKit bridge can receive the raw ephemeral token payload without the adapter persisting or logging that token.
+- Started a transport-only LiveKit smoke bridge module with optional `realtime` dependency support; it connects from a raw `VOICE_SERVER_UPDATE` payload and keeps the ephemeral token out of returned/stored/logged state.
+
 ## [0.1.1] - 2026-06-05
 
 ### Added
