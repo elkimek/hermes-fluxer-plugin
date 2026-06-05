@@ -22,6 +22,39 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+
+def _safe_room_snapshot(room: Any) -> dict[str, Any]:
+    """Return non-secret LiveKit room diagnostics for smoke debugging."""
+    participants = []
+    for participant in getattr(room, "remote_participants", {}).values():
+        publications = []
+        for publication in getattr(participant, "track_publications", {}).values():
+            track = getattr(publication, "track", None)
+            publications.append(
+                {
+                    "sid": getattr(publication, "sid", None),
+                    "kind": str(getattr(publication, "kind", None)),
+                    "source": str(getattr(publication, "source", None)),
+                    "subscribed": bool(getattr(publication, "subscribed", False)),
+                    "muted": bool(getattr(publication, "muted", False)),
+                    "has_track": track is not None,
+                    "track_kind": str(getattr(track, "kind", None)) if track is not None else None,
+                    "track_class": track.__class__.__name__ if track is not None else None,
+                }
+            )
+        participants.append(
+            {
+                "identity": getattr(participant, "identity", None),
+                "sid": getattr(participant, "sid", None),
+                "publications": publications,
+            }
+        )
+    return {
+        "room_name": getattr(room, "name", None),
+        "remote_participant_count": len(participants),
+        "remote_participants": participants,
+    }
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -34,15 +67,19 @@ from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 async def run(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
+    if not token:
+        print("FLUXER_BOT_TOKEN is required", file=sys.stderr)
+        return 2
+
     adapter = FluxerAdapter(
         PlatformConfig(
-            name="fluxer",
-            type="fluxer",
             enabled=True,
-            config={
-                "bot_token": os.environ.get("FLUXER_BOT_TOKEN"),
-                "base_url": os.environ.get("FLUXER_BASE_URL", "https://api.fluxer.app/v1"),
-                "gateway_url": os.environ.get("FLUXER_GATEWAY_URL"),
+            extra={
+                "bot_token": token,
+                "base_url": os.getenv("FLUXER_BASE_URL", ""),
+                "gateway_url": os.getenv("FLUXER_GATEWAY_URL", ""),
+                "allow_all_users": True,
             },
         )
     )
@@ -53,7 +90,7 @@ async def run(args: argparse.Namespace) -> int:
     async def on_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
         try:
             info = await bridge.connect_from_voice_server_update(raw_update)
-            connected.set()
+            result["room_before_capture"] = _safe_room_snapshot(bridge._room)
             pcm = await bridge.collect_remote_audio_pcm16(
                 duration_seconds=args.listen_seconds,
                 sample_rate=args.sample_rate,
@@ -83,9 +120,12 @@ async def run(args: argparse.Namespace) -> int:
                 "xai_events_tail": list(xai_result.events_seen[-5:]),
                 "duplex_turn_published": True,
             }
+            connected.set()
         except Exception as exc:  # token intentionally not included
             result["error"] = type(exc).__name__
             result["message"] = str(exc)
+            if bridge._room is not None:
+                result["room_at_error"] = _safe_room_snapshot(bridge._room)
             connected.set()
 
     adapter.set_voice_server_update_handler(on_voice_server_update)
