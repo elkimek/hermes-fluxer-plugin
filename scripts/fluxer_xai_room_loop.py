@@ -23,6 +23,7 @@ import os
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -40,6 +41,17 @@ logger = logging.getLogger("fluxer_xai_room_loop")
 
 class BargeInInterrupt(Exception):
     """Raised when fresh user speech interrupts assistant playback."""
+
+
+@dataclass
+class BargeInCapture:
+    """State shared between assistant playback and the barge-in listener."""
+
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    pcm: bytes = b""
+    captured_audio_seconds: float = 0.0
 
 
 DEFAULT_INSTRUCTIONS = """You are Žofka speaking with Elkim in a Fluxer voice room.
@@ -168,29 +180,70 @@ async def _capture_one_speech_segment(
 async def _wait_for_barge_in(
     args: argparse.Namespace,
     bridge: FluxerLiveKitSmokeBridge,
-    stop_event: asyncio.Event,
+    capture_or_event: BargeInCapture | asyncio.Event,
 ) -> None:
-    """Set stop_event when sustained fresh user speech arrives during assistant output."""
+    """Detect sustained fresh user speech and retain it as carryover PCM."""
+
+    if isinstance(capture_or_event, BargeInCapture):
+        capture = capture_or_event
+    else:
+        capture = BargeInCapture(event=capture_or_event)
 
     chunks = bridge.iter_remote_audio_pcm16(
         sample_rate=args.sample_rate,
         frame_size_ms=args.frame_ms,
         participant_identity=args.participant_identity,
     )
+    bytes_per_ms = args.sample_rate * 2 / 1000
+    silence_ms = getattr(args, "silence_ms", 600)
+    end_padding_ms = getattr(args, "end_padding_ms", min(180, silence_ms))
+    min_segment_ms = getattr(args, "min_segment_ms", args.barge_in_min_ms)
+    max_segment_seconds = getattr(args, "max_segment_seconds", 8.0)
+    silence_bytes_limit = int(bytes_per_ms * silence_ms)
+    end_padding_bytes = int(bytes_per_ms * end_padding_ms)
+    min_bytes = int(bytes_per_ms * min_segment_ms)
+    max_bytes = int(args.sample_rate * max_segment_seconds) * 2
+    segment = bytearray()
+    trailing_silence = 0
     voiced_ms = 0
+    in_segment = False
     try:
         async for chunk in chunks:
-            if stop_event.is_set():
+            if capture.stop_event.is_set():
                 return
+            if not chunk:
+                continue
             rms = _pcm16_rms(chunk)
-            if rms >= args.barge_in_energy_threshold:
+            voiced = rms >= args.barge_in_energy_threshold
+            if voiced:
+                in_segment = True
+                trailing_silence = 0
                 voiced_ms += args.frame_ms
+                segment.extend(chunk)
                 if voiced_ms >= args.barge_in_min_ms:
-                    stop_event.set()
-                    return
+                    capture.event.set()
+            elif in_segment:
+                voiced_ms = 0
+                segment.extend(chunk)
+                trailing_silence += len(chunk)
             else:
                 voiced_ms = 0
+
+            if in_segment and (trailing_silence >= silence_bytes_limit or len(segment) >= max_bytes):
+                if trailing_silence > end_padding_bytes:
+                    trim_bytes = trailing_silence - end_padding_bytes
+                    if trim_bytes > 0:
+                        del segment[-trim_bytes:]
+                if len(segment) >= min_bytes and capture.event.is_set():
+                    capture.pcm = bytes(segment)
+                    capture.captured_audio_seconds = _pcm16_duration_seconds(capture.pcm, sample_rate=args.sample_rate)
+                    capture.ready.set()
+                return
     finally:
+        if segment and capture.event.is_set() and not capture.ready.is_set():
+            capture.pcm = bytes(segment)
+            capture.captured_audio_seconds = _pcm16_duration_seconds(capture.pcm, sample_rate=args.sample_rate)
+            capture.ready.set()
         close_chunks = getattr(chunks, "aclose", None)
         if close_chunks is not None:
             await close_chunks()
@@ -211,17 +264,25 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         sample_rate=args.sample_rate,
         instructions=args.wake_gate_instructions,
     )
+    carryover_pcm: bytes | None = None
     while True:
         if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
             break
         remaining = args.max_runtime_seconds - (time.monotonic() - started) if args.max_runtime_seconds else 30.0
-        try:
-            capture_started = time.monotonic()
-            pcm = await _capture_one_speech_segment(args, bridge, timeout=max(1.0, remaining))
-            capture_seconds = time.monotonic() - capture_started
+        from_barge_in_carryover = carryover_pcm is not None
+        if carryover_pcm is not None:
+            pcm = carryover_pcm
+            carryover_pcm = None
+            capture_seconds = 0.0
             captured_audio_seconds = _pcm16_duration_seconds(pcm, sample_rate=args.sample_rate)
-        except TimeoutError:
-            break
+        else:
+            try:
+                capture_started = time.monotonic()
+                pcm = await _capture_one_speech_segment(args, bridge, timeout=max(1.0, remaining))
+                capture_seconds = time.monotonic() - capture_started
+                captured_audio_seconds = _pcm16_duration_seconds(pcm, sample_rate=args.sample_rate)
+            except TimeoutError:
+                break
         turn_no = len(turns) + 1
         logger.info("Captured speech turn %s bytes=%s rms=%s", turn_no, len(pcm), _pcm16_rms(pcm))
         gate_transcript = ""
@@ -247,6 +308,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                         "gate_transcript": gate_transcript,
                         "published": False,
                         "ignored": True,
+                        "from_barge_in_carryover": from_barge_in_carryover,
                         "timing": {
                             "capture_seconds": round(capture_seconds, 3),
                             "captured_audio_seconds": round(captured_audio_seconds, 3),
@@ -261,9 +323,9 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         first_audio_seconds: float | None = None
         barge_in_seconds: float | None = None
         publisher: Any | None = None
+        barge_in_capture = BargeInCapture()
         try:
             xai_started = time.monotonic()
-            barge_in_event = asyncio.Event()
             barge_in_task: asyncio.Task[Any] | None = None
             publisher = bridge.pcm16_publisher(
                 sample_rate=args.sample_rate,
@@ -272,12 +334,12 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
             )
             await publisher.__aenter__()
             if not args.disable_barge_in:
-                barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_event))
+                barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
 
             async def publish_delta(chunk: bytes) -> None:
                 nonlocal first_audio_seconds, barge_in_seconds
                 assert publisher is not None
-                if barge_in_event.is_set():
+                if barge_in_capture.event.is_set():
                     barge_in_seconds = time.monotonic() - xai_started
                     await publisher.interrupt()
                     raise BargeInInterrupt("user interrupted assistant speech")
@@ -293,14 +355,20 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     first_audio_timeout=args.xai_first_audio_timeout,
                 )
                 xai_seconds = time.monotonic() - xai_started
-                if barge_in_event.is_set():
+                if barge_in_capture.event.is_set():
                     assert publisher is not None
                     barge_in_seconds = time.monotonic() - xai_started
                     await publisher.interrupt()
                     raise BargeInInterrupt("user interrupted assistant speech")
             finally:
                 if barge_in_task is not None:
-                    barge_in_event.set()
+                    if barge_in_capture.event.is_set():
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                barge_in_capture.ready.wait(),
+                                timeout=getattr(args, "barge_in_capture_timeout", 2.0),
+                            )
+                    barge_in_capture.stop_event.set()
                     barge_in_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await barge_in_task
@@ -312,6 +380,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
             publish_seconds = time.monotonic() - publish_started
         except BargeInInterrupt:
             logger.info("Barge-in interrupted turn %s", turn_no)
+            carryover_pcm = barge_in_capture.pcm or None
             turns.append(
                 {
                     "turn": turn_no,
@@ -320,12 +389,15 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "published": False,
                     "interrupted": True,
                     "partial_response_bytes": getattr(publisher, "bytes_published", 0),
+                    "barge_in_carryover_pcm_bytes": len(carryover_pcm or b""),
+                    "from_barge_in_carryover": from_barge_in_carryover,
                     "timing": {
                         "capture_seconds": round(capture_seconds, 3),
                         "captured_audio_seconds": round(captured_audio_seconds, 3),
                         "gate_seconds": round(gate_seconds, 3),
                         "first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
                         "barge_in_seconds": round(barge_in_seconds, 3) if barge_in_seconds is not None else None,
+                        "barge_in_captured_audio_seconds": round(barge_in_capture.captured_audio_seconds, 3),
                     },
                 }
             )
@@ -341,6 +413,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "gate_transcript": gate_transcript,
                     "published": False,
                     "error": f"{type(exc).__name__}: response failed",
+                    "from_barge_in_carryover": from_barge_in_carryover,
                     "timing": {
                         "capture_seconds": round(capture_seconds, 3),
                         "captured_audio_seconds": round(captured_audio_seconds, 3),
@@ -360,6 +433,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 "xai_transcript": xai_result.transcript,
                 "xai_events_tail": list(xai_result.events_seen[-5:]),
                 "published": True,
+                "from_barge_in_carryover": from_barge_in_carryover,
                 "timing": {
                     "capture_seconds": round(capture_seconds, 3),
                     "captured_audio_seconds": round(captured_audio_seconds, 3),
@@ -481,6 +555,7 @@ def main() -> int:
     parser.add_argument("--disable-barge-in", action="store_true", help="Do not monitor for user interruption while assistant audio is streaming")
     parser.add_argument("--barge-in-energy-threshold", type=int, default=700)
     parser.add_argument("--barge-in-min-ms", type=int, default=240)
+    parser.add_argument("--barge-in-capture-timeout", type=float, default=2.0, help="How long to wait for the interrupting utterance to finish so it can become the next prompt")
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 

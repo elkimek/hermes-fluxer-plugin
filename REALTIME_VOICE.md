@@ -90,7 +90,8 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Tightened realtime answer instructions to default to one short sentence and avoid multiple follow-up questions, reducing generated-audio length.
 - Added `--xai-first-audio-timeout` so a provider turn that emits no audio delta fails fast and the room can resume listening instead of waiting for the full response timeout.
 - Added first barge-in support: while assistant audio is streaming, a fresh sustained user speech detector clears the LiveKit `AudioSource` queue, aborts further xAI audio deltas, marks the turn as interrupted, and reopens listening. Live smoke verified `interrupted_turn_count: 1` followed by a newly captured response turn.
-- Next: tune barge-in echo/noise thresholds and carry the interrupted utterance directly into the next turn rather than requiring a fresh post-interrupt capture.
+- Optimized barge-in carryover: the interrupting utterance is now retained as PCM, reported as `barge_in_carryover_pcm_bytes`, and used immediately as the next xAI prompt instead of forcing a fresh post-interrupt capture/repeat.
+- Next: live-test carryover timing in the hosted room, then tune echo/noise thresholds if Fluxer speaker playback leaks into the interruption detector.
 
 ### Phase 4 — real-time Žofka loop
 
