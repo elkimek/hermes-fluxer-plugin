@@ -40,6 +40,19 @@ class SlowRealtimeWebSocket(FakeRealtimeWebSocket):
         return await super().__anext__()
 
 
+class SequenceDelayRealtimeWebSocket(FakeRealtimeWebSocket):
+    def __init__(self, events, *, delays):
+        super().__init__(events)
+        self.delays = list(delays)
+
+    async def __anext__(self):
+        import asyncio
+
+        delay = self.delays.pop(0) if self.delays else 0
+        await asyncio.sleep(delay)
+        return await super().__anext__()
+
+
 def pcm_delta(data: bytes):
     return {"type": "response.output_audio.delta", "delta": base64.b64encode(data).decode("ascii")}
 
@@ -129,19 +142,40 @@ async def test_xai_realtime_audio_response_streams_deltas_to_sink(tmp_path):
 
 @pytest.mark.asyncio
 async def test_xai_realtime_first_audio_timeout_fails_fast():
-    ws = SlowRealtimeWebSocket([{"type": "response.created"}, pcm_delta(b"\x01\x00")], delay=0.05)
+    ws = SequenceDelayRealtimeWebSocket(
+        [{"type": "response.created"}, pcm_delta(b"\x01\x00")],
+        delays=[0, 0.05],
+    )
     client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
 
     async def sink(chunk: bytes):
         raise AssertionError("sink should not receive late audio")
 
-    with pytest.raises(TimeoutError, match="emitted no audio"):
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="emitted no audio.*events_tail=.*response.created"):
         await client._audio_response_from_pcm16_to_sink_on_ws(
             ws,
             b"\x10\x00",
             sink,
             first_audio_timeout=0.001,
         )
+
+
+@pytest.mark.asyncio
+async def test_xai_realtime_wraps_audio_sink_failures_with_event_tail():
+    ws = FakeRealtimeWebSocket([
+        {"type": "response.created"},
+        pcm_delta(b"\x01\x00"),
+    ])
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
+
+    async def sink(chunk: bytes):
+        raise ValueError("publisher closed")
+
+    with pytest.raises(
+        xai_realtime.XAIRealtimeStreamError,
+        match="audio sink failed.*events_tail=.*response.output_audio.delta.*cause=ValueError: publisher closed",
+    ):
+        await client._audio_response_from_pcm16_to_sink_on_ws(ws, b"\x10\x00", sink)
 
 
 @pytest.mark.asyncio

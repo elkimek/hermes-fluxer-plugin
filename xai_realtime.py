@@ -28,6 +28,21 @@ class XAIRealtimeAudioResult:
     transcript: str = ""
 
 
+class XAIRealtimeStreamError(RuntimeError):
+    """xAI realtime stream failure with sanitized event context."""
+
+    def __init__(self, message: str, *, events_seen: list[str] | tuple[str, ...], cause: BaseException | None = None) -> None:
+        self.events_seen = tuple(events_seen)
+        self.cause_type = type(cause).__name__ if cause is not None else None
+        self.cause_message = str(cause) if cause is not None else ""
+        tail = self.events_seen[-12:]
+        detail = f"{message}; events_tail={tail}"
+        if cause is not None:
+            cause_text = str(cause) or repr(cause)
+            detail += f"; cause={type(cause).__name__}: {cause_text}"
+        super().__init__(detail)
+
+
 def _xai_realtime_url(model: str) -> str:
     return f"{_XAI_REALTIME_URL}?model={model}"
 
@@ -297,7 +312,11 @@ class XAIRealtimeVoiceClient:
             except StopAsyncIteration:
                 break
             except TimeoutError as exc:
-                raise TimeoutError(f"xAI Realtime emitted no audio within {first_audio_timeout}s; events={events}") from exc
+                raise XAIRealtimeStreamError(
+                    f"xAI Realtime emitted no audio within {first_audio_timeout}s",
+                    events_seen=events,
+                    cause=exc,
+                ) from exc
             event = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
             event_type = str(event.get("type") or "")
             if event_type:
@@ -308,7 +327,14 @@ class XAIRealtimeVoiceClient:
             if event_type == "response.output_audio.delta":
                 chunk = _decode_audio_delta(event)
                 if chunk:
-                    await on_audio_delta(chunk)
+                    try:
+                        await on_audio_delta(chunk)
+                    except Exception as exc:
+                        raise XAIRealtimeStreamError(
+                            "xAI audio sink failed while handling output delta",
+                            events_seen=events,
+                            cause=exc,
+                        ) from exc
                     bytes_written += len(chunk)
             elif event_type == "response.output_audio_transcript.delta":
                 delta = event.get("delta")
@@ -317,7 +343,7 @@ class XAIRealtimeVoiceClient:
             elif event_type == "response.done":
                 break
         if bytes_written <= 0:
-            raise RuntimeError(f"xAI Realtime returned no audio; events={events}")
+            raise XAIRealtimeStreamError("xAI Realtime returned no audio", events_seen=events)
         return XAIRealtimeAudioResult(
             wav_path=None,
             sample_rate=self.sample_rate,
