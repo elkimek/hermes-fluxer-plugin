@@ -57,6 +57,12 @@ async def run(args: argparse.Namespace) -> int:
     async def handle_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
         try:
             info = await bridge.connect_from_voice_server_update(raw_update)
+            if args.tone_seconds > 0:
+                await bridge.publish_test_tone(
+                    duration_seconds=args.tone_seconds,
+                    frequency_hz=args.tone_hz,
+                    amplitude=args.tone_amplitude,
+                )
             result["safe_update"] = safe_update
             result["connection"] = {
                 "endpoint": info.endpoint,
@@ -65,6 +71,7 @@ async def run(args: argparse.Namespace) -> int:
                 "connection_id": info.connection_id,
                 "room_name": info.room_name,
                 "participant_identity": info.participant_identity,
+                "tone_published": args.tone_seconds > 0,
             }
             connected.set()
         except Exception as exc:  # token intentionally not included
@@ -75,6 +82,9 @@ async def run(args: argparse.Namespace) -> int:
     try:
         if not await adapter.connect():
             print("Fluxer adapter did not connect to gateway", file=sys.stderr)
+            return 1
+        if not await adapter.wait_until_gateway_ready(timeout=min(args.timeout, 10.0)):
+            print("Fluxer gateway connected but did not reach READY before voice join", file=sys.stderr)
             return 1
         sent = await adapter.send_voice_state_update(
             args.channel_id,
@@ -109,6 +119,9 @@ def main() -> int:
     parser.add_argument("--unmute", action="store_true", help="Join unmuted; default is muted for smoke safety")
     parser.add_argument("--listen", action="store_true", help="Join undeafened/listening; default is deaf for smoke safety")
     parser.add_argument("--auto-subscribe", action="store_true", help="Ask LiveKit SDK to auto-subscribe to room tracks")
+    parser.add_argument("--tone-seconds", type=float, default=0.0, help="Publish a short sine tone after joining; 0 disables audio publishing")
+    parser.add_argument("--tone-hz", type=float, default=440.0, help="Sine tone frequency for --tone-seconds")
+    parser.add_argument("--tone-amplitude", type=float, default=0.18, help="Sine tone amplitude, 0.0-1.0")
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 

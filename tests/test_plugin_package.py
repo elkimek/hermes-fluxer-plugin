@@ -484,3 +484,29 @@ def test_pyproject_has_runtime_dependencies():
 
     assert any(dep.startswith("httpx") for dep in deps)
     assert any(dep.startswith("websockets") for dep in deps)
+
+
+def test_realtime_voice_spike_doc_records_fluxer_livekit_flow():
+    doc = (ROOT / "REALTIME_VOICE.md").read_text()
+
+    assert "opcode 4" in doc
+    assert "VOICE_SERVER_UPDATE" in doc
+    assert "LiveKit" in doc
+    assert "xAI Realtime" in doc
+    assert "standalone plugin" in doc
+
+@pytest.mark.asyncio
+async def test_gateway_ready_event_is_set_on_ready_dispatch(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+
+    assert await adapter.wait_until_gateway_ready(timeout=0.001) is False
+    await adapter._handle_gateway_dispatch(
+        {"op": 0, "t": "READY", "d": {"user": {"id": "bot-user"}}}
+    )
+
+    assert adapter.bot_user_id == "bot-user"
+    assert await adapter.wait_until_gateway_ready(timeout=0.001) is True

@@ -6,6 +6,13 @@ import livekit_bridge
 class FakeParticipant:
     identity = "fluxer-bot"
 
+    def __init__(self):
+        self.published = []
+
+    async def publish_track(self, track, options):
+        self.published.append((track, options))
+        return type("Publication", (), {"sid": "track-sid"})()
+
 
 class FakeRoom:
     def __init__(self):
@@ -91,3 +98,81 @@ async def test_smoke_bridge_requires_endpoint_and_token_without_leaking_token():
         )
 
     assert "secret-token" not in str(exc.value)
+
+class FakeAudioSource:
+    instances = []
+
+    def __init__(self, sample_rate, num_channels):
+        self.sample_rate = sample_rate
+        self.num_channels = num_channels
+        self.frames = []
+        self.waited = False
+        self.closed = False
+        FakeAudioSource.instances.append(self)
+
+    async def capture_frame(self, frame):
+        self.frames.append(frame)
+
+    async def wait_for_playout(self):
+        self.waited = True
+
+    async def aclose(self):
+        self.closed = True
+
+
+class FakeAudioFrame:
+    def __init__(self, data, sample_rate, num_channels, samples_per_channel):
+        self.data = data
+        self.sample_rate = sample_rate
+        self.num_channels = num_channels
+        self.samples_per_channel = samples_per_channel
+
+
+class FakeLocalAudioTrack:
+    @staticmethod
+    def create_audio_track(name, source):
+        return {"name": name, "source": source}
+
+
+class FakeTrackPublishOptions:
+    def __init__(self):
+        self.source = None
+
+
+class FakeTrackSource:
+    SOURCE_MICROPHONE = 2
+
+
+class FakeRtc:
+    AudioSource = FakeAudioSource
+    AudioFrame = FakeAudioFrame
+    LocalAudioTrack = FakeLocalAudioTrack
+    TrackPublishOptions = FakeTrackPublishOptions
+    TrackSource = FakeTrackSource
+
+
+@pytest.mark.asyncio
+async def test_publish_test_tone_publishes_pcm_audio_frames(monkeypatch):
+    FakeAudioSource.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FakeRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+
+    await bridge.publish_test_tone(duration_seconds=0.04, sample_rate=1000, frequency_hz=100, frame_ms=20)
+
+    source = FakeAudioSource.instances[0]
+    assert room.local_participant.published[0][0] == {"name": "zofka-test-tone", "source": source}
+    assert room.local_participant.published[0][1].source == FakeTrackSource.SOURCE_MICROPHONE
+    assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
+    assert all(frame.sample_rate == 1000 and frame.num_channels == 1 for frame in source.frames)
+    assert source.waited is True
+    assert source.closed is True
+
+
+@pytest.mark.asyncio
+async def test_publish_test_tone_requires_connected_room():
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=FakeRoom)
+
+    with pytest.raises(RuntimeError, match="not connected"):
+        await bridge.publish_test_tone()

@@ -621,6 +621,10 @@ class FluxerAdapter(BasePlatformAdapter):
         self._pending_exec_approvals: Dict[str, Dict[str, Any]] = {}
         self._pending_component_actions: Dict[str, Dict[str, Any]] = {}
         self._pending_reaction_actions: Dict[str, Dict[str, Any]] = {}
+        self._pending_voice_joins: Dict[str, Dict[str, Any]] = {}
+        self._last_voice_server_update: Optional[Dict[str, Any]] = None
+        self._voice_server_update_handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Any]] = None
+        self._gateway_ready_event = asyncio.Event()
 
     async def connect(self) -> bool:
         if not self.bot_token:
@@ -661,6 +665,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._heartbeat_task = None
         self._listener_task = None
         self._reconnect_task = None
+        self._gateway_ready_event.clear()
         self._mark_disconnected()
 
     async def _connect_gateway_once(self) -> None:
@@ -688,6 +693,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._awaiting_heartbeat_ack = False
         self._last_heartbeat_sent_at = None
         self._last_heartbeat_ack_at = None
+        self._gateway_ready_event.clear()
 
         sep = "&" if "?" in self.gateway_url else "?"
         ws_url = f"{self.gateway_url}{sep}v={_GATEWAY_VERSION}&encoding=json"
@@ -1797,6 +1803,60 @@ class FluxerAdapter(BasePlatformAdapter):
         self._awaiting_heartbeat_ack = True
         await self._ws.send(json.dumps({"op": 1, "d": self._last_seq}))
 
+    async def _send_gateway_payload(self, payload: Dict[str, Any]) -> bool:
+        """Send a raw Fluxer gateway payload if the websocket is available."""
+        if self._ws is None:
+            return False
+        await self._ws.send(json.dumps(payload))
+        return True
+
+    async def wait_until_gateway_ready(self, timeout: float = 10.0) -> bool:
+        """Wait until Fluxer gateway identification has completed with READY."""
+        if self._gateway_ready_event.is_set():
+            return True
+        try:
+            await asyncio.wait_for(self._gateway_ready_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def send_voice_state_update(
+        self,
+        channel_id: Optional[str],
+        *,
+        guild_id: Optional[str] = None,
+        connection_id: Optional[str] = None,
+        self_mute: bool = False,
+        self_deaf: bool = True,
+        self_video: bool = False,
+        self_stream: bool = False,
+        viewer_stream_keys: Optional[List[str]] = None,
+    ) -> bool:
+        """Ask Fluxer to join/update/leave a voice channel on the main gateway.
+
+        This is the first half of Fluxer's LiveKit flow. A successful send should
+        be followed by gateway VOICE_SERVER_UPDATE containing endpoint/token;
+        the future realtime bridge can then connect to LiveKit and publish audio.
+        """
+        payload = _build_voice_state_update_payload(
+            channel_id=channel_id,
+            guild_id=guild_id,
+            connection_id=connection_id,
+            self_mute=self_mute,
+            self_deaf=self_deaf,
+            self_video=self_video,
+            self_stream=self_stream,
+            viewer_stream_keys=viewer_stream_keys,
+        )
+        sent = await self._send_gateway_payload(payload)
+        if sent and channel_id:
+            self._pending_voice_joins[_voice_join_key(guild_id, channel_id)] = {
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "connection_id": connection_id,
+            }
+        return sent
+
     async def _heartbeat_loop(self, interval_ms: int) -> None:
         interval_s = max(interval_ms, 1000) / 1000
         ack_timeout_s = interval_s * _HEARTBEAT_ACK_TIMEOUT_FACTOR
@@ -2033,6 +2093,7 @@ class FluxerAdapter(BasePlatformAdapter):
             user = data.get("user") or data.get("bot") or {}
             if user.get("id"):
                 self.bot_user_id = str(user["id"])
+            self._gateway_ready_event.set()
             return
         if event_name == "INTERACTION_CREATE":
             await self._handle_interaction_create(data)

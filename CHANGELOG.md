@@ -19,6 +19,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Started a transport-only LiveKit smoke bridge module with optional `realtime` dependency support; it connects from a raw `VOICE_SERVER_UPDATE` payload and keeps the ephemeral token out of returned/stored/logged state.
 - Added a muted/deaf `scripts/fluxer_livekit_smoke.py` probe for the first real Fluxer voice-room presence test.
 - Verified the presence-only LiveKit smoke path against hosted Fluxer without logging or storing the ephemeral token.
+- Added and verified low-amplitude sine-tone publishing to hosted Fluxer LiveKit for the first audible bot smoke path.
 
 ## [0.1.1] - 2026-06-05
 
