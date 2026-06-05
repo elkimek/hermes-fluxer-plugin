@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -615,24 +616,34 @@ async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmok
     publisher = bridge.pcm16_publisher(
         sample_rate=args.sample_rate,
         frame_ms=args.frame_ms,
-        track_name="zofka-barge-diagnostic-silence",
+        track_name="zofka-barge-diagnostic-tone",
     )
     frame_samples = max(1, args.sample_rate * args.frame_ms // 1000)
-    silence_frame = b"\x00\x00" * frame_samples
+    tone_phase = 0.0
+    tone_step = 2.0 * math.pi * args.diagnostic_tone_hz / args.sample_rate
+
+    def tone_frame() -> bytes:
+        nonlocal tone_phase
+        samples = bytearray()
+        for _ in range(frame_samples):
+            sample = int(args.diagnostic_tone_amplitude * math.sin(tone_phase))
+            samples.extend(sample.to_bytes(2, byteorder="little", signed=True))
+            tone_phase = (tone_phase + tone_step) % (2.0 * math.pi)
+        return bytes(samples)
     max_rms = 0
     voiced_ms = 0
     chunks_seen = 0
     detected_at: float | None = None
     first_chunk_at: float | None = None
 
-    async def publish_silence() -> None:
+    async def publish_tone() -> None:
         await publisher.__aenter__()
         end_at = time.monotonic() + args.diagnose_seconds
         while time.monotonic() < end_at and detected_at is None:
-            await publisher.write(silence_frame)
+            await publisher.write(tone_frame())
             await asyncio.sleep(args.frame_ms / 1000)
 
-    publish_task = asyncio.create_task(publish_silence())
+    publish_task = asyncio.create_task(publish_tone())
     iterator = chunks.__aiter__()
     try:
         while True:
@@ -686,6 +697,8 @@ async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         "frame_ms": args.frame_ms,
         "threshold": args.barge_in_energy_threshold,
         "min_ms": args.barge_in_min_ms,
+        "tone_hz": args.diagnostic_tone_hz,
+        "tone_amplitude": args.diagnostic_tone_amplitude,
         "chunks_seen": chunks_seen,
         "first_chunk_seconds": round(first_chunk_at, 3) if first_chunk_at is not None else None,
         "max_rms": max_rms,
@@ -812,8 +825,10 @@ def main() -> int:
     parser.add_argument("--barge-in-energy-threshold", type=int, default=700)
     parser.add_argument("--barge-in-min-ms", type=int, default=240)
     parser.add_argument("--barge-in-capture-timeout", type=float, default=2.0, help="How long to wait for the interrupting utterance to finish so it can become the next prompt")
-    parser.add_argument("--diagnose-barge-in", action="store_true", help="Run a silent LiveKit-only barge-in receive/publish diagnostic instead of xAI conversation")
+    parser.add_argument("--diagnose-barge-in", action="store_true", help="Run an audible LiveKit-only barge-in receive/publish diagnostic instead of xAI conversation")
     parser.add_argument("--diagnose-seconds", type=float, default=20.0, help="Seconds to run --diagnose-barge-in")
+    parser.add_argument("--diagnostic-tone-hz", type=float, default=440.0, help="Tone frequency for --diagnose-barge-in audible probe")
+    parser.add_argument("--diagnostic-tone-amplitude", type=int, default=1800, help="PCM16 amplitude for --diagnose-barge-in audible probe")
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 
