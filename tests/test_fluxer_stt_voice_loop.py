@@ -8,6 +8,7 @@ from scripts.fluxer_stt_voice_loop import (
     build_answer_prompt,
     build_hermes_messages,
     load_env_file,
+    normalize_voice_transcript,
     parse_args,
     safe_stt_summary,
     transcribe_with_provider,
@@ -50,6 +51,22 @@ def test_build_hermes_messages_preserves_history_and_latest_transcript():
     ]
 
 
+def test_normalize_voice_transcript_strips_recalled_memory_context():
+    transcript = "Yeah, I just want you to improve\n\n<memory-context>\n[System note: recalled memory, not speech]\nPrivate facts and long context.\n</memory-context>"
+
+    assert normalize_voice_transcript(transcript) == "Yeah, I just want you to improve"
+
+
+def test_build_hermes_messages_does_not_treat_memory_context_as_user_speech():
+    messages = build_hermes_messages(
+        "Improve it <memory-context>not spoken</memory-context>",
+        history=[],
+        system="system context",
+    )
+
+    assert messages[-1] == {"role": "user", "content": "Improve it"}
+
+
 def test_append_jsonl_writes_one_turn_per_line(tmp_path):
     path = tmp_path / "turns.jsonl"
 
@@ -66,7 +83,7 @@ def test_safe_stt_summary_drops_extra_provider_payload():
     summary = safe_stt_summary(
         {
             "success": True,
-            "transcript": "hello",
+            "transcript": "hello <memory-context>not spoken</memory-context>",
             "provider": "local",
             "model": "medium.en",
             "error": None,
@@ -83,12 +100,12 @@ def test_safe_stt_summary_drops_extra_provider_payload():
     }
 
 
-def test_parse_args_defaults_to_accurate_local_stt_and_fixed_capture():
+def test_parse_args_defaults_to_realtime_voice_stack():
     args = parse_args(["--channel-id", "voice-room"])
 
-    assert args.stt_provider == "local"
+    assert args.stt_provider == "elevenlabs"
     assert args.stt_model == "medium.en"
-    assert args.capture_mode == "fixed"
+    assert args.capture_mode == "vad"
     assert args.capture_window_seconds == 3.0
     assert args.brain_provider == "hermes"
     assert args.hermes_url == "http://127.0.0.1:8642"

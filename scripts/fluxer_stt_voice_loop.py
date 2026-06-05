@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -97,10 +98,28 @@ def write_pcm16_wav(path: Path, pcm: bytes, *, sample_rate: int) -> Path:
     return path
 
 
+_MEMORY_CONTEXT_RE = re.compile(r"<memory-context>.*?</memory-context>", re.IGNORECASE | re.DOTALL)
+_SYSTEM_NOTE_RE = re.compile(r"\[System note:.*?\]", re.IGNORECASE | re.DOTALL)
+
+
+def normalize_voice_transcript(transcript: str) -> str:
+    """Drop non-spoken context wrappers before routing STT text to Hermes.
+
+    The live API may append recalled memory/context blocks beside a voice
+    transcript. Those are useful to the agent, but they are not something Elkim
+    said out loud; feeding them back as user speech makes Žofka answer the
+    wrapper instead of the actual utterance.
+    """
+
+    cleaned = _MEMORY_CONTEXT_RE.sub(" ", transcript or "")
+    cleaned = _SYSTEM_NOTE_RE.sub(" ", cleaned)
+    return " ".join(cleaned.split()).strip()
+
+
 def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], system: str = DEFAULT_TEXT_SYSTEM) -> str:
     """Build a compact text prompt for a voice answer grounded in STT text."""
 
-    transcript = transcript.strip()
+    transcript = normalize_voice_transcript(transcript)
     history_lines: list[str] = []
     for item in history[-6:]:
         user = (item.get("user") or "").strip()
@@ -127,7 +146,7 @@ def build_hermes_messages(transcript: str, *, history: list[dict[str, str]], sys
             messages.append({"role": "user", "content": user})
         if assistant:
             messages.append({"role": "assistant", "content": assistant})
-    messages.append({"role": "user", "content": transcript.strip()})
+    messages.append({"role": "user", "content": normalize_voice_transcript(transcript)})
     return messages
 
 
@@ -179,7 +198,11 @@ def transcribe_with_provider(file_path: str, *, provider: str, model: str | None
 
 
 def safe_stt_summary(result: dict[str, Any]) -> dict[str, Any]:
-    return {key: result.get(key) for key in ("success", "transcript", "provider", "model", "error")}
+    summary = {key: result.get(key) for key in ("success", "transcript", "provider", "model", "error")}
+    transcript = summary.get("transcript")
+    if isinstance(transcript, str):
+        summary["transcript"] = normalize_voice_transcript(transcript)
+    return summary
 
 
 def append_jsonl(path: str | None, item: dict[str, Any]) -> None:
@@ -253,7 +276,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     model=args.stt_model,
                 )
                 stt_seconds = time.monotonic() - stt_started
-                transcript = (stt_result.get("transcript") or "").strip()
+                transcript = normalize_voice_transcript((stt_result.get("transcript") or "").strip())
                 turn: dict[str, Any] = {
                     "turn": turn_no,
                     "captured_pcm_bytes": len(pcm),
@@ -376,7 +399,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Only capture remote LiveKit participants whose identity starts with this prefix, e.g. user_<FluxerUserId>_",
     )
     parser.add_argument("--max-turns", type=int, default=3)
-    parser.add_argument("--capture-mode", choices=("vad", "fixed"), default="fixed")
+    parser.add_argument("--capture-mode", choices=("vad", "fixed"), default="vad")
     parser.add_argument("--capture-window-seconds", type=float, default=3.0)
     parser.add_argument("--capture-timeout", type=float, default=25.0)
     parser.add_argument("--initial-settle-seconds", type=float, default=0.8)
@@ -394,8 +417,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hermes-timeout", type=float, default=90.0)
     parser.add_argument("--hermes-max-tokens", type=int, default=90)
     parser.add_argument("--hermes-temperature", type=float, default=0.4)
-    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="local")
-    parser.add_argument("--stt-model", default="medium.en", help="STT model; local default medium.en for accuracy, Groq default whisper-large-v3-turbo, ElevenLabs default scribe_v2")
+    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="elevenlabs")
+    parser.add_argument("--stt-model", default="medium.en", help="STT model; ElevenLabs default scribe_v2, local default medium.en for accuracy, Groq default whisper-large-v3-turbo")
     parser.add_argument("--xai-timeout", type=float, default=45.0)
     parser.add_argument("--xai-first-audio-timeout", type=float, default=12.0)
     parser.add_argument("--connect-timeout", type=float, default=30.0)
