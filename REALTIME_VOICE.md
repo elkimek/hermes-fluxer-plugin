@@ -63,13 +63,13 @@ Status: started in this repo.
 
 ### Phase 2 — observe `VOICE_SERVER_UPDATE`
 
-Status: started in this repo.
+Status: implemented in this repo.
 
 - Teach `_handle_gateway_dispatch` to recognize `VOICE_SERVER_UPDATE`.
 - Keep a small pending-join map keyed by `(guild_id, channel_id)` and `connection_id`.
 - Store only non-secret metadata: endpoint, connection id, guild/channel ids, and token presence.
 - Never retain or log the LiveKit token.
-- Next: expose a bridge callback/hook for the full `VOICE_SERVER_UPDATE` payload without writing its token into persistent adapter state.
+- Expose an in-memory bridge callback/hook for the raw `VOICE_SERVER_UPDATE` payload so a future LiveKit bridge can consume the ephemeral token without writing it into persistent adapter state.
 
 ### Phase 3 — LiveKit smoke bridge
 

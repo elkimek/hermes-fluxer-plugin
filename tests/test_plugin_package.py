@@ -511,6 +511,74 @@ async def test_unmatched_voice_server_update_is_still_sanitized(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_voice_server_update_handler_receives_live_token_in_memory_only(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    received = []
+
+    async def bridge_handler(raw_update, safe_update):
+        received.append((raw_update, safe_update))
+
+    adapter.set_voice_server_update_handler(bridge_handler)
+
+    await adapter._handle_gateway_dispatch(
+        {
+            "op": 0,
+            "t": "VOICE_SERVER_UPDATE",
+            "d": {
+                "guild_id": "guild-1",
+                "channel_id": "voice-chan",
+                "connection_id": "conn-1",
+                "endpoint": "wss://livekit.fluxer.example",
+                "token": "ephemeral-livekit-token",
+            },
+        }
+    )
+
+    assert len(received) == 1
+    raw_update, safe_update = received[0]
+    assert raw_update["token"] == "ephemeral-livekit-token"
+    assert safe_update == adapter._last_voice_server_update
+    assert "token" not in safe_update
+    assert "ephemeral-livekit-token" not in repr(adapter._last_voice_server_update)
+
+
+@pytest.mark.asyncio
+async def test_voice_server_update_handler_failure_does_not_persist_token(monkeypatch, caplog):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+
+    def bridge_handler(raw_update, safe_update):
+        raise RuntimeError(f"bridge failed for {raw_update['token']}")
+
+    adapter.set_voice_server_update_handler(bridge_handler)
+
+    await adapter._handle_gateway_dispatch(
+        {
+            "op": 0,
+            "t": "VOICE_SERVER_UPDATE",
+            "d": {
+                "guild_id": "guild-1",
+                "channel_id": "voice-chan",
+                "connection_id": "conn-1",
+                "endpoint": "wss://livekit.fluxer.example",
+                "token": "failure-secret-token",
+            },
+        }
+    )
+
+    assert adapter._last_voice_server_update["has_token"] is True
+    assert "failure-secret-token" not in repr(adapter._last_voice_server_update)
+    assert "failure-secret-token" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_send_voice_uploads_fluxer_voice_message_payload(monkeypatch, tmp_path):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
