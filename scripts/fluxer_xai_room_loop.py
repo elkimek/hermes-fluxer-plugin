@@ -105,14 +105,41 @@ async def _speech_segments(
                 yield pcm
 
 
-async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmokeBridge) -> dict[str, Any]:
-    turns: list[dict[str, Any]] = []
-    started = time.monotonic()
+async def _capture_one_speech_segment(
+    args: argparse.Namespace,
+    bridge: FluxerLiveKitSmokeBridge,
+    *,
+    timeout: float,
+) -> bytes:
+    """Capture one speech segment, then close the LiveKit consumer to drop stale backlog."""
+
     chunks = bridge.iter_remote_audio_pcm16(
         sample_rate=args.sample_rate,
         frame_size_ms=args.frame_ms,
         participant_identity=args.participant_identity,
     )
+    segments = _speech_segments(
+        chunks,
+        sample_rate=args.sample_rate,
+        energy_threshold=args.energy_threshold,
+        silence_ms=args.silence_ms,
+        min_segment_ms=args.min_segment_ms,
+        max_segment_seconds=args.max_segment_seconds,
+    )
+    try:
+        return await asyncio.wait_for(anext(segments), timeout=timeout)
+    finally:
+        close_segments = getattr(segments, "aclose", None)
+        if close_segments is not None:
+            await close_segments()
+        close_chunks = getattr(chunks, "aclose", None)
+        if close_chunks is not None:
+            await close_chunks()
+
+
+async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmokeBridge) -> dict[str, Any]:
+    turns: list[dict[str, Any]] = []
+    started = time.monotonic()
     xai = XAIRealtimeVoiceClient(
         model=args.xai_model,
         voice=args.xai_voice,
@@ -125,14 +152,14 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         sample_rate=args.sample_rate,
         instructions=args.wake_gate_instructions,
     )
-    async for pcm in _speech_segments(
-        chunks,
-        sample_rate=args.sample_rate,
-        energy_threshold=args.energy_threshold,
-        silence_ms=args.silence_ms,
-        min_segment_ms=args.min_segment_ms,
-        max_segment_seconds=args.max_segment_seconds,
-    ):
+    while True:
+        if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
+            break
+        remaining = args.max_runtime_seconds - (time.monotonic() - started) if args.max_runtime_seconds else 30.0
+        try:
+            pcm = await _capture_one_speech_segment(args, bridge, timeout=max(1.0, remaining))
+        except TimeoutError:
+            break
         turn_no = len(turns) + 1
         logger.info("Captured speech turn %s bytes=%s rms=%s", turn_no, len(pcm), _pcm16_rms(pcm))
         gate_transcript = ""
