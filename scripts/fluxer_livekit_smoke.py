@@ -67,6 +67,8 @@ async def run(args: argparse.Namespace) -> int:
     async def handle_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
         try:
             info = await bridge.connect_from_voice_server_update(raw_update)
+            if args.pre_publish_delay > 0:
+                await asyncio.sleep(args.pre_publish_delay)
             if args.tone_seconds > 0:
                 await bridge.publish_test_tone(
                     duration_seconds=args.tone_seconds,
@@ -77,6 +79,8 @@ async def run(args: argparse.Namespace) -> int:
                 await bridge.publish_wav_file(args.wav_path)
             if generated_wav_path:
                 await bridge.publish_wav_file(generated_wav_path, track_name="zofka-xai-realtime")
+            if args.post_publish_hold > 0:
+                await asyncio.sleep(args.post_publish_hold)
             result["safe_update"] = safe_update
             result["connection"] = {
                 "endpoint": info.endpoint,
@@ -135,6 +139,8 @@ def main() -> int:
     parser.add_argument("--unmute", action="store_true", help="Join unmuted; default is muted for smoke safety")
     parser.add_argument("--listen", action="store_true", help="Join undeafened/listening; default is deaf for smoke safety")
     parser.add_argument("--auto-subscribe", action="store_true", help="Ask LiveKit SDK to auto-subscribe to room tracks")
+    parser.add_argument("--pre-publish-delay", type=float, default=0.0, help="Seconds to remain in the room before publishing test audio")
+    parser.add_argument("--post-publish-hold", type=float, default=0.0, help="Seconds to remain in the room after publishing test audio")
     parser.add_argument("--tone-seconds", type=float, default=0.0, help="Publish a short sine tone after joining; 0 disables audio publishing")
     parser.add_argument("--tone-hz", type=float, default=440.0, help="Sine tone frequency for --tone-seconds")
     parser.add_argument("--tone-amplitude", type=float, default=0.18, help="Sine tone amplitude, 0.0-1.0")

@@ -78,6 +78,27 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+async def _wait_for_livekit_subscription(publication: Any, *, timeout: float = 5.0) -> bool:
+    """Wait briefly until at least one remote participant subscribes to a local track."""
+
+    wait_for_subscription = getattr(publication, "wait_for_subscription", None)
+    if wait_for_subscription is None:
+        return False
+    try:
+        await asyncio.wait_for(_maybe_await(wait_for_subscription()), timeout=timeout)
+        return True
+    except TimeoutError:
+        logger.warning(
+            "Fluxer LiveKit local track had no subscriber before timeout sid=%s source=%s kind=%s muted=%s timeout=%.1fs",
+            getattr(publication, "sid", "<none>"),
+            getattr(publication, "source", "<unknown>"),
+            getattr(publication, "kind", "<unknown>"),
+            getattr(publication, "muted", "<unknown>"),
+            timeout,
+        )
+        return False
+
+
 def _sine_pcm16_frame(
     *,
     start_sample: int,
@@ -135,7 +156,14 @@ class _LiveKitPcm16Publisher:
         options = self._rtc.TrackPublishOptions()
         options.source = self._rtc.TrackSource.SOURCE_MICROPHONE
         self._publication = await _maybe_await(self._room.local_participant.publish_track(self._track, options))
-        logger.info("Fluxer LiveKit bridge opened streaming PCM track sid=%s", getattr(self._publication, "sid", "<none>"))
+        logger.info(
+            "Fluxer LiveKit bridge opened streaming PCM track sid=%s source=%s kind=%s muted=%s",
+            getattr(self._publication, "sid", "<none>"),
+            getattr(self._publication, "source", "<unknown>"),
+            getattr(self._publication, "kind", "<unknown>"),
+            getattr(self._publication, "muted", "<unknown>"),
+        )
+        await _wait_for_livekit_subscription(self._publication)
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
@@ -331,7 +359,14 @@ class FluxerLiveKitSmokeBridge:
         options = rtc.TrackPublishOptions()
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
         publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
-        logger.info("Fluxer LiveKit smoke bridge published test tone track sid=%s", getattr(publication, "sid", "<none>"))
+        logger.info(
+            "Fluxer LiveKit smoke bridge published test tone track sid=%s source=%s kind=%s muted=%s",
+            getattr(publication, "sid", "<none>"),
+            getattr(publication, "source", "<unknown>"),
+            getattr(publication, "kind", "<unknown>"),
+            getattr(publication, "muted", "<unknown>"),
+        )
+        await _wait_for_livekit_subscription(publication)
 
         frame_samples = max(1, sample_rate * frame_ms // 1000)
         total_samples = max(1, int(sample_rate * duration_seconds))
@@ -385,7 +420,14 @@ class FluxerLiveKitSmokeBridge:
             options = rtc.TrackPublishOptions()
             options.source = rtc.TrackSource.SOURCE_MICROPHONE
             publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
-            logger.info("Fluxer LiveKit smoke bridge published WAV track sid=%s", getattr(publication, "sid", "<none>"))
+            logger.info(
+                "Fluxer LiveKit smoke bridge published WAV track sid=%s source=%s kind=%s muted=%s",
+                getattr(publication, "sid", "<none>"),
+                getattr(publication, "source", "<unknown>"),
+                getattr(publication, "kind", "<unknown>"),
+                getattr(publication, "muted", "<unknown>"),
+            )
+            await _wait_for_livekit_subscription(publication)
 
             frame_samples = max(1, sample_rate * frame_ms // 1000)
             while True:
@@ -425,7 +467,14 @@ class FluxerLiveKitSmokeBridge:
         options = rtc.TrackPublishOptions()
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
         publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
-        logger.info("Fluxer LiveKit bridge published PCM track sid=%s", getattr(publication, "sid", "<none>"))
+        logger.info(
+            "Fluxer LiveKit bridge published PCM track sid=%s source=%s kind=%s muted=%s",
+            getattr(publication, "sid", "<none>"),
+            getattr(publication, "source", "<unknown>"),
+            getattr(publication, "kind", "<unknown>"),
+            getattr(publication, "muted", "<unknown>"),
+        )
+        await _wait_for_livekit_subscription(publication)
 
         frame_samples = max(1, sample_rate * frame_ms // 1000)
         frame_bytes = frame_samples * 2
