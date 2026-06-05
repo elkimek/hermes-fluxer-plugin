@@ -118,6 +118,8 @@ class _LiveKitPcm16Publisher:
         self._frame_bytes = self._frame_samples * 2
         self._track_name = track_name
         self._source: Any = None
+        self._track: Any = None
+        self._publication: Any = None
         self._buffer = bytearray()
         self.bytes_published = 0
         self.frames_published = 0
@@ -125,11 +127,11 @@ class _LiveKitPcm16Publisher:
 
     async def __aenter__(self) -> "_LiveKitPcm16Publisher":
         self._source = self._rtc.AudioSource(self._sample_rate, 1)
-        track = self._rtc.LocalAudioTrack.create_audio_track(self._track_name, self._source)
+        self._track = self._rtc.LocalAudioTrack.create_audio_track(self._track_name, self._source)
         options = self._rtc.TrackPublishOptions()
         options.source = self._rtc.TrackSource.SOURCE_MICROPHONE
-        publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
-        logger.info("Fluxer LiveKit bridge opened streaming PCM track sid=%s", getattr(publication, "sid", "<none>"))
+        self._publication = await _maybe_await(self._room.local_participant.publish_track(self._track, options))
+        logger.info("Fluxer LiveKit bridge opened streaming PCM track sid=%s", getattr(self._publication, "sid", "<none>"))
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
@@ -146,6 +148,26 @@ class _LiveKitPcm16Publisher:
             del self._buffer[: self._frame_bytes]
             await self._capture_chunk(chunk)
 
+    async def write_interruptible(self, pcm: bytes, should_interrupt: Callable[[], Any]) -> bool:
+        """Write PCM frame-by-frame, stopping immediately if should_interrupt fires."""
+
+        if self._source is None:
+            raise RuntimeError("Fluxer LiveKit PCM publisher is not open")
+        if not pcm:
+            return False
+        self._buffer.extend(pcm)
+        while len(self._buffer) >= self._frame_bytes:
+            if await _maybe_await(should_interrupt()):
+                await self.interrupt()
+                return True
+            chunk = bytes(self._buffer[: self._frame_bytes])
+            del self._buffer[: self._frame_bytes]
+            await self._capture_chunk(chunk)
+        if await _maybe_await(should_interrupt()):
+            await self.interrupt()
+            return True
+        return False
+
     async def close(self, *, wait_for_playout: bool = True, flush_remainder: bool = True) -> None:
         source = self._source
         if source is None:
@@ -159,9 +181,23 @@ class _LiveKitPcm16Publisher:
         self._source = None
         if wait_for_playout:
             await _maybe_await(source.wait_for_playout())
+        await self._stop_track()
         close = getattr(source, "aclose", None)
         if close is not None:
             await _maybe_await(close())
+
+    async def _stop_track(self) -> None:
+        track = self._track
+        publication = self._publication
+        self._track = None
+        self._publication = None
+        track_sid = getattr(publication, "sid", None) or getattr(publication, "track_sid", None)
+        unpublish = getattr(self._room.local_participant, "unpublish_track", None)
+        if track_sid and unpublish is not None:
+            await _maybe_await(unpublish(track_sid))
+        stop = getattr(track, "stop", None)
+        if stop is not None:
+            await _maybe_await(stop())
 
     async def interrupt(self) -> None:
         """Stop queued bot speech immediately and discard buffered PCM."""

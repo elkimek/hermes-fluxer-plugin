@@ -339,13 +339,26 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
             async def publish_delta(chunk: bytes) -> None:
                 nonlocal first_audio_seconds, barge_in_seconds
                 assert publisher is not None
-                if barge_in_capture.event.is_set():
-                    barge_in_seconds = time.monotonic() - xai_started
+
+                async def should_interrupt() -> bool:
+                    nonlocal barge_in_seconds
+                    if barge_in_capture.event.is_set():
+                        barge_in_seconds = time.monotonic() - xai_started
+                        return True
+                    return False
+
+                if await should_interrupt():
                     await publisher.interrupt()
                     raise BargeInInterrupt("user interrupted assistant speech")
                 if first_audio_seconds is None:
                     first_audio_seconds = time.monotonic() - xai_started
-                await publisher.write(chunk)
+                write_interruptible = getattr(publisher, "write_interruptible", None)
+                if write_interruptible is not None:
+                    interrupted = await write_interruptible(chunk, should_interrupt)
+                    if interrupted:
+                        raise BargeInInterrupt("user interrupted assistant speech")
+                else:
+                    await publisher.write(chunk)
 
             try:
                 xai_result = await xai.audio_response_from_pcm16_to_sink(
@@ -453,7 +466,13 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
 
 
 async def run(args: argparse.Namespace) -> int:
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger("adapter").setLevel(logging.DEBUG)
+        logging.getLogger("livekit_bridge").setLevel(logging.DEBUG)
+    for noisy_secret_logger in ("websockets", "websockets.client", "httpcore", "httpx"):
+        logging.getLogger(noisy_secret_logger).setLevel(logging.INFO)
     token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
     if not token:
         print("FLUXER_BOT_TOKEN is required", file=sys.stderr)

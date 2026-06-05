@@ -92,6 +92,7 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Added first barge-in support: while assistant audio is streaming, a fresh sustained user speech detector clears the LiveKit `AudioSource` queue, aborts further xAI audio deltas, marks the turn as interrupted, and reopens listening. Live smoke verified `interrupted_turn_count: 1` followed by a newly captured response turn.
 - Optimized barge-in carryover: the interrupting utterance is now retained as PCM, reported as `barge_in_carryover_pcm_bytes`, and used immediately as the next xAI prompt instead of forcing a fresh post-interrupt capture/repeat.
 - Next: live-test carryover timing in the hosted room, then tune echo/noise thresholds if Fluxer speaker playback leaks into the interruption detector.
+- Hardened the interrupt path after live testing showed Žofka could keep speaking: interruption now checks between 20ms frames inside large xAI audio deltas and stops/unpublishes the LiveKit local track instead of only clearing the `AudioSource` queue.
 
 ### Phase 4 — real-time Žofka loop
 

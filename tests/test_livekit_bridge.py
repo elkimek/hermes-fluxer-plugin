@@ -8,10 +8,14 @@ class FakeParticipant:
 
     def __init__(self):
         self.published = []
+        self.unpublished = []
 
     async def publish_track(self, track, options):
         self.published.append((track, options))
-        return type("Publication", (), {"sid": "track-sid"})()
+        return type("Publication", (), {"sid": "track-sid", "track_sid": "track-sid"})()
+
+    async def unpublish_track(self, track_sid):
+        self.unpublished.append(track_sid)
 
 
 class FakeRoom:
@@ -139,9 +143,20 @@ class FakeAudioFrame:
 
 
 class FakeLocalAudioTrack:
+    instances = []
+
+    def __init__(self, name, source):
+        self.name = name
+        self.source = source
+        self.stopped = False
+        FakeLocalAudioTrack.instances.append(self)
+
     @staticmethod
     def create_audio_track(name, source):
-        return {"name": name, "source": source}
+        return FakeLocalAudioTrack(name, source)
+
+    def stop(self):
+        self.stopped = True
 
 
 class FakeTrackPublishOptions:
@@ -172,7 +187,8 @@ async def test_publish_test_tone_publishes_pcm_audio_frames(monkeypatch):
     await bridge.publish_test_tone(duration_seconds=0.04, sample_rate=1000, frequency_hz=100, frame_ms=20)
 
     source = FakeAudioSource.instances[0]
-    assert room.local_participant.published[0][0] == {"name": "zofka-test-tone", "source": source}
+    assert room.local_participant.published[0][0].name == "zofka-test-tone"
+    assert room.local_participant.published[0][0].source is source
     assert room.local_participant.published[0][1].source == FakeTrackSource.SOURCE_MICROPHONE
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
     assert all(frame.sample_rate == 1000 and frame.num_channels == 1 for frame in source.frames)
@@ -206,7 +222,8 @@ async def test_publish_wav_file_publishes_pcm_audio_frames(monkeypatch, tmp_path
     await bridge.publish_wav_file(wav_path, frame_ms=20)
 
     source = FakeAudioSource.instances[0]
-    assert room.local_participant.published[0][0] == {"name": "zofka-tts-smoke", "source": source}
+    assert room.local_participant.published[0][0].name == "zofka-tts-smoke"
+    assert room.local_participant.published[0][0].source is source
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
     assert source.waited is True
     assert source.closed is True
@@ -245,7 +262,8 @@ async def test_pcm16_publisher_streams_chunks_and_flushes_remainder(monkeypatch)
         assert publisher.frames_published == 2
 
     source = FakeAudioSource.instances[0]
-    assert room.local_participant.published[0][0] == {"name": "zofka-stream", "source": source}
+    assert room.local_participant.published[0][0].name == "zofka-stream"
+    assert room.local_participant.published[0][0].source is source
     assert room.local_participant.published[0][1].source == FakeTrackSource.SOURCE_MICROPHONE
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20, 5]
     assert publisher.bytes_published == 90
@@ -268,13 +286,44 @@ async def test_pcm16_publisher_interrupt_clears_queue_without_playout(monkeypatc
     await publisher.interrupt()
 
     source = FakeAudioSource.instances[0]
+    track = room.local_participant.published[0][0]
     assert publisher.interrupted is True
     assert source.cleared is True
     assert source.waited is False
     assert source.closed is True
+    assert track.stopped is True
+    assert room.local_participant.unpublished == ["track-sid"]
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
     with pytest.raises(RuntimeError, match="not open"):
         await publisher.write(b"\x03\x00" * 20)
+
+
+@pytest.mark.asyncio
+async def test_pcm16_publisher_interruptible_write_stops_mid_chunk(monkeypatch):
+    FakeAudioSource.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FakeRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+
+    publisher = bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="zofka-stream")
+    await publisher.__aenter__()
+    calls = 0
+
+    async def should_interrupt():
+        nonlocal calls
+        calls += 1
+        return calls >= 3
+
+    interrupted = await publisher.write_interruptible(b"\x01\x00" * 100, should_interrupt)
+
+    source = FakeAudioSource.instances[0]
+    assert interrupted is True
+    assert publisher.interrupted is True
+    assert source.cleared is True
+    assert source.closed is True
+    assert room.local_participant.unpublished == ["track-sid"]
+    assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
 
 
 class FakeAudioFrameEvent:
