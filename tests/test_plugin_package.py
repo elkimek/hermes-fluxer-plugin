@@ -383,6 +383,51 @@ def test_fluxer_voice_metadata_is_safe_and_normalized():
     }
     assert "large-waveform-blob" not in repr(metadata)
 
+def test_fluxer_voice_metadata_skips_non_voice_attachment_before_voice_file():
+    metadata = fluxer_adapter._voice_attachment_metadata(
+        {
+            "type": "VOICE_MESSAGE",
+            "attachments": [
+                {"id": "thumb", "filename": "thumb.jpg", "content_type": "image/jpeg"},
+                {
+                    "id": "voice",
+                    "filename": "clip.webm",
+                    "content_type": "video/webm",
+                    "is_voice_message": True,
+                    "duration": 3.0,
+                },
+            ],
+        }
+    )
+
+    assert metadata == {
+        "is_voice_message": True,
+        "attachment_id": "voice",
+        "filename": "clip.webm",
+        "content_type": "audio/webm",
+        "duration_seconds": 3.0,
+    }
+
+
+def test_fluxer_voice_metadata_preserves_zero_duration_over_fallback_keys():
+    metadata = fluxer_adapter._voice_attachment_metadata(
+        {
+            "attachments": [
+                {
+                    "id": "voice-zero",
+                    "filename": "zero.ogg",
+                    "is_voice_message": True,
+                    "duration": 0,
+                    "duration_secs": 5.0,
+                }
+            ]
+        }
+    )
+
+    assert metadata is not None
+    assert metadata["duration_seconds"] == 0.0
+
+
 def test_fluxer_voice_attachment_without_content_type_infers_audio_mime():
     att = {
         "filename": "voice-message.ogg",

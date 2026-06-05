@@ -21,6 +21,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Fluxer attachments with voice-message shape (`VOICE_MESSAGE` flags, explicit voice markers, or duration/waveform metadata) now normalize to Hermes `MessageType.VOICE` instead of generic audio.
 - Voice-shaped WebM attachments now normalize `video/webm` filename guesses to `audio/webm`, and inbound voice events carry safe `fluxer_voice_message` metadata (`content_type`, duration, waveform presence) for downstream STT/logging without storing waveform blobs.
+- Voice metadata extraction now skips non-voice attachments that may precede the actual voice file and preserves an explicit zero-duration value instead of falling through to fallback duration keys.
 - Native approval and slash-confirm controls now share one component registration path, keeping Fluxer button state consistent with reaction/text fallbacks.
 - Attachments without an explicit MIME type now infer the MIME type from the filename, so files such as `voice-message.ogg` are cached as `audio/ogg` and can enter the normal Hermes STT path.
 - Documentation now uses safe placeholders for Fluxer bot tokens instead of token-shaped examples.

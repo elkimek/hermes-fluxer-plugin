@@ -401,6 +401,24 @@ def _fluxer_action_buttons(
     return buttons, actions
 
 
+def _attachment_is_voice_shaped(att: Dict[str, Any]) -> bool:
+    """Return True when an individual attachment carries Fluxer voice-message shape."""
+    if att.get("is_voice_message") or att.get("voice") or att.get("voice_message"):
+        return True
+    if att.get("waveform") not in (None, "", [], {}):
+        return True
+    for key in ("duration", "duration_secs", "duration_seconds"):
+        value = att.get(key)
+        if value is None:
+            continue
+        try:
+            if float(value) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _voice_attachment_metadata(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return safe, normalized metadata for the first Fluxer voice attachment."""
     if not _is_voice_message(data):
@@ -409,7 +427,7 @@ def _voice_attachment_metadata(data: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if not isinstance(attachments, list):
         return {"is_voice_message": True}
     for att in attachments:
-        if not isinstance(att, dict):
+        if not isinstance(att, dict) or not _attachment_is_voice_shaped(att):
             continue
         content_type = _attachment_content_type(att)
         meta: Dict[str, Any] = {
@@ -418,7 +436,10 @@ def _voice_attachment_metadata(data: Dict[str, Any]) -> Optional[Dict[str, Any]]
             "filename": _attachment_filename(att),
             "content_type": content_type,
         }
-        duration = att.get("duration") or att.get("duration_secs") or att.get("duration_seconds")
+        duration = next(
+            (att.get(key) for key in ("duration", "duration_secs", "duration_seconds") if att.get(key) is not None),
+            None,
+        )
         try:
             if duration is not None:
                 meta["duration_seconds"] = float(duration)
