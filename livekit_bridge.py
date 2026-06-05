@@ -528,6 +528,7 @@ class FluxerLiveKitSmokeBridge:
         sample_rate: int = 24_000,
         frame_size_ms: int = 20,
         participant_identity: str | None = None,
+        participant_identity_prefix: str | None = None,
     ) -> AsyncIterator[bytes]:
         """Stream PCM16 mono chunks from subscribed remote LiveKit audio tracks."""
 
@@ -546,9 +547,17 @@ class FluxerLiveKitSmokeBridge:
             kind = getattr(track, "kind", None)
             return str(kind).lower().endswith("audio") or track.__class__.__name__.lower().endswith("audiotrack")
 
+        def participant_matches(identity: Any) -> bool:
+            identity_text = str(identity or "")
+            if participant_identity and identity_text != participant_identity:
+                return False
+            if participant_identity_prefix and not identity_text.startswith(participant_identity_prefix):
+                return False
+            return True
+
         async def consume_track(track: Any, participant: Any) -> None:
             identity = getattr(participant, "identity", None)
-            if participant_identity and identity != participant_identity:
+            if not participant_matches(identity):
                 return
             stream = rtc.AudioStream.from_track(
                 track=track,
@@ -601,6 +610,7 @@ class FluxerLiveKitSmokeBridge:
         sample_rate: int = 24_000,
         frame_size_ms: int = 20,
         participant_identity: str | None = None,
+        participant_identity_prefix: str | None = None,
         timeout: float = 30.0,
     ) -> bytes:
         """Collect PCM16 mono audio from a subscribed remote LiveKit track.
@@ -618,6 +628,7 @@ class FluxerLiveKitSmokeBridge:
                 sample_rate=sample_rate,
                 frame_size_ms=frame_size_ms,
                 participant_identity=participant_identity,
+                participant_identity_prefix=participant_identity_prefix,
             ):
                 collected.extend(chunk)
                 if len(collected) >= target_bytes:

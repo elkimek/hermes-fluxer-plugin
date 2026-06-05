@@ -34,7 +34,8 @@ This project uses simple semantic versioning while the plugin is young:
 - Added `--diagnose-barge-in`, an audible LiveKit-only probe that keeps a local output track active while measuring remote mic RMS/detection, plus richer xAI failure messages for first-audio latency/debugging.
 - Fixed the xAI realtime audio-input path for captured Fluxer voice by sending captured PCM as an explicit `conversation.item.create` `input_audio` item before `response.create`; the older `input_audio_buffer.append`/`commit` path committed speech but did not produce responses for live Fluxer captures.
 - Added LiveKit subscriber confirmation before streaming local audio frames, so smoke tests now distinguish "track published" from "Fluxer client subscribed and can hear it".
-- Corrected realtime voice status: post-reload Fluxer playout, xAI streaming, and one-turn room-loop responses are live-verified; barge-in detection remains a tuning target because current live interruption attempts only produced short 20ms RMS bursts below sustained-detection requirements.
+- Added LiveKit participant-identity-prefix filtering so realtime capture can target Elkim's Fluxer user track (`user_<id>_*`) instead of listening to every remote audio source; targeted fixed-window STT verified the captured prompt as "Shevka, what is two past two?" while the unfiltered/VAD path produced generic/empty understanding.
+- Corrected realtime voice status: post-reload Fluxer playout, xAI streaming, one-turn room-loop responses, and STT-backed content responses are live-verified; barge-in detection remains a tuning target because current live interruption attempts only produced short 20ms RMS bursts below sustained-detection requirements.
 
 ## [0.1.1] - 2026-06-05
 

@@ -175,6 +175,7 @@ async def _capture_one_speech_segment(
         sample_rate=args.sample_rate,
         frame_size_ms=args.frame_ms,
         participant_identity=args.participant_identity,
+        participant_identity_prefix=getattr(args, "participant_identity_prefix", None),
     )
     segments = _speech_segments(
         chunks,
@@ -212,6 +213,7 @@ async def _wait_for_barge_in(
         sample_rate=args.sample_rate,
         frame_size_ms=args.frame_ms,
         participant_identity=args.participant_identity,
+        participant_identity_prefix=getattr(args, "participant_identity_prefix", None),
     )
     bytes_per_ms = args.sample_rate * 2 / 1000
     silence_ms = getattr(args, "silence_ms", 600)
@@ -612,6 +614,7 @@ async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         sample_rate=args.sample_rate,
         frame_size_ms=args.frame_ms,
         participant_identity=args.participant_identity,
+        participant_identity_prefix=getattr(args, "participant_identity_prefix", None),
     )
     publisher = bridge.pcm16_publisher(
         sample_rate=args.sample_rate,
@@ -801,7 +804,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Continuous Fluxer voice ↔ xAI Realtime room loop")
     parser.add_argument("--channel-id", required=True)
     parser.add_argument("--guild-id")
-    parser.add_argument("--participant-identity", help="Only capture this remote LiveKit participant identity")
+    parser.add_argument("--participant-identity", help="Only capture this exact remote LiveKit participant identity")
+    parser.add_argument("--participant-identity-prefix", help="Only capture remote LiveKit participants whose identity starts with this prefix")
     parser.add_argument("--connect-timeout", type=float, default=30.0)
     parser.add_argument("--max-runtime-seconds", type=float, default=120.0)
     parser.add_argument("--max-turns", type=int, default=3)
