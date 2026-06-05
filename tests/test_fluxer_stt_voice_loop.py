@@ -8,6 +8,7 @@ from scripts.fluxer_stt_voice_loop import (
     load_env_file,
     parse_args,
     safe_stt_summary,
+    transcribe_with_provider,
     write_pcm16_wav,
 )
 
@@ -49,10 +50,26 @@ def test_safe_stt_summary_drops_extra_provider_payload():
 def test_parse_args_defaults_to_fast_local_stt_and_fixed_capture():
     args = parse_args(["--channel-id", "voice-room"])
 
+    assert args.stt_provider == "local"
     assert args.stt_model == "tiny.en"
     assert args.capture_mode == "fixed"
     assert args.capture_window_seconds == 3.0
     assert args.silence_ms == 500
+
+
+def test_transcribe_with_provider_uses_groq_default_for_local_model_name(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_groq(file_path, model):
+        seen["file_path"] = file_path
+        seen["model"] = model
+        return {"success": True, "transcript": "ok", "provider": "groq"}
+
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._transcribe_groq", fake_groq)
+    result = transcribe_with_provider(str(tmp_path / "voice.wav"), provider="groq", model="tiny.en")
+
+    assert result["provider"] == "groq"
+    assert seen["model"] == "whisper-large-v3-turbo"
 
 
 def test_write_pcm16_wav_roundtrip(tmp_path):

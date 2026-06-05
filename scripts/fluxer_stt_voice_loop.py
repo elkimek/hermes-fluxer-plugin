@@ -39,7 +39,7 @@ from adapter import FluxerAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from scripts.fluxer_xai_room_loop import _capture_one_speech_segment  # noqa: E402
-from tools.transcription_tools import transcribe_audio  # noqa: E402
+from tools.transcription_tools import _transcribe_groq, _transcribe_xai, transcribe_audio  # noqa: E402
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 logger = logging.getLogger("fluxer_stt_voice_loop")
@@ -96,6 +96,21 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
         f"Latest STT transcript from Elkim: {transcript!r}\n\n"
         "Speak Žofka's next reply now, grounded only in the latest transcript and relevant history."
     )
+
+
+def transcribe_with_provider(file_path: str, *, provider: str, model: str | None) -> dict[str, Any]:
+    """Transcribe with an explicit provider for this spike loop."""
+
+    if provider == "auto":
+        return transcribe_audio(file_path, model=model)
+    if provider == "local":
+        return transcribe_audio(file_path, model=model)
+    if provider == "groq":
+        groq_model = model if model and model not in {"tiny.en", "base.en", "small.en", "medium.en"} else "whisper-large-v3-turbo"
+        return _transcribe_groq(file_path, groq_model)
+    if provider == "xai":
+        return _transcribe_xai(file_path, model or "grok-stt")
+    raise ValueError(f"Unsupported STT provider: {provider}")
 
 
 def safe_stt_summary(result: dict[str, Any]) -> dict[str, Any]:
@@ -158,7 +173,11 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 wav_path = Path(tempfile.gettempdir()) / f"zofka_stt_loop_input_{turn_no}.wav"
                 write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
                 stt_started = time.monotonic()
-                stt_result = transcribe_audio(str(wav_path), model=args.stt_model)
+                stt_result = transcribe_with_provider(
+                    str(wav_path),
+                    provider=args.stt_provider,
+                    model=args.stt_model,
+                )
                 stt_seconds = time.monotonic() - stt_started
                 transcript = (stt_result.get("transcript") or "").strip()
                 turn: dict[str, Any] = {
@@ -273,7 +292,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-segment-ms", type=int, default=500)
     parser.add_argument("--max-segment-seconds", type=float, default=6.0)
     parser.add_argument("--voice", default="eve")
-    parser.add_argument("--stt-model", default="tiny.en", help="Hermes STT/faster-whisper model; tiny.en is fastest locally")
+    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai"), default="local")
+    parser.add_argument("--stt-model", default="tiny.en", help="STT model; local default tiny.en, Groq default whisper-large-v3-turbo")
     parser.add_argument("--xai-timeout", type=float, default=45.0)
     parser.add_argument("--xai-first-audio-timeout", type=float, default=12.0)
     parser.add_argument("--connect-timeout", type=float, default=30.0)
