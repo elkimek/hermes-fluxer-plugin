@@ -411,12 +411,39 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     await publisher.write(chunk)
 
             try:
-                xai_result = await xai.audio_response_from_pcm16_to_sink(
-                    pcm,
-                    publish_delta,
-                    timeout=args.xai_timeout,
-                    first_audio_timeout=args.xai_first_audio_timeout,
+                xai_task = asyncio.create_task(
+                    xai.audio_response_from_pcm16_to_sink(
+                        pcm,
+                        publish_delta,
+                        timeout=args.xai_timeout,
+                        first_audio_timeout=args.xai_first_audio_timeout,
+                    )
                 )
+                barge_event_task: asyncio.Task[Any] | None = None
+                if not args.disable_barge_in:
+                    barge_event_task = asyncio.create_task(barge_in_capture.event.wait())
+                try:
+                    if barge_event_task is None:
+                        xai_result = await xai_task
+                    else:
+                        done, _pending = await asyncio.wait(
+                            {xai_task, barge_event_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if barge_event_task in done and barge_in_capture.event.is_set() and not xai_task.done():
+                            assert publisher is not None
+                            barge_in_seconds = time.monotonic() - xai_started
+                            await publisher.interrupt()
+                            xai_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await xai_task
+                            raise BargeInInterrupt("user interrupted assistant speech before xAI audio")
+                        xai_result = await xai_task
+                finally:
+                    if barge_event_task is not None:
+                        barge_event_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await barge_event_task
                 xai_seconds = time.monotonic() - xai_started
                 if barge_in_capture.event.is_set():
                     assert publisher is not None
