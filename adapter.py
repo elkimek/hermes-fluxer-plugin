@@ -198,10 +198,19 @@ def _attachment_content_type(att: Dict[str, Any]) -> str:
         or att.get("mimetype")
         or ""
     ).split(";", 1)[0].strip().lower()
+    filename = _attachment_filename(att)
+    suffix = Path(filename).suffix.lower()
+    voice_shaped = bool(att.get("is_voice_message") or att.get("voice") or att.get("voice_message"))
+    voice_shaped = voice_shaped or att.get("waveform") not in (None, "", [], {})
     if explicit:
+        if voice_shaped and explicit == "video/webm":
+            return "audio/webm"
         return explicit
-    guessed, _encoding = mimetypes.guess_type(_attachment_filename(att))
-    return (guessed or "application/octet-stream").split(";", 1)[0].strip().lower()
+    guessed, _encoding = mimetypes.guess_type(filename)
+    normalized = (guessed or "application/octet-stream").split(";", 1)[0].strip().lower()
+    if voice_shaped and suffix == ".webm" and normalized == "video/webm":
+        return "audio/webm"
+    return normalized
 
 
 def _extension_for_attachment(att: Dict[str, Any], content_type: str, default: str = ".bin") -> str:
@@ -374,6 +383,75 @@ def _fluxer_component_row(buttons: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 def _fluxer_button(*, custom_id: str, label: str, style: int) -> Dict[str, Any]:
     return {"type": 2, "style": style, "custom_id": custom_id[:100], "label": label, "disabled": False}
+
+
+def _fluxer_action_buttons(
+    *,
+    prefix: str,
+    specs: tuple[tuple[str, str, str], ...],
+    danger_choice: str,
+) -> tuple[List[Dict[str, Any]], List[tuple[str, str]]]:
+    """Build Fluxer component buttons plus action ids for a native-controls prompt."""
+    buttons: List[Dict[str, Any]] = []
+    actions: List[tuple[str, str]] = []
+    for _emoji, choice, label in specs:
+        custom_id = f"{prefix}:{uuid.uuid4().hex}:{choice}"
+        actions.append((custom_id, choice))
+        buttons.append(_fluxer_button(custom_id=custom_id, label=label, style=4 if choice == danger_choice else 3))
+    return buttons, actions
+
+
+def _attachment_is_voice_shaped(att: Dict[str, Any]) -> bool:
+    """Return True when an individual attachment carries Fluxer voice-message shape."""
+    if att.get("is_voice_message") or att.get("voice") or att.get("voice_message"):
+        return True
+    if att.get("waveform") not in (None, "", [], {}):
+        return True
+    for key in ("duration", "duration_secs", "duration_seconds"):
+        value = att.get(key)
+        if value is None:
+            continue
+        try:
+            if float(value) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _voice_attachment_metadata(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return safe, normalized metadata for the first Fluxer voice attachment."""
+    if not _is_voice_message(data):
+        return None
+    attachments = data.get("attachments") or []
+    if not isinstance(attachments, list):
+        return {"is_voice_message": True}
+    for att in attachments:
+        if not isinstance(att, dict) or not _attachment_is_voice_shaped(att):
+            continue
+        content_type = _attachment_content_type(att)
+        meta: Dict[str, Any] = {
+            "is_voice_message": True,
+            "attachment_id": str(att.get("id") or "") or None,
+            "filename": _attachment_filename(att),
+            "content_type": content_type,
+        }
+        duration = next(
+            (att.get(key) for key in ("duration", "duration_secs", "duration_seconds") if att.get(key) is not None),
+            None,
+        )
+        try:
+            if duration is not None:
+                meta["duration_seconds"] = float(duration)
+        except (TypeError, ValueError):
+            pass
+        waveform = att.get("waveform")
+        if waveform not in (None, "", [], {}):
+            # Store shape/presence only; waveform blobs can be large and are not
+            # useful for Hermes turn context.
+            meta["has_waveform"] = True
+        return {key: value for key, value in meta.items() if value is not None}
+    return {"is_voice_message": True}
 
 
 def _looks_like_fluxer_id(value: str) -> bool:
@@ -767,12 +845,11 @@ class FluxerAdapter(BasePlatformAdapter):
         )
         try:
             self._known_channel_ids.add(target_id)
-            component_actions = []
-            buttons = []
-            for _emoji, choice, label in _EXEC_APPROVAL_REACTIONS:
-                custom_id = f"fluxer_exec:{uuid.uuid4().hex}:{choice}"
-                component_actions.append((custom_id, choice))
-                buttons.append(_fluxer_button(custom_id=custom_id, label=label, style=4 if choice == "deny" else 3))
+            buttons, component_actions = _fluxer_action_buttons(
+                prefix="fluxer_exec",
+                specs=_EXEC_APPROVAL_REACTIONS,
+                danger_choice="deny",
+            )
             data, components_enabled = await self._post_message_with_optional_components(
                 target_id,
                 content,
@@ -791,14 +868,13 @@ class FluxerAdapter(BasePlatformAdapter):
             }
             self._pending_exec_approvals[message_id] = pending
             if components_enabled:
-                for custom_id, choice in component_actions:
-                    self._pending_component_actions[custom_id] = {
-                        "kind": "exec_approval",
-                        "message_id": message_id,
-                        "session_key": session_key,
-                        "channel_id": target_id,
-                        "choice": choice,
-                    }
+                self._register_component_actions(
+                    component_actions,
+                    kind="exec_approval",
+                    message_id=message_id,
+                    session_key=session_key,
+                    channel_id=target_id,
+                )
             for emoji, choice, _label in _EXEC_APPROVAL_REACTIONS:
                 self._pending_reaction_actions[f"{message_id}:{_normalize_reaction_emoji(emoji)}"] = {
                     "kind": "exec_approval",
@@ -831,12 +907,11 @@ class FluxerAdapter(BasePlatformAdapter):
         content_message = f"{content_message}\n\nReact: {reaction_hint}"
         content = f"**{title}**\n{content_message}"
         try:
-            component_actions = []
-            buttons = []
-            for _emoji, choice, label in _SLASH_CONFIRM_REACTIONS:
-                custom_id = f"fluxer_confirm:{uuid.uuid4().hex}:{choice}"
-                component_actions.append((custom_id, choice))
-                buttons.append(_fluxer_button(custom_id=custom_id, label=label, style=4 if choice == "cancel" else 3))
+            buttons, component_actions = _fluxer_action_buttons(
+                prefix="fluxer_confirm",
+                specs=_SLASH_CONFIRM_REACTIONS,
+                danger_choice="cancel",
+            )
             data, components_enabled = await self._post_message_with_optional_components(
                 target_id,
                 content,
@@ -846,15 +921,14 @@ class FluxerAdapter(BasePlatformAdapter):
             if not message_id:
                 return SendResult(success=False, error="Fluxer slash confirm message missing id", retryable=True)
             if components_enabled:
-                for custom_id, choice in component_actions:
-                    self._pending_component_actions[custom_id] = {
-                        "kind": "slash_confirm",
-                        "message_id": message_id,
-                        "session_key": session_key,
-                        "confirm_id": confirm_id,
-                        "channel_id": target_id,
-                        "choice": choice,
-                    }
+                self._register_component_actions(
+                    component_actions,
+                    kind="slash_confirm",
+                    message_id=message_id,
+                    session_key=session_key,
+                    confirm_id=confirm_id,
+                    channel_id=target_id,
+                )
             for emoji, choice, _label in _SLASH_CONFIRM_REACTIONS:
                 self._pending_reaction_actions[f"{message_id}:{_normalize_reaction_emoji(emoji)}"] = {
                     "kind": "slash_confirm",
@@ -1374,6 +1448,29 @@ class FluxerAdapter(BasePlatformAdapter):
         while len(self._seen_message_ids) > 1000:
             self._seen_message_ids.popitem(last=False)
         return True
+
+    def _register_component_actions(
+        self,
+        actions: List[tuple[str, str]],
+        *,
+        kind: str,
+        message_id: str,
+        channel_id: str,
+        session_key: str,
+        confirm_id: Optional[str] = None,
+    ) -> None:
+        """Register Fluxer native button custom IDs for a pending prompt."""
+        for custom_id, choice in actions:
+            state: Dict[str, Any] = {
+                "kind": kind,
+                "message_id": message_id,
+                "session_key": session_key,
+                "channel_id": channel_id,
+                "choice": choice,
+            }
+            if confirm_id is not None:
+                state["confirm_id"] = confirm_id
+            self._pending_component_actions[custom_id] = state
 
     async def _post_message_with_optional_components(
         self,
@@ -2073,11 +2170,16 @@ class FluxerAdapter(BasePlatformAdapter):
             except ValueError:
                 pass
 
+        voice_metadata = _voice_attachment_metadata(data)
+        event_raw_payload = dict(raw_payload)
+        if voice_metadata:
+            event_raw_payload["fluxer_voice_message"] = voice_metadata
+
         event = MessageEvent(
             text=text,
-            message_type=MessageType.VOICE if _is_voice_message(data) else _message_type_for_media(media_types),
+            message_type=MessageType.VOICE if voice_metadata else _message_type_for_media(media_types),
             source=source,
-            raw_message=raw_payload,
+            raw_message=event_raw_payload,
             message_id=msg_id or None,
             media_urls=media_urls,
             media_types=media_types,

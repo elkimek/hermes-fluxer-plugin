@@ -76,9 +76,10 @@ def test_component_actions_are_registered_or_components_fall_back():
     assert "Fluxer components unsupported by deployment; retrying without components" in source
     assert "status_code not in {400, 404, 415, 422}" in source
     assert "Fluxer component message send failed without safe fallback" in source
-    assert 'self._pending_component_actions[custom_id] = {' in source
-    assert '"kind": "exec_approval"' in source
-    assert '"kind": "slash_confirm"' in source
+    assert "def _fluxer_action_buttons" in source
+    assert "def _register_component_actions" in source
+    assert 'kind="exec_approval"' in source
+    assert 'kind="slash_confirm"' in source
 
 
 def test_native_command_application_id_rejects_token_like_values():
@@ -331,6 +332,100 @@ async def test_fluxer_voice_attachment_dispatches_as_voice_for_stt(monkeypatch):
     assert seen[0].message_type is fluxer_adapter.MessageType.VOICE
     assert seen[0].media_urls == ["/tmp/hermes-voice.ogg"]
     assert seen[0].media_types == ["audio/ogg"]
+    assert seen[0].raw_message["fluxer_voice_message"] == {
+        "is_voice_message": True,
+        "attachment_id": "att-1",
+        "filename": "voice-message.ogg",
+        "content_type": "audio/ogg",
+        "duration_seconds": 4.2,
+        "has_waveform": True,
+    }
+
+
+
+def test_fluxer_action_buttons_generate_native_control_rows():
+    buttons, actions = fluxer_adapter._fluxer_action_buttons(
+        prefix="fluxer_test",
+        specs=(("✅", "ok", "approve"), ("❌", "no", "deny")),
+        danger_choice="no",
+    )
+
+    assert [button["label"] for button in buttons] == ["approve", "deny"]
+    assert buttons[0]["style"] == 3
+    assert buttons[1]["style"] == 4
+    assert actions[0][1] == "ok"
+    assert actions[1][1] == "no"
+    assert all(action_id.startswith("fluxer_test:") for action_id, _choice in actions)
+
+
+def test_fluxer_voice_metadata_is_safe_and_normalized():
+    metadata = fluxer_adapter._voice_attachment_metadata(
+        {
+            "attachments": [
+                {
+                    "id": "att-voice",
+                    "filename": "note.webm",
+                    "duration_seconds": "2.5",
+                    "waveform": "large-waveform-blob",
+                    "is_voice_message": True,
+                }
+            ]
+        }
+    )
+
+    assert metadata == {
+        "is_voice_message": True,
+        "attachment_id": "att-voice",
+        "filename": "note.webm",
+        "content_type": "audio/webm",
+        "duration_seconds": 2.5,
+        "has_waveform": True,
+    }
+    assert "large-waveform-blob" not in repr(metadata)
+
+def test_fluxer_voice_metadata_skips_non_voice_attachment_before_voice_file():
+    metadata = fluxer_adapter._voice_attachment_metadata(
+        {
+            "type": "VOICE_MESSAGE",
+            "attachments": [
+                {"id": "thumb", "filename": "thumb.jpg", "content_type": "image/jpeg"},
+                {
+                    "id": "voice",
+                    "filename": "clip.webm",
+                    "content_type": "video/webm",
+                    "is_voice_message": True,
+                    "duration": 3.0,
+                },
+            ],
+        }
+    )
+
+    assert metadata == {
+        "is_voice_message": True,
+        "attachment_id": "voice",
+        "filename": "clip.webm",
+        "content_type": "audio/webm",
+        "duration_seconds": 3.0,
+    }
+
+
+def test_fluxer_voice_metadata_preserves_zero_duration_over_fallback_keys():
+    metadata = fluxer_adapter._voice_attachment_metadata(
+        {
+            "attachments": [
+                {
+                    "id": "voice-zero",
+                    "filename": "zero.ogg",
+                    "is_voice_message": True,
+                    "duration": 0,
+                    "duration_secs": 5.0,
+                }
+            ]
+        }
+    )
+
+    assert metadata is not None
+    assert metadata["duration_seconds"] == 0.0
 
 
 def test_fluxer_voice_attachment_without_content_type_infers_audio_mime():
