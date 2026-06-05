@@ -9,6 +9,7 @@ room before wiring realtime STT/TTS.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import math
@@ -26,6 +27,8 @@ class LiveKitRoomLike(Protocol):
     async def connect(self, url: str, token: str, options: Any = ...) -> None: ...
 
     async def disconnect(self, **kwargs: Any) -> None: ...
+
+    def on(self, event: str, callback: Any = None) -> Any: ...
 
 
 RoomFactory = Callable[[], LiveKitRoomLike]
@@ -259,6 +262,84 @@ class FluxerLiveKitSmokeBridge:
             close = getattr(source, "aclose", None)
             if close is not None:
                 await _maybe_await(close())
+
+    async def collect_remote_audio_pcm16(
+        self,
+        *,
+        duration_seconds: float = 4.0,
+        sample_rate: int = 24_000,
+        frame_size_ms: int = 20,
+        participant_identity: str | None = None,
+        timeout: float = 30.0,
+    ) -> bytes:
+        """Collect PCM16 mono audio from a subscribed remote LiveKit track.
+
+        Returned bytes are suitable for xAI Realtime `input_audio_buffer.append`
+        when the xAI session is configured with the same sample rate.
+        """
+
+        if self._room is None:
+            raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
+        if duration_seconds <= 0:
+            raise ValueError("duration_seconds must be positive")
+        if sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        if frame_size_ms <= 0:
+            raise ValueError("frame_size_ms must be positive")
+
+        rtc = _load_livekit_audio_helpers()
+        target_bytes = int(sample_rate * duration_seconds) * 2
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        stream_tasks: list[asyncio.Task[Any]] = []
+
+        async def consume_track(track: Any, participant: Any) -> None:
+            identity = getattr(participant, "identity", None)
+            if participant_identity and identity != participant_identity:
+                return
+            stream = rtc.AudioStream.from_track(
+                track=track,
+                sample_rate=sample_rate,
+                num_channels=1,
+                frame_size_ms=frame_size_ms,
+            )
+            try:
+                async for event in stream:
+                    frame = event.frame
+                    data = bytes(frame.data)
+                    if data:
+                        await queue.put(data)
+            finally:
+                close = getattr(stream, "aclose", None)
+                if close is not None:
+                    await _maybe_await(close())
+
+        def maybe_track_is_audio(track: Any) -> bool:
+            kind = getattr(track, "kind", None)
+            return str(kind).lower().endswith("audio") or track.__class__.__name__.lower().endswith("audiotrack")
+
+        def on_track_subscribed(track: Any, publication: Any, participant: Any) -> None:
+            if maybe_track_is_audio(track):
+                stream_tasks.append(asyncio.create_task(consume_track(track, participant)))
+
+        self._room.on("track_subscribed", on_track_subscribed)
+
+        for participant in getattr(self._room, "remote_participants", {}).values():
+            for publication in getattr(participant, "track_publications", {}).values():
+                track = getattr(publication, "track", None)
+                if track is not None and maybe_track_is_audio(track):
+                    stream_tasks.append(asyncio.create_task(consume_track(track, participant)))
+
+        collected = bytearray()
+        try:
+            while len(collected) < target_bytes:
+                collected.extend(await asyncio.wait_for(queue.get(), timeout=timeout))
+        finally:
+            for task in stream_tasks:
+                task.cancel()
+            for task in stream_tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        return bytes(collected[:target_bytes])
 
     async def disconnect(self) -> None:
         room = self._room

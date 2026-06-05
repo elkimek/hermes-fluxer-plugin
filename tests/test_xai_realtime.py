@@ -75,6 +75,20 @@ async def test_xai_realtime_force_message_does_not_send_response_create(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_xai_realtime_audio_response_appends_commits_and_creates_response(tmp_path):
+    ws = FakeRealtimeWebSocket([pcm_delta(b"\x02\x00"), {"type": "response.done"}])
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
+
+    result = await client._audio_response_from_pcm16_on_ws(ws, b"\x10\x00\x20\x00", tmp_path / "audio.wav")
+
+    assert ws.sent[1]["type"] == "input_audio_buffer.append"
+    assert base64.b64decode(ws.sent[1]["audio"]) == b"\x10\x00\x20\x00"
+    assert ws.sent[2] == {"type": "input_audio_buffer.commit"}
+    assert ws.sent[3] == {"type": "response.create"}
+    assert result.bytes_written == 2
+
+
+@pytest.mark.asyncio
 async def test_xai_realtime_raises_on_error_event(tmp_path):
     ws = FakeRealtimeWebSocket([{"type": "error", "error": {"message": "bad request"}}])
     client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")

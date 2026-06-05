@@ -23,6 +23,8 @@ This project uses simple semantic versioning while the plugin is young:
 - Added mono 16-bit PCM WAV publishing and verified a generated Žofka TTS clip through hosted Fluxer LiveKit.
 - Added a minimal xAI Realtime websocket client plus smoke-probe flags for generating Grok Voice audio and publishing it through Fluxer LiveKit.
 - Verified `grok-voice-latest` text-to-voice output through hosted Fluxer LiveKit with `xai_realtime_published: true`.
+- Added one-turn duplex smoke plumbing: Fluxer remote audio capture → xAI Realtime audio input → Grok Voice WAV → Fluxer LiveKit publish.
+- Verified xAI Realtime audio-input handling live with a speech fixture and published that response through hosted Fluxer LiveKit; remote human-speaker capture remains the next manual smoke.
 
 ## [0.1.1] - 2026-06-05
 

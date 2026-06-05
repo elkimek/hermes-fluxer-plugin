@@ -136,6 +136,25 @@ class XAIRealtimeVoiceClient:
             )
         )
 
+    async def audio_response_from_pcm16(
+        self,
+        pcm_audio: bytes,
+        output_path: str | Path,
+        *,
+        timeout: float = 45.0,
+    ) -> XAIRealtimeAudioResult:
+        """Send mono PCM16 user audio into xAI Realtime and write the voice response."""
+
+        if not self.api_key:
+            raise RuntimeError("XAI_API_KEY is required for xAI Realtime")
+        if not pcm_audio:
+            raise ValueError("pcm_audio must not be empty")
+        ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
+        try:
+            return await asyncio.wait_for(self._audio_response_from_pcm16_on_ws(ws, pcm_audio, output_path), timeout=timeout)
+        finally:
+            await ws.close()
+
     async def _text_response_to_wav_on_ws(self, ws: Any, text: str, output_path: str | Path) -> XAIRealtimeAudioResult:
         await self._configure_session(ws)
         await ws.send(
@@ -150,6 +169,25 @@ class XAIRealtimeVoiceClient:
                 }
             )
         )
+        await ws.send(json.dumps({"type": "response.create"}))
+        return await self._collect_audio_to_wav(ws, output_path)
+
+    async def _audio_response_from_pcm16_on_ws(
+        self,
+        ws: Any,
+        pcm_audio: bytes,
+        output_path: str | Path,
+    ) -> XAIRealtimeAudioResult:
+        await self._configure_session(ws)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm_audio).decode("ascii"),
+                }
+            )
+        )
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
         await ws.send(json.dumps({"type": "response.create"}))
         return await self._collect_audio_to_wav(ws, output_path)
 

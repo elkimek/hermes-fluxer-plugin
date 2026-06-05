@@ -20,6 +20,12 @@ class FakeRoom:
         self.disconnected = False
         self.name = "Fluxer voice room"
         self.local_participant = FakeParticipant()
+        self.remote_participants = {}
+        self.handlers = {}
+
+    def on(self, event, callback=None):
+        self.handlers[event] = callback
+        return callback
 
     async def connect(self, url, token, options=None):
         self.connected.append((url, token, options))
@@ -219,3 +225,52 @@ async def test_publish_wav_file_rejects_non_mono_pcm(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="mono 16-bit PCM"):
         await bridge.publish_wav_file(wav_path)
+
+class FakeAudioFrameEvent:
+    def __init__(self, data):
+        self.frame = type("Frame", (), {"data": data})()
+
+
+class FakeAudioStream:
+    tracks = []
+
+    def __init__(self, events):
+        self.events = list(events)
+        self.closed = False
+
+    @classmethod
+    def from_track(cls, *, track, sample_rate, num_channels, frame_size_ms):
+        cls.tracks.append((track, sample_rate, num_channels, frame_size_ms))
+        return cls([FakeAudioFrameEvent(b"\x01\x00" * 200), FakeAudioFrameEvent(b"\x02\x00" * 200)])
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.events:
+            raise StopAsyncIteration
+        return self.events.pop(0)
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_collect_remote_audio_pcm16_from_existing_track(monkeypatch):
+    FakeAudioStream.tracks = []
+    room = FakeRoom()
+    participant = type("RemoteParticipant", (), {"identity": "user-a", "track_publications": {}})()
+    track = type("RemoteAudioTrack", (), {"kind": "audio"})()
+    participant.track_publications["pub"] = type("Publication", (), {"track": track})()
+    room.remote_participants["user-a"] = participant
+
+    fake_rtc = type("FakeRtc", (), {"AudioStream": FakeAudioStream})()
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: fake_rtc)
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    bridge._room = room
+
+    pcm = await bridge.collect_remote_audio_pcm16(duration_seconds=0.01, sample_rate=24000, participant_identity="user-a")
+
+    assert len(pcm) == 480
+    assert FakeAudioStream.tracks == [(track, 24000, 1, 20)]
+    assert room.handlers["track_subscribed"] is not None

@@ -84,7 +84,9 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Added mono 16-bit PCM WAV publishing and verified a generated Žofka TTS clip against hosted Fluxer with `wav_published: true`.
 - Added a minimal xAI Realtime websocket client that can request `grok-voice-latest` PCM16 audio from either a text prompt or xAI `force_message`, write it as WAV, and hand it to the Fluxer LiveKit publisher.
 - Verified xAI Realtime end-to-end into Fluxer: `grok-voice-latest` produced PCM16 audio over `wss://api.x.ai/v1/realtime`, the smoke probe joined Fluxer LiveKit, and published it with `xai_realtime_published: true`.
-- Next: subscribe to allowed user audio and stream it into xAI Realtime instead of using text prompts.
+- Added the first one-turn duplex probe: subscribe to remote LiveKit audio, collect PCM16, send `input_audio_buffer.append`/`commit` into xAI Realtime, collect Grok Voice output, and publish it back into Fluxer.
+- Verified the xAI audio-input half live with a speech fixture and separately published that response WAV through hosted Fluxer LiveKit. Full remote-user capture still needs a human speaker in the Fluxer voice channel.
+- Next: run the duplex probe with Elkim speaking in the voice room, then convert the one-turn probe into a streaming loop.
 
 ### Phase 4 — real-time Žofka loop
 
