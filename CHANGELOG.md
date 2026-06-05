@@ -18,6 +18,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Added an in-memory `VOICE_SERVER_UPDATE` bridge hook so a future LiveKit bridge can receive the raw ephemeral token payload without the adapter persisting or logging that token.
 - Started a transport-only LiveKit smoke bridge module with optional `realtime` dependency support; it connects from a raw `VOICE_SERVER_UPDATE` payload and keeps the ephemeral token out of returned/stored/logged state.
 - Added a muted/deaf `scripts/fluxer_livekit_smoke.py` probe for the first real Fluxer voice-room presence test.
+- Verified the presence-only LiveKit smoke path against hosted Fluxer without logging or storing the ephemeral token.
 
 ## [0.1.1] - 2026-06-05
 
