@@ -23,7 +23,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote, urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 4000
 _DEFAULT_BASE_URL = "https://api.fluxer.app/v1"
 _GATEWAY_VERSION = 1
+_VOICE_STATE_UPDATE_OPCODE = 4
 _VOICE_MESSAGE_FLAG = 1 << 13
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
@@ -99,6 +100,55 @@ def _build_identify_payload(bot_token: str) -> Dict[str, Any]:
                 "device": "hermes",
             },
         },
+    }
+
+
+def _build_voice_state_update_payload(
+    *,
+    channel_id: Optional[str],
+    guild_id: Optional[str] = None,
+    connection_id: Optional[str] = None,
+    self_mute: bool = False,
+    self_deaf: bool = True,
+    self_video: bool = False,
+    self_stream: bool = False,
+    viewer_stream_keys: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build Fluxer's opcode-4 voice state update payload.
+
+    Fluxer's LiveKit voice handshake starts on the main gateway: the client
+    sends VOICE_STATE_UPDATE, then waits for VOICE_SERVER_UPDATE with a LiveKit
+    endpoint/token. This helper intentionally does not touch audio media yet;
+    it is the tested seam a future realtime bridge can call.
+    """
+    return {
+        "op": _VOICE_STATE_UPDATE_OPCODE,
+        "d": {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "self_mute": self_mute,
+            "self_deaf": self_deaf,
+            "self_video": self_video,
+            "self_stream": self_stream,
+            "viewer_stream_keys": list(viewer_stream_keys or []),
+            "connection_id": connection_id,
+        },
+    }
+
+
+def _voice_join_key(guild_id: Optional[str], channel_id: Optional[str]) -> str:
+    return f"{guild_id or ''}:{channel_id or ''}"
+
+
+def _sanitize_voice_server_update(data: Dict[str, Any], *, matched_pending_join: bool) -> Dict[str, Any]:
+    """Return non-secret voice-server metadata safe for logs/state."""
+    return {
+        "guild_id": data.get("guild_id"),
+        "channel_id": data.get("channel_id"),
+        "connection_id": data.get("connection_id"),
+        "endpoint": data.get("endpoint"),
+        "has_token": bool(data.get("token")),
+        "matched_pending_join": matched_pending_join,
     }
 
 
