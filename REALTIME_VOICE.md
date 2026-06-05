@@ -73,7 +73,7 @@ Status: implemented in this repo.
 
 ### Phase 3 — LiveKit smoke bridge
 
-Status: TTS clip publishing verified against hosted Fluxer on 2026-06-05.
+Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 2026-06-05.
 
 - Added `livekit_bridge.py`, a minimal transport-only smoke bridge that can connect to the Fluxer LiveKit room from a raw `VOICE_SERVER_UPDATE` payload and disconnect cleanly.
 - The bridge uses the ephemeral token only as the local `Room.connect(endpoint, token, ...)` argument; it never stores, returns, or logs the token.
@@ -82,7 +82,9 @@ Status: TTS clip publishing verified against hosted Fluxer on 2026-06-05.
 - Verified the smoke probe against hosted Fluxer: the bot received a sanitized `VOICE_SERVER_UPDATE`, connected to `wss://*.fluxer.media`, entered `guild_..._channel_...` with a LiveKit participant identity, then left cleanly. Token presence was reported only as `has_token: true`.
 - Verified audible publishing against hosted Fluxer: the probe joined unmuted/deaf, published a short low-amplitude test tone with `tone_published: true`, then disconnected.
 - Added mono 16-bit PCM WAV publishing and verified a generated Žofka TTS clip against hosted Fluxer with `wav_published: true`.
-- Next: subscribe to allowed user audio and feed it into a realtime/STT backend.
+- Added a minimal xAI Realtime websocket client that can request `grok-voice-latest` PCM16 audio from either a text prompt or xAI `force_message`, write it as WAV, and hand it to the Fluxer LiveKit publisher.
+- Verified xAI Realtime end-to-end into Fluxer: `grok-voice-latest` produced PCM16 audio over `wss://api.x.ai/v1/realtime`, the smoke probe joined Fluxer LiveKit, and published it with `xai_realtime_published: true`.
+- Next: subscribe to allowed user audio and stream it into xAI Realtime instead of using text prompts.
 
 ### Phase 4 — real-time Žofka loop
 

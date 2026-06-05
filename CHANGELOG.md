@@ -21,6 +21,8 @@ This project uses simple semantic versioning while the plugin is young:
 - Verified the presence-only LiveKit smoke path against hosted Fluxer without logging or storing the ephemeral token.
 - Added and verified low-amplitude sine-tone publishing to hosted Fluxer LiveKit for the first audible bot smoke path.
 - Added mono 16-bit PCM WAV publishing and verified a generated Žofka TTS clip through hosted Fluxer LiveKit.
+- Added a minimal xAI Realtime websocket client plus smoke-probe flags for generating Grok Voice audio and publishing it through Fluxer LiveKit.
+- Verified `grok-voice-latest` text-to-voice output through hosted Fluxer LiveKit with `xai_realtime_published: true`.
 
 ## [0.1.1] - 2026-06-05
 

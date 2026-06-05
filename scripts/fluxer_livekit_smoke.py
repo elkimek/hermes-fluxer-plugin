@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ if str(ROOT) not in sys.path:
 from adapter import FluxerAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
+from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -50,6 +52,14 @@ async def run(args: argparse.Namespace) -> int:
             },
         )
     )
+    generated_wav_path: str | None = None
+    if args.xai_text:
+        generated_wav_path = str(Path(tempfile.gettempdir()) / "zofka_xai_realtime_fluxer.wav")
+        xai = XAIRealtimeVoiceClient(model=args.xai_model, voice=args.xai_voice, instructions=args.xai_instructions)
+        if args.xai_force_message:
+            await xai.force_message_to_wav(args.xai_text, generated_wav_path, timeout=args.xai_timeout)
+        else:
+            await xai.text_response_to_wav(args.xai_text, generated_wav_path, timeout=args.xai_timeout)
     bridge = FluxerLiveKitSmokeBridge(auto_subscribe=args.auto_subscribe)
     connected = asyncio.Event()
     result: dict[str, Any] = {}
@@ -65,6 +75,8 @@ async def run(args: argparse.Namespace) -> int:
                 )
             if args.wav_path:
                 await bridge.publish_wav_file(args.wav_path)
+            if generated_wav_path:
+                await bridge.publish_wav_file(generated_wav_path, track_name="zofka-xai-realtime")
             result["safe_update"] = safe_update
             result["connection"] = {
                 "endpoint": info.endpoint,
@@ -75,6 +87,7 @@ async def run(args: argparse.Namespace) -> int:
                 "participant_identity": info.participant_identity,
                 "tone_published": args.tone_seconds > 0,
                 "wav_published": bool(args.wav_path),
+                "xai_realtime_published": bool(generated_wav_path),
             }
             connected.set()
         except Exception as exc:  # token intentionally not included
@@ -126,6 +139,12 @@ def main() -> int:
     parser.add_argument("--tone-hz", type=float, default=440.0, help="Sine tone frequency for --tone-seconds")
     parser.add_argument("--tone-amplitude", type=float, default=0.18, help="Sine tone amplitude, 0.0-1.0")
     parser.add_argument("--wav-path", help="Publish a mono 16-bit PCM WAV clip after joining")
+    parser.add_argument("--xai-text", help="Ask xAI Realtime for a voice response to this text, then publish it")
+    parser.add_argument("--xai-force-message", action="store_true", help="Use xAI Realtime force_message instead of model response")
+    parser.add_argument("--xai-model", default="grok-voice-latest")
+    parser.add_argument("--xai-voice", default="eve")
+    parser.add_argument("--xai-timeout", type=float, default=30.0)
+    parser.add_argument("--xai-instructions", default="You are Žofka, warm, direct, and concise. Keep this voice reply short.")
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 
