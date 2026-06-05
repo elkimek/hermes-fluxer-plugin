@@ -49,12 +49,24 @@ from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 logger = logging.getLogger("fluxer_stt_voice_loop")
 
-DEFAULT_TEXT_SYSTEM = """You are Žofka in a live Fluxer voice chat with Elkim.
-Answer the transcript directly and briefly. No filler greetings unless Elkim greeted you.
-If STT writes Shevka, Shovka, Jefka, Zofka, Jovka, or Jessica, treat it as Žofka.
-Correct obvious ASR homophones when context is clear, e.g. "past" or "plast" can mean "plus" in arithmetic.
-Speak English by default. Do not switch to Czech just because STT produced Czech-looking syllables; use Czech only if Elkim explicitly asks for Czech or clearly speaks Czech.
-Never use Spanish.
+DEFAULT_TEXT_SYSTEM = """You are Žofka, not a generic xAI assistant. You are in a live Fluxer voice chat with Elkim.
+Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and brief enough for voice.
+
+Current implementation context you know:
+- We are dogfooding Fluxer realtime voice in the spike worktree /home/elkim/.hermes/plugins/fluxer-realtime-spike on branch feat/realtime-voice-livekit-spike.
+- The room path is Fluxer LiveKit capture → STT → text-grounded answer → xAI Eve TTS → LiveKit publish.
+- Best current stack: participant-targeted capture of Elkim's LiveKit identity prefix user_1503635769218148907_, no wake-name, ElevenLabs Scribe STT, xAI Eve TTS with light speech tags.
+- Voice channel id is 1510905670319210500, guild id is 1510905670319210496.
+- The wake-name “Žofka” poisons STT; in room mode, speech from Elkim's targeted track counts as addressed to you.
+- xAI speech tags available include [pause], [long-pause], [breath], [sigh], [chuckle], <soft>, <whisper>, <slow>, and <emphasis>; use them lightly, not theatrically.
+- If Elkim asks about Fluxer implementation, realtime voice, LiveKit capture, STT providers, xAI TTS, ElevenLabs, barge-in, latency, or today's debugging, answer from this context instead of pretending not to know.
+
+Conversation rules:
+- Answer the transcript directly and briefly. No filler greetings unless Elkim greeted you.
+- If STT writes Shevka, Shovka, Jefka, Zofka, Jovka, Żabka, or Jessica, treat it as Žofka.
+- Correct obvious ASR homophones when context is clear, e.g. "past", "plast", or "plastic" can mean "plus" in arithmetic.
+- Speak English by default. Do not switch to Czech just because STT produced Czech-looking syllables; use Czech only if Elkim explicitly asks for Czech or clearly speaks Czech.
+- Never use Spanish.
 """.strip()
 
 
@@ -100,7 +112,7 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
         f"{system}\n\n"
         f"Recent voice-chat history:\n{history_text}\n\n"
         f"Latest STT transcript from Elkim: {transcript!r}\n\n"
-        "Speak Žofka's next reply now, grounded only in the latest transcript and relevant history."
+        "Speak Žofka's next reply now. Use the latest transcript, relevant voice history, and the implementation context above."
     )
 
 
@@ -124,6 +136,15 @@ def transcribe_with_provider(file_path: str, *, provider: str, model: str | None
 
 def safe_stt_summary(result: dict[str, Any]) -> dict[str, Any]:
     return {key: result.get(key) for key in ("success", "transcript", "provider", "model", "error")}
+
+
+def append_jsonl(path: str | None, item: dict[str, Any]) -> None:
+    if not path:
+        return
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
@@ -203,6 +224,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     turn["published"] = False
                     turn["reason"] = "empty_stt_transcript"
                     result["turns"].append(turn)
+                    append_jsonl(args.turn_log_jsonl, turn)
                     if args.stop_on_empty_stt:
                         break
                     continue
@@ -255,6 +277,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 result["published_turn_count"] += 1
                 result["turns"].append(turn)
+                append_jsonl(args.turn_log_jsonl, turn)
 
             result["turn_count"] = len(result["turns"])
         except Exception as exc:
@@ -309,6 +332,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-runtime-seconds", type=float, default=180.0)
     parser.add_argument("--env-file", default="/home/elkim/.hermes/.env")
     parser.add_argument("--stop-on-empty-stt", action="store_true")
+    parser.add_argument(
+        "--turn-log-jsonl",
+        default="/tmp/zofka_fluxer_voice_loop_turns.jsonl",
+        help="Append each turn as JSONL so long-running sessions keep transcripts/timing even when stopped",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 

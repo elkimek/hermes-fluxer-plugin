@@ -4,6 +4,7 @@ import os
 import wave
 
 from scripts.fluxer_stt_voice_loop import (
+    append_jsonl,
     build_answer_prompt,
     load_env_file,
     parse_args,
@@ -24,9 +25,25 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
     assert "Žofka: Hi." in prompt
     assert "past" in prompt and "plus" in prompt
     assert "plast" in prompt and "plus" in prompt
+    assert "participant-targeted capture" in prompt
+    assert "ElevenLabs Scribe STT" in prompt
+    assert "xAI Eve TTS" in prompt
+    assert "Fluxer implementation" in prompt
     assert "Speak English by default" in prompt
     assert "Do not switch to Czech" in prompt
     assert "No filler greetings" in prompt
+
+
+def test_append_jsonl_writes_one_turn_per_line(tmp_path):
+    path = tmp_path / "turns.jsonl"
+
+    append_jsonl(str(path), {"turn": 1, "transcript": "hello"})
+    append_jsonl(str(path), {"turn": 2, "transcript": "world"})
+
+    assert path.read_text(encoding="utf-8").splitlines() == [
+        '{"turn": 1, "transcript": "hello"}',
+        '{"turn": 2, "transcript": "world"}',
+    ]
 
 
 def test_safe_stt_summary_drops_extra_provider_payload():
