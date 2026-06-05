@@ -138,10 +138,15 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         gate_transcript = ""
         if not args.disable_wake_gate:
             gate_wav = str(Path(tempfile.gettempdir()) / f"zofka_xai_room_loop_gate_{turn_no}.wav")
-            gate_result = await gate_xai.audio_response_from_pcm16(pcm, gate_wav, timeout=args.xai_timeout)
-            gate_transcript = gate_result.transcript.strip()
-            gate_decision = gate_transcript.upper().strip().split()
-            if not gate_decision or gate_decision[0] != "RESPOND":
+            try:
+                gate_result = await gate_xai.audio_response_from_pcm16(pcm, gate_wav, timeout=args.xai_timeout)
+                gate_transcript = gate_result.transcript.strip()
+                gate_decision = gate_transcript.upper().strip().split()
+                should_respond = bool(gate_decision and gate_decision[0] == "RESPOND")
+            except Exception as exc:
+                gate_transcript = f"{type(exc).__name__}: wake gate failed"
+                should_respond = False
+            if not should_respond:
                 logger.info("Wake gate ignored turn %s transcript=%r", turn_no, gate_transcript)
                 turns.append(
                     {
@@ -152,11 +157,28 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                         "ignored": True,
                     }
                 )
+                if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
+                    break
                 continue
 
         output_wav = str(Path(tempfile.gettempdir()) / f"zofka_xai_room_loop_turn_{turn_no}.wav")
-        xai_result = await xai.audio_response_from_pcm16(pcm, output_wav, timeout=args.xai_timeout)
-        await bridge.publish_wav_file(output_wav, track_name=f"zofka-xai-room-loop-{turn_no}")
+        try:
+            xai_result = await xai.audio_response_from_pcm16(pcm, output_wav, timeout=args.xai_timeout)
+            await bridge.publish_wav_file(output_wav, track_name=f"zofka-xai-room-loop-{turn_no}")
+        except Exception as exc:
+            logger.warning("xAI response/publish failed for turn %s: %s", turn_no, type(exc).__name__)
+            turns.append(
+                {
+                    "turn": turn_no,
+                    "captured_pcm_bytes": len(pcm),
+                    "gate_transcript": gate_transcript,
+                    "published": False,
+                    "error": f"{type(exc).__name__}: response failed",
+                }
+            )
+            if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
+                break
+            continue
         turns.append(
             {
                 "turn": turn_no,
