@@ -201,7 +201,7 @@ async def test_barge_in_capture_sets_interrupt_early_and_retains_utterance_pcm()
 async def test_conversation_loop_reuses_barge_in_pcm_as_next_turn(monkeypatch):
     args = argparse.Namespace(
         max_runtime_seconds=10.0,
-        max_turns=1,
+        max_turns=2,
         sample_rate=1000,
         frame_ms=20,
         participant_identity=None,
@@ -313,6 +313,117 @@ async def test_conversation_loop_reuses_barge_in_pcm_as_next_turn(monkeypatch):
     assert result["turns"][0]["barge_in_carryover_pcm_bytes"] == len(interrupt_prompt)
     assert result["turns"][0]["barge_in_carryover_discarded"] is False
     assert result["turns"][1]["from_barge_in_carryover"] is True
+
+
+@pytest.mark.asyncio
+async def test_conversation_loop_max_turns_counts_interrupted_turns(monkeypatch):
+    args = argparse.Namespace(
+        max_runtime_seconds=10.0,
+        max_turns=1,
+        sample_rate=1000,
+        frame_ms=20,
+        participant_identity=None,
+        energy_threshold=350,
+        silence_ms=80,
+        end_padding_ms=20,
+        min_segment_ms=60,
+        max_segment_seconds=2.0,
+        disable_wake_gate=True,
+        xai_model="grok-voice-latest",
+        xai_voice="eve",
+        xai_instructions="test",
+        wake_gate_instructions="gate",
+        xai_timeout=5.0,
+        xai_first_audio_timeout=5.0,
+        disable_barge_in=False,
+        barge_in_energy_threshold=700,
+        barge_in_min_ms=60,
+        barge_in_capture_timeout=2.0,
+    )
+    first_prompt = pcm16(1200, 80) + pcm16(0, 20)
+    interrupt_prompt = pcm16(900, 80) + pcm16(0, 20)
+
+    class FakePublisher:
+        def __init__(self):
+            self.interrupted = False
+            self.bytes_published = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def write(self, chunk):
+            self.bytes_published += len(chunk)
+
+        async def interrupt(self):
+            self.interrupted = True
+
+        async def close(self, **kwargs):
+            pass
+
+    class FakeBridge:
+        def __init__(self):
+            self.capture_calls = 0
+
+        def iter_remote_audio_pcm16(self, **kwargs):
+            if self.capture_calls == 0:
+                self.capture_calls += 1
+                return FakeChunkIterator(
+                    [
+                        pcm16(1200, 20),
+                        pcm16(1200, 20),
+                        pcm16(1200, 20),
+                        pcm16(1200, 20),
+                        pcm16(0, 20),
+                        pcm16(0, 20),
+                        pcm16(0, 20),
+                        pcm16(0, 20),
+                    ]
+                )
+            return FakeChunkIterator(
+                [
+                    pcm16(900, 20),
+                    pcm16(900, 20),
+                    pcm16(900, 20),
+                    pcm16(900, 20),
+                    pcm16(0, 20),
+                    pcm16(0, 20),
+                    pcm16(0, 20),
+                    pcm16(0, 20),
+                ]
+            )
+
+        def pcm16_publisher(self, **kwargs):
+            return FakePublisher()
+
+    class FakeXAIResult:
+        def __init__(self, payload):
+            self.bytes_written = len(payload)
+            self.transcript = "ok"
+            self.events_seen = ["response.done"]
+
+    class FakeXAI:
+        prompts = []
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def audio_response_from_pcm16_to_sink(self, pcm, sink, **kwargs):
+            self.prompts.append(pcm)
+            for _ in range(6):
+                await sink(pcm16(300, 20))
+                await room_loop.asyncio.sleep(0)
+            return FakeXAIResult(pcm)
+
+    monkeypatch.setattr(room_loop, "XAIRealtimeVoiceClient", FakeXAI)
+    FakeXAI.prompts = []
+
+    result = await room_loop._conversation_loop(args, FakeBridge())
+
+    assert len(result["turns"]) == 1
+    assert result["turn_count"] == 1
+    assert result["turns"][0]["interrupted"] is True
+    assert result["turns"][0]["barge_in_carryover_pcm_bytes"] == len(interrupt_prompt)
+    assert FakeXAI.prompts == [first_prompt]
 
 
 def test_barge_in_carryover_decision_discards_tiny_interrupt_fragment():

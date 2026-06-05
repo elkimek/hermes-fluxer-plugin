@@ -316,6 +316,8 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
     )
     carryover_pcm: bytes | None = None
     while True:
+        if args.max_turns and len(turns) >= args.max_turns:
+            break
         if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
             break
         remaining = args.max_runtime_seconds - (time.monotonic() - started) if args.max_runtime_seconds else 30.0
@@ -583,7 +585,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 },
             }
         )
-        if args.max_turns and sum(1 for turn in turns if turn.get("published")) >= args.max_turns:
+        if args.max_turns and len(turns) >= args.max_turns:
             break
         if args.max_runtime_seconds and time.monotonic() - started >= args.max_runtime_seconds:
             break
