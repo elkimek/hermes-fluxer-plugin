@@ -337,6 +337,8 @@ class XAIRealtimeVoiceClient:
                     try:
                         await on_audio_delta(chunk)
                     except Exception as exc:
+                        if type(exc).__name__ == "BargeInInterrupt":
+                            raise
                         raise XAIRealtimeStreamError(
                             "xAI audio sink failed while handling output delta",
                             events_seen=events,

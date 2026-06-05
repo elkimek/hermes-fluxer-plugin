@@ -179,6 +179,24 @@ async def test_xai_realtime_wraps_audio_sink_failures_with_event_tail():
 
 
 @pytest.mark.asyncio
+async def test_xai_realtime_lets_barge_in_interrupt_escape_unwrapped():
+    class BargeInInterrupt(Exception):
+        pass
+
+    ws = FakeRealtimeWebSocket([
+        {"type": "response.created"},
+        pcm_delta(b"\x01\x00"),
+    ])
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
+
+    async def sink(chunk: bytes):
+        raise BargeInInterrupt("user interrupted assistant speech")
+
+    with pytest.raises(BargeInInterrupt, match="user interrupted"):
+        await client._audio_response_from_pcm16_to_sink_on_ws(ws, b"\x10\x00", sink)
+
+
+@pytest.mark.asyncio
 async def test_xai_realtime_raises_on_error_event(tmp_path):
     ws = FakeRealtimeWebSocket([{"type": "error", "error": {"message": "bad request"}}])
     client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")
