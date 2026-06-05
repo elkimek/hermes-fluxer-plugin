@@ -23,6 +23,9 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
     assert "Elkim: hello" in prompt
     assert "Žofka: Hi." in prompt
     assert "past" in prompt and "plus" in prompt
+    assert "plast" in prompt and "plus" in prompt
+    assert "Speak English by default" in prompt
+    assert "Do not switch to Czech" in prompt
     assert "No filler greetings" in prompt
 
 
