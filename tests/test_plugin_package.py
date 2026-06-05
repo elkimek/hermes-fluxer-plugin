@@ -3,7 +3,10 @@ import ast
 from unittest.mock import AsyncMock
 
 import pytest
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 compatibility for CI matrix.
+    import tomli as tomllib
 import yaml
 
 import adapter as fluxer_adapter
@@ -278,6 +281,106 @@ async def test_application_command_from_non_allowed_user_gets_ephemeral_rejectio
         json={"type": 4, "data": {"content": "You are not allowed to use this bot.", "flags": 64}},
         warn_on_error=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_fluxer_voice_attachment_dispatches_as_voice_for_stt(monkeypatch):
+    """Voice-shaped Fluxer attachments should trigger Hermes STT, not generic audio handling."""
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allowed_users": "owner-user",
+                "free_response_channels": ["chan-1"],
+            },
+        )
+    )
+    adapter._cache_attachment = AsyncMock(return_value=("/tmp/hermes-voice.ogg", "audio/ogg"))
+    seen = []
+
+    async def fake_handle(event):
+        seen.append(event)
+
+    adapter.handle_message = fake_handle
+
+    await adapter._handle_message_create(
+        {
+            "id": "msg-voice",
+            "channel_id": "chan-1",
+            "channel_type": "channel",
+            "content": "",
+            "author": {"id": "owner-user", "username": "Alice", "bot": False},
+            "attachments": [
+                {
+                    "id": "att-1",
+                    "filename": "voice-message.ogg",
+                    "url": "https://cdn.fluxer.example/voice-message.ogg",
+                    "content_type": "audio/ogg",
+                    "duration": 4.2,
+                    "waveform": "AAAA",
+                }
+            ],
+        },
+        {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+    )
+
+    assert len(seen) == 1
+    assert seen[0].message_type is fluxer_adapter.MessageType.VOICE
+    assert seen[0].media_urls == ["/tmp/hermes-voice.ogg"]
+    assert seen[0].media_types == ["audio/ogg"]
+
+
+def test_fluxer_voice_attachment_without_content_type_infers_audio_mime():
+    att = {
+        "filename": "voice-message.ogg",
+        "url": "https://cdn.fluxer.example/voice-message.ogg",
+        "duration": 3,
+        "waveform": "AAAA",
+    }
+
+    assert fluxer_adapter._attachment_content_type(att) == "audio/ogg"
+
+
+def test_zero_duration_attachment_without_waveform_is_not_voice_message():
+    data = {
+        "attachments": [
+            {
+                "filename": "empty-audio.ogg",
+                "url": "https://cdn.fluxer.example/empty-audio.ogg",
+                "duration": 0,
+            }
+        ]
+    }
+
+    assert fluxer_adapter._is_voice_message(data) is False
+
+
+@pytest.mark.asyncio
+async def test_send_voice_uploads_fluxer_voice_message_payload(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    audio_path = tmp_path / "reply.ogg"
+    audio_path.write_bytes(b"fake-ogg")
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    adapter._multipart_request = AsyncMock(return_value={"id": "msg-voice-out"})
+    adapter._verify_delivery = AsyncMock(return_value={"id": "msg-voice-out", "attachments": [{"id": "0"}]})
+
+    result = await adapter.send_voice("chan-1", str(audio_path), duration=5, waveform="BBBB")
+
+    assert result.success is True
+    assert result.message_id == "msg-voice-out"
+    adapter._multipart_request.assert_awaited_once()
+    kwargs = adapter._multipart_request.await_args.kwargs
+    assert kwargs["payload"]["flags"] == fluxer_adapter._VOICE_MESSAGE_FLAG
+    assert kwargs["payload"]["attachments"] == [
+        {"id": 0, "filename": "reply.ogg", "title": "reply.ogg", "duration": 5, "waveform": "BBBB"}
+    ]
+    assert kwargs["files"][0][0] == "files[0]"
 
 
 def test_pyproject_has_runtime_dependencies():

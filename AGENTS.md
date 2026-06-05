@@ -30,6 +30,12 @@ python3 -m py_compile adapter.py __init__.py tests/test_plugin_package.py
 
 When checking environment files, print only key names, never values.
 
+## Release notes
+
+- Every user-visible plugin update must add or update `CHANGELOG.md` in the same commit.
+- Keep changelog entries human-readable: what changed, why it matters, user impact, and verification.
+- Bump `pyproject.toml` and `plugin.yaml` versions together when cutting a new plugin release.
+
 ## Verification before reporting success
 
 A setup is not done until you have verified:

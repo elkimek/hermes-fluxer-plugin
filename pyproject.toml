@@ -1,6 +1,6 @@
 [project]
 name = "hermes-fluxer-plugin"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fluxer platform plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,14 @@ dependencies = [
 Homepage = "https://github.com/elkimek/hermes-fluxer-plugin"
 Hermes = "https://hermes-agent.nousresearch.com/docs"
 Fluxer = "https://fluxer.app"
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "PyYAML>=6",
+  "tomli>=2; python_version < '3.11'",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

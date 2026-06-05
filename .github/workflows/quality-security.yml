@@ -1,0 +1,98 @@
+name: Quality and Security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'feat/**'
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  lint-and-security:
+    name: Lint, audit, and secret-shape checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install quality and security tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . ruff bandit pip-audit
+
+      - name: Ruff lint
+        run: ruff check adapter.py tests
+
+      - name: Bandit security scan
+        run: bandit -q -r adapter.py -x tests --severity-level medium
+
+      - name: Dependency vulnerability audit
+        run: |
+          printf 'httpx>=0.24\nwebsockets>=11\n' > /tmp/fluxer-runtime-requirements.txt
+          pip-audit --strict -r /tmp/fluxer-runtime-requirements.txt
+
+      - name: Secret-shaped placeholder scan
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          patterns = {
+              'GitHub classic token': re.compile(r'ghp_[A-Za-z0-9_]+'),
+              'GitHub fine-grained token': re.compile(r'github_pat_[A-Za-z0-9_]+'),
+              'credential-bearing GitHub URL': re.compile(r'https://[^\s/@]+:[^\s/@]+@github\.com'),
+              'bearer token': re.compile(r'Bearer\s+[A-Za-z0-9._-]{20,}', re.I),
+              'token assignment': re.compile('token' + r'\s*[:=]\s*[A-Za-z0-9._-]{20,}', re.I),
+              'api key assignment': re.compile('api' + r'[_-]?key\s*[:=]', re.I),
+          }
+          ignored_dirs = {'.git', '.pytest_cache', '__pycache__'}
+          issues = []
+          for path in pathlib.Path('.').rglob('*'):
+              if not path.is_file() or any(part in ignored_dirs for part in path.parts):
+                  continue
+              try:
+                  text = path.read_text(errors='ignore')
+              except OSError:
+                  continue
+              for line_no, line in enumerate(text.splitlines(), 1):
+                  for label, pattern in patterns.items():
+                      if pattern.search(line):
+                          issues.append(f'{path}:{line_no}: {label}')
+          if issues:
+              print('\n'.join(issues))
+              sys.exit(1)
+          print('secret-shaped placeholder scan clean')
+          PY
+
+  codeql:
+    name: CodeQL Python analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3

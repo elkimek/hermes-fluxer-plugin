@@ -188,6 +188,22 @@ def _attachment_filename(att: Dict[str, Any]) -> str:
     return str(att.get("filename") or att.get("title") or att.get("name") or "attachment").strip()
 
 
+def _attachment_content_type(att: Dict[str, Any]) -> str:
+    """Return a normalized attachment MIME type, falling back to filename hints."""
+    explicit = str(
+        att.get("content_type")
+        or att.get("contentType")
+        or att.get("mime_type")
+        or att.get("mimeType")
+        or att.get("mimetype")
+        or ""
+    ).split(";", 1)[0].strip().lower()
+    if explicit:
+        return explicit
+    guessed, _encoding = mimetypes.guess_type(_attachment_filename(att))
+    return (guessed or "application/octet-stream").split(";", 1)[0].strip().lower()
+
+
 def _extension_for_attachment(att: Dict[str, Any], content_type: str, default: str = ".bin") -> str:
     filename = _attachment_filename(att)
     suffix = Path(filename).suffix.lower()
@@ -228,6 +244,15 @@ def _is_voice_message(data: Dict[str, Any]) -> bool:
                 continue
             if bool(att.get("is_voice_message") or att.get("voice") or att.get("voice_message")):
                 return True
+            waveform = att.get("waveform")
+            if waveform not in (None, "", [], {}):
+                return True
+            duration = att.get("duration")
+            try:
+                if duration is not None and float(duration) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
     return False
 
 
@@ -1473,7 +1498,7 @@ class FluxerAdapter(BasePlatformAdapter):
         if not is_safe_url(url):
             logger.warning("Fluxer blocked unsafe attachment URL: %s", safe_url_for_log(url))
             return None, None
-        content_type = str(att.get("content_type") or att.get("contentType") or "application/octet-stream").split(";", 1)[0].lower()
+        content_type = _attachment_content_type(att)
         filename = _attachment_filename(att)
         ext = _extension_for_attachment(att, content_type)
 

@@ -23,6 +23,7 @@ This repo is not Fluxer itself and it is not a full Hermes fork. It is the adapt
 | `__init__.py` | Registration shim loaded by Hermes when the plugin is enabled. |
 | `pyproject.toml` | Python package metadata and runtime dependencies. |
 | `after-install.md` | Short post-install checklist shown after plugin installation. |
+| `CHANGELOG.md` | User-facing release notes for plugin updates, fixes, and new capabilities. |
 | `AGENTS.md` | Safety and execution contract for AI agents working in this repo. |
 | `INSTALL_FOR_AGENTS.md` | Short install/configure/verify runbook for agents helping users set Fluxer up. |
 | `tests/` | Source-level package and regression tests for the adapter and manifest. |
@@ -60,6 +61,7 @@ Implemented:
 - message edits and deletes
 - pins, when the Fluxer server supports pin routes
 - media and document delivery where Fluxer's API supports uploads or attachment URLs
+- voice-message roundtrip: inbound voice-shaped attachments are cached as audio for Hermes STT, and outbound `send_voice` uploads Fluxer voice-message payloads with duration/waveform metadata
 - reactions for approval and slash-confirm flows
 - component buttons for approval flows, with reaction fallback
 - channel-directory enumeration for Hermes delivery targets
@@ -149,7 +151,7 @@ hermes config set platforms.fluxer.enabled true
 Put your token in `~/.hermes/.env`. Append to the file; do not replace an existing `.env` wholesale:
 
 ```bash
-FLUXER_BOT_TOKEN=your_application_id.your_secret
+FLUXER_BOT_TOKEN=<fluxer-bot-token>
 ```
 
 The token is sensitive. Do not paste a real token into GitHub issues, logs, screenshots, or chat transcripts.
@@ -316,6 +318,16 @@ FLUXER_BACKLOG_BOOTSTRAP_SECONDS=120
 | `FLUXER_BACKLOG_BOOTSTRAP_SECONDS` | `120` | Startup lookback window when no previous disconnect time exists. |
 
 Backlog recovery is a safety net for short disconnects. It is not a full historical importer.
+
+### Voice messages
+
+Fluxer voice messages are treated differently from generic audio files:
+
+- inbound voice-shaped attachments (`VOICE_MESSAGE` flags, `is_voice_message`/`voice_message` markers, or Fluxer duration/waveform metadata) are normalized as `MessageType.VOICE`, cached as local audio, and handed to Hermes' normal STT path;
+- plain audio attachments remain generic audio files so music/podcasts do not get auto-transcribed as if they were spoken chat;
+- outbound `send_voice` uses Fluxer's multipart message endpoint with the voice-message flag plus attachment duration/waveform metadata, so TTS replies and explicit voice sends can render as native Fluxer voice messages when the deployment supports them.
+
+If no STT provider is configured, Hermes will still receive the voice attachment but will send the user the normal voice setup notice instead of pretending it understood the audio.
 
 ### Native command registration
 
