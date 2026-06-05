@@ -75,6 +75,21 @@ def test_transcribe_with_provider_uses_groq_default_for_local_model_name(monkeyp
     assert seen["model"] == "whisper-large-v3-turbo"
 
 
+def test_transcribe_with_provider_uses_elevenlabs_default_for_local_model_name(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_elevenlabs(file_path, model):
+        seen["file_path"] = file_path
+        seen["model"] = model
+        return {"success": True, "transcript": "ok", "provider": "elevenlabs"}
+
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._transcribe_elevenlabs", fake_elevenlabs)
+    result = transcribe_with_provider(str(tmp_path / "voice.wav"), provider="elevenlabs", model="medium.en")
+
+    assert result["provider"] == "elevenlabs"
+    assert seen["model"] == "scribe_v2"
+
+
 def test_write_pcm16_wav_roundtrip(tmp_path):
     path = tmp_path / "voice.wav"
     write_pcm16_wav(path, b"\x01\x00\x02\x00", sample_rate=24_000)

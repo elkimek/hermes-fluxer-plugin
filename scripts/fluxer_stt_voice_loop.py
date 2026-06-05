@@ -39,7 +39,12 @@ from adapter import FluxerAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from scripts.fluxer_xai_room_loop import _capture_one_speech_segment  # noqa: E402
-from tools.transcription_tools import _transcribe_groq, _transcribe_xai, transcribe_audio  # noqa: E402
+from tools.transcription_tools import (  # noqa: E402
+    _transcribe_elevenlabs,
+    _transcribe_groq,
+    _transcribe_xai,
+    transcribe_audio,
+)
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 logger = logging.getLogger("fluxer_stt_voice_loop")
@@ -111,6 +116,9 @@ def transcribe_with_provider(file_path: str, *, provider: str, model: str | None
         return _transcribe_groq(file_path, groq_model)
     if provider == "xai":
         return _transcribe_xai(file_path, model or "grok-stt")
+    if provider == "elevenlabs":
+        elevenlabs_model = model if model and model not in {"tiny.en", "base.en", "small.en", "medium.en"} else "scribe_v2"
+        return _transcribe_elevenlabs(file_path, elevenlabs_model)
     raise ValueError(f"Unsupported STT provider: {provider}")
 
 
@@ -293,8 +301,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-segment-ms", type=int, default=500)
     parser.add_argument("--max-segment-seconds", type=float, default=6.0)
     parser.add_argument("--voice", default="eve")
-    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai"), default="local")
-    parser.add_argument("--stt-model", default="medium.en", help="STT model; local default medium.en for accuracy, Groq default whisper-large-v3-turbo")
+    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="local")
+    parser.add_argument("--stt-model", default="medium.en", help="STT model; local default medium.en for accuracy, Groq default whisper-large-v3-turbo, ElevenLabs default scribe_v2")
     parser.add_argument("--xai-timeout", type=float, default=45.0)
     parser.add_argument("--xai-first-audio-timeout", type=float, default=12.0)
     parser.add_argument("--connect-timeout", type=float, default=30.0)
