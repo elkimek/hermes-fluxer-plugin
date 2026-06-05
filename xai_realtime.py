@@ -68,7 +68,10 @@ class XAIRealtimeVoiceClient:
         model: str = "grok-voice-latest",
         voice: str = "eve",
         sample_rate: int = 24_000,
-        instructions: str = "You are Žofka, warm, direct, and concise.",
+        instructions: str = (
+            "You are Žofka, warm, direct, and concise. "
+            "Always answer in English unless Elkim explicitly asks for Czech. Do not answer in Spanish."
+        ),
     ) -> None:
         self.api_key = (api_key or os.getenv("XAI_API_KEY") or "").strip()
         self.model = model

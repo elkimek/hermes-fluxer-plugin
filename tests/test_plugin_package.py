@@ -510,3 +510,36 @@ async def test_gateway_ready_event_is_set_on_ready_dispatch(monkeypatch):
 
     assert adapter.bot_user_id == "bot-user"
     assert await adapter.wait_until_gateway_ready(timeout=0.001) is True
+
+
+def test_xai_realtime_defaults_pin_english_not_spanish():
+    source = (ROOT / "xai_realtime.py").read_text()
+
+    assert "Always answer in English" in source
+    assert "Do not answer in Spanish" in source
+
+
+def test_continuous_room_loop_script_has_noise_and_language_guardrails():
+    source = (ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text()
+
+    assert "Always answer in English" in source
+    assert "Do not answer in Spanish" in source
+    assert "Ignore background music" in source
+    assert "Jefka" in source
+    assert "obvious ASR confusion" in source
+    assert "WAKE_GATE_INSTRUCTIONS" in source
+    assert "--disable-wake-gate" in source
+    assert "RESPOND" in source
+    assert "IGNORE" in source
+    assert "def _speech_segments" in source
+    assert "iter_remote_audio_pcm16" in source
+    assert "audio_response_from_pcm16" in source
+    assert "publish_wav_file" in source
+
+
+def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():
+    source = (ROOT / "livekit_bridge.py").read_text()
+
+    assert "def iter_remote_audio_pcm16" in source
+    assert "async def publish_pcm16" in source
+    assert "AsyncIterator[bytes]" in source

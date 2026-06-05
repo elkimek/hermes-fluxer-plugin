@@ -16,7 +16,7 @@ import math
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, AsyncIterator, Callable, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -263,34 +263,72 @@ class FluxerLiveKitSmokeBridge:
             if close is not None:
                 await _maybe_await(close())
 
-    async def collect_remote_audio_pcm16(
+    async def publish_pcm16(
         self,
+        pcm: bytes,
         *,
-        duration_seconds: float = 4.0,
         sample_rate: int = 24_000,
-        frame_size_ms: int = 20,
-        participant_identity: str | None = None,
-        timeout: float = 30.0,
-    ) -> bytes:
-        """Collect PCM16 mono audio from a subscribed remote LiveKit track.
-
-        Returned bytes are suitable for xAI Realtime `input_audio_buffer.append`
-        when the xAI session is configured with the same sample rate.
-        """
+        frame_ms: int = 20,
+        track_name: str = "zofka-realtime-response",
+    ) -> None:
+        """Publish mono PCM16 audio bytes into the connected LiveKit room."""
 
         if self._room is None:
             raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
-        if duration_seconds <= 0:
-            raise ValueError("duration_seconds must be positive")
+        if not pcm:
+            raise ValueError("pcm must not be empty")
+        if sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        if frame_ms <= 0:
+            raise ValueError("frame_ms must be positive")
+
+        rtc = _load_livekit_audio_helpers()
+        source = rtc.AudioSource(sample_rate, 1)
+        track = rtc.LocalAudioTrack.create_audio_track(track_name, source)
+        options = rtc.TrackPublishOptions()
+        options.source = rtc.TrackSource.SOURCE_MICROPHONE
+        publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
+        logger.info("Fluxer LiveKit bridge published PCM track sid=%s", getattr(publication, "sid", "<none>"))
+
+        frame_samples = max(1, sample_rate * frame_ms // 1000)
+        frame_bytes = frame_samples * 2
+        for offset in range(0, len(pcm), frame_bytes):
+            chunk = pcm[offset : offset + frame_bytes]
+            if len(chunk) % 2:
+                chunk = chunk[:-1]
+            if not chunk:
+                continue
+            samples = len(chunk) // 2
+            frame = rtc.AudioFrame(chunk, sample_rate, 1, samples)
+            await _maybe_await(source.capture_frame(frame))
+        await _maybe_await(source.wait_for_playout())
+        close = getattr(source, "aclose", None)
+        if close is not None:
+            await _maybe_await(close())
+
+    def iter_remote_audio_pcm16(
+        self,
+        *,
+        sample_rate: int = 24_000,
+        frame_size_ms: int = 20,
+        participant_identity: str | None = None,
+    ) -> AsyncIterator[bytes]:
+        """Stream PCM16 mono chunks from subscribed remote LiveKit audio tracks."""
+
+        if self._room is None:
+            raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
         if sample_rate <= 0:
             raise ValueError("sample_rate must be positive")
         if frame_size_ms <= 0:
             raise ValueError("frame_size_ms must be positive")
 
         rtc = _load_livekit_audio_helpers()
-        target_bytes = int(sample_rate * duration_seconds) * 2
         queue: asyncio.Queue[bytes] = asyncio.Queue()
         stream_tasks: list[asyncio.Task[Any]] = []
+
+        def maybe_track_is_audio(track: Any) -> bool:
+            kind = getattr(track, "kind", None)
+            return str(kind).lower().endswith("audio") or track.__class__.__name__.lower().endswith("audiotrack")
 
         async def consume_track(track: Any, participant: Any) -> None:
             identity = getattr(participant, "identity", None)
@@ -313,33 +351,62 @@ class FluxerLiveKitSmokeBridge:
                 if close is not None:
                     await _maybe_await(close())
 
-        def maybe_track_is_audio(track: Any) -> bool:
-            kind = getattr(track, "kind", None)
-            return str(kind).lower().endswith("audio") or track.__class__.__name__.lower().endswith("audiotrack")
-
         def on_track_subscribed(track: Any, publication: Any, participant: Any) -> None:
             if maybe_track_is_audio(track):
                 stream_tasks.append(asyncio.create_task(consume_track(track, participant)))
 
-        self._room.on("track_subscribed", on_track_subscribed)
+        room = self._room
+        if room is None:
+            raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
 
-        for participant in getattr(self._room, "remote_participants", {}).values():
-            for publication in getattr(participant, "track_publications", {}).values():
-                track = getattr(publication, "track", None)
-                if track is not None and maybe_track_is_audio(track):
-                    stream_tasks.append(asyncio.create_task(consume_track(track, participant)))
+        async def generator() -> AsyncIterator[bytes]:
+            room.on("track_subscribed", on_track_subscribed)
+            for participant in getattr(room, "remote_participants", {}).values():
+                for publication in getattr(participant, "track_publications", {}).values():
+                    track = getattr(publication, "track", None)
+                    if track is not None and maybe_track_is_audio(track):
+                        stream_tasks.append(asyncio.create_task(consume_track(track, participant)))
+            try:
+                while True:
+                    yield await queue.get()
+            finally:
+                for task in stream_tasks:
+                    task.cancel()
+                for task in stream_tasks:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
 
+        return generator()
+
+    async def collect_remote_audio_pcm16(
+        self,
+        *,
+        duration_seconds: float = 4.0,
+        sample_rate: int = 24_000,
+        frame_size_ms: int = 20,
+        participant_identity: str | None = None,
+        timeout: float = 30.0,
+    ) -> bytes:
+        """Collect PCM16 mono audio from a subscribed remote LiveKit track.
+
+        Returned bytes are suitable for xAI Realtime `input_audio_buffer.append`
+        when the xAI session is configured with the same sample rate.
+        """
+
+        if duration_seconds <= 0:
+            raise ValueError("duration_seconds must be positive")
+        target_bytes = int(sample_rate * duration_seconds) * 2
         collected = bytearray()
-        try:
-            while len(collected) < target_bytes:
-                collected.extend(await asyncio.wait_for(queue.get(), timeout=timeout))
-        finally:
-            for task in stream_tasks:
-                task.cancel()
-            for task in stream_tasks:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        return bytes(collected[:target_bytes])
+        async with asyncio.timeout(timeout):
+            async for chunk in self.iter_remote_audio_pcm16(
+                sample_rate=sample_rate,
+                frame_size_ms=frame_size_ms,
+                participant_identity=participant_identity,
+            ):
+                collected.extend(chunk)
+                if len(collected) >= target_bytes:
+                    return bytes(collected[:target_bytes])
+        return bytes(collected)
 
     async def disconnect(self) -> None:
         room = self._room
