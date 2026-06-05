@@ -164,6 +164,7 @@ class XAIRealtimeVoiceClient:
         on_audio_delta: Callable[[bytes], Awaitable[None]],
         *,
         timeout: float = 45.0,
+        first_audio_timeout: Optional[float] = None,
     ) -> XAIRealtimeAudioResult:
         """Stream xAI Realtime output PCM deltas to a sink as soon as they arrive."""
 
@@ -174,7 +175,12 @@ class XAIRealtimeVoiceClient:
         ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
         try:
             return await asyncio.wait_for(
-                self._audio_response_from_pcm16_to_sink_on_ws(ws, pcm_audio, on_audio_delta),
+                self._audio_response_from_pcm16_to_sink_on_ws(
+                    ws,
+                    pcm_audio,
+                    on_audio_delta,
+                    first_audio_timeout=first_audio_timeout,
+                ),
                 timeout=timeout,
             )
         finally:
@@ -211,9 +217,11 @@ class XAIRealtimeVoiceClient:
         ws: Any,
         pcm_audio: bytes,
         on_audio_delta: Callable[[bytes], Awaitable[None]],
+        *,
+        first_audio_timeout: Optional[float] = None,
     ) -> XAIRealtimeAudioResult:
         await self._send_audio_response_request(ws, pcm_audio)
-        return await self._collect_audio_to_sink(ws, on_audio_delta)
+        return await self._collect_audio_to_sink(ws, on_audio_delta, first_audio_timeout=first_audio_timeout)
 
     async def _send_audio_response_request(self, ws: Any, pcm_audio: bytes) -> None:
         await self._configure_session(ws)
@@ -273,11 +281,23 @@ class XAIRealtimeVoiceClient:
         self,
         ws: Any,
         on_audio_delta: Callable[[bytes], Awaitable[None]],
+        *,
+        first_audio_timeout: Optional[float] = None,
     ) -> XAIRealtimeAudioResult:
         bytes_written = 0
         events: list[str] = []
         transcript_parts: list[str] = []
-        async for raw in ws:
+        iterator = ws.__aiter__()
+        while True:
+            try:
+                if bytes_written == 0 and first_audio_timeout is not None:
+                    raw = await asyncio.wait_for(anext(iterator), timeout=first_audio_timeout)
+                else:
+                    raw = await anext(iterator)
+            except StopAsyncIteration:
+                break
+            except TimeoutError as exc:
+                raise TimeoutError(f"xAI Realtime emitted no audio within {first_audio_timeout}s; events={events}") from exc
             event = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
             event_type = str(event.get("type") or "")
             if event_type:

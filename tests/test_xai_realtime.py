@@ -28,6 +28,18 @@ class FakeRealtimeWebSocket:
         self.closed = True
 
 
+class SlowRealtimeWebSocket(FakeRealtimeWebSocket):
+    def __init__(self, events, *, delay):
+        super().__init__(events)
+        self.delay = delay
+
+    async def __anext__(self):
+        import asyncio
+
+        await asyncio.sleep(self.delay)
+        return await super().__anext__()
+
+
 def pcm_delta(data: bytes):
     return {"type": "response.output_audio.delta", "delta": base64.b64encode(data).decode("ascii")}
 
@@ -113,6 +125,23 @@ async def test_xai_realtime_audio_response_streams_deltas_to_sink(tmp_path):
     assert result.wav_path is None
     assert result.bytes_written == 6
     assert result.transcript == "ok"
+
+
+@pytest.mark.asyncio
+async def test_xai_realtime_first_audio_timeout_fails_fast():
+    ws = SlowRealtimeWebSocket([{"type": "response.created"}, pcm_delta(b"\x01\x00")], delay=0.05)
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
+
+    async def sink(chunk: bytes):
+        raise AssertionError("sink should not receive late audio")
+
+    with pytest.raises(TimeoutError, match="emitted no audio"):
+        await client._audio_response_from_pcm16_to_sink_on_ws(
+            ws,
+            b"\x10\x00",
+            sink,
+            first_audio_timeout=0.001,
+        )
 
 
 @pytest.mark.asyncio

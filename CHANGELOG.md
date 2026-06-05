@@ -25,6 +25,9 @@ This project uses simple semantic versioning while the plugin is young:
 - Verified `grok-voice-latest` text-to-voice output through hosted Fluxer LiveKit with `xai_realtime_published: true`.
 - Added one-turn duplex smoke plumbing: Fluxer remote audio capture → xAI Realtime audio input → streamed Grok Voice PCM deltas → Fluxer LiveKit publish.
 - Verified live remote human-speaker capture and streamed response publishing against hosted Fluxer; first assistant audio arrived at about 2.0s after capture, with only 0.84s final playout drain.
+- Tuned live VAD defaults to reduce end-of-turn latency while avoiding false bursts: 600ms silence stop, 180ms retained final silence, and 750ms minimum segment; diagnostics now separate wall-clock capture time from captured audio duration.
+- Tightened realtime voice instructions to one short default answer and no multiple follow-up questions.
+- Added a first-audio timeout for streamed xAI responses so no-audio provider turns fail fast instead of blocking the room until the full response timeout.
 
 ## [0.1.1] - 2026-06-05
 

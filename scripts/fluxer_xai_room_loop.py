@@ -40,7 +40,7 @@ DEFAULT_INSTRUCTIONS = """You are Žofka speaking with Elkim in a Fluxer voice r
 Always answer in English unless Elkim explicitly asks for Czech. Do not answer in Spanish.
 Treat Žofka, Zofka, Jefka, and occasional voice-ASR name confusions like Jessica as your name; do not correct the name out loud.
 Ignore background music, lyrics, radio, TV, and room noise. Respond only to speech that sounds directed at Žofka or clearly part of the conversation.
-Be warm, direct, concise, and natural for realtime voice. One or two short sentences unless Elkim asks for depth.
+Be warm, direct, concise, and natural for realtime voice. Default to one short sentence. Do not ask multiple follow-up questions.
 """.strip()
 
 WAKE_GATE_INSTRUCTIONS = """You are a strict realtime voice gate for Žofka in a noisy room.
@@ -63,19 +63,36 @@ def _pcm16_rms(pcm: bytes) -> int:
     return int((total / samples) ** 0.5) if samples else 0
 
 
+def _pcm16_duration_seconds(pcm: bytes, *, sample_rate: int) -> float:
+    if sample_rate <= 0:
+        return 0.0
+    return (len(pcm) // 2) / sample_rate
+
+
 async def _speech_segments(
     chunks: AsyncIterator[bytes],
     *,
     sample_rate: int,
     energy_threshold: int,
     silence_ms: int,
+    end_padding_ms: int,
     min_segment_ms: int,
     max_segment_seconds: float,
 ) -> AsyncIterator[bytes]:
-    """Yield PCM16 speech-ish segments from a chunk iterator using simple VAD."""
+    """Yield PCM16 speech-ish segments from a chunk iterator using simple VAD.
+
+    `silence_ms` controls how quickly we decide the speaker stopped. Only
+    `end_padding_ms` of that final silence is kept in the PCM sent to xAI, so
+    short natural pauses stay intact but we do not ask the model to process a
+    long dead tail.
+    """
+
+    if end_padding_ms < 0 or end_padding_ms > silence_ms:
+        raise ValueError("end_padding_ms must be between 0 and silence_ms")
 
     bytes_per_ms = sample_rate * 2 / 1000
     silence_bytes_limit = int(bytes_per_ms * silence_ms)
+    end_padding_bytes = int(bytes_per_ms * end_padding_ms)
     min_bytes = int(bytes_per_ms * min_segment_ms)
     max_bytes = int(sample_rate * max_segment_seconds) * 2
 
@@ -97,6 +114,10 @@ async def _speech_segments(
             trailing_silence += len(chunk)
 
         if in_segment and (trailing_silence >= silence_bytes_limit or len(segment) >= max_bytes):
+            if trailing_silence > end_padding_bytes:
+                trim_bytes = trailing_silence - end_padding_bytes
+                if trim_bytes > 0:
+                    del segment[-trim_bytes:]
             pcm = bytes(segment)
             segment.clear()
             trailing_silence = 0
@@ -123,6 +144,7 @@ async def _capture_one_speech_segment(
         sample_rate=args.sample_rate,
         energy_threshold=args.energy_threshold,
         silence_ms=args.silence_ms,
+        end_padding_ms=args.end_padding_ms,
         min_segment_ms=args.min_segment_ms,
         max_segment_seconds=args.max_segment_seconds,
     )
@@ -160,6 +182,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
             capture_started = time.monotonic()
             pcm = await _capture_one_speech_segment(args, bridge, timeout=max(1.0, remaining))
             capture_seconds = time.monotonic() - capture_started
+            captured_audio_seconds = _pcm16_duration_seconds(pcm, sample_rate=args.sample_rate)
         except TimeoutError:
             break
         turn_no = len(turns) + 1
@@ -189,6 +212,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                         "ignored": True,
                         "timing": {
                             "capture_seconds": round(capture_seconds, 3),
+                            "captured_audio_seconds": round(captured_audio_seconds, 3),
                             "gate_seconds": round(gate_seconds, 3),
                         },
                     }
@@ -218,6 +242,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     pcm,
                     publish_delta,
                     timeout=args.xai_timeout,
+                    first_audio_timeout=args.xai_first_audio_timeout,
                 )
                 xai_seconds = time.monotonic() - xai_started
             finally:
@@ -235,6 +260,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     "error": f"{type(exc).__name__}: response failed",
                     "timing": {
                         "capture_seconds": round(capture_seconds, 3),
+                        "captured_audio_seconds": round(captured_audio_seconds, 3),
                         "gate_seconds": round(gate_seconds, 3),
                     },
                 }
@@ -253,6 +279,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 "published": True,
                 "timing": {
                     "capture_seconds": round(capture_seconds, 3),
+                    "captured_audio_seconds": round(captured_audio_seconds, 3),
                     "gate_seconds": round(gate_seconds, 3),
                     "xai_seconds": round(xai_seconds, 3),
                     "first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
@@ -355,13 +382,15 @@ def main() -> int:
     parser.add_argument("--sample-rate", type=int, default=24000)
     parser.add_argument("--frame-ms", type=int, default=20)
     parser.add_argument("--energy-threshold", type=int, default=350)
-    parser.add_argument("--silence-ms", type=int, default=900)
-    parser.add_argument("--min-segment-ms", type=int, default=600)
+    parser.add_argument("--silence-ms", type=int, default=600)
+    parser.add_argument("--end-padding-ms", type=int, default=180, help="Final silence kept in captured PCM after end-of-turn detection")
+    parser.add_argument("--min-segment-ms", type=int, default=750)
     parser.add_argument("--max-segment-seconds", type=float, default=8.0)
     parser.add_argument("--unmute", action="store_true", help="Join unmuted; default muted")
     parser.add_argument("--xai-model", default="grok-voice-latest")
     parser.add_argument("--xai-voice", default="eve")
     parser.add_argument("--xai-timeout", type=float, default=45.0)
+    parser.add_argument("--xai-first-audio-timeout", type=float, default=8.0, help="Abort a response turn if xAI emits no audio delta by this many seconds")
     parser.add_argument("--xai-instructions", default=DEFAULT_INSTRUCTIONS)
     parser.add_argument("--wake-gate-instructions", default=WAKE_GATE_INSTRUCTIONS)
     parser.add_argument("--disable-wake-gate", action="store_true", help="Answer every captured speech segment")

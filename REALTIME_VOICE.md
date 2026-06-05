@@ -86,7 +86,10 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Verified xAI Realtime end-to-end into Fluxer: `grok-voice-latest` produced PCM16 audio over `wss://api.x.ai/v1/realtime`, the smoke probe joined Fluxer LiveKit, and published it with `xai_realtime_published: true`.
 - Added the first one-turn duplex probe: subscribe to remote LiveKit audio, collect PCM16, send `input_audio_buffer.append`/`commit` into xAI Realtime, stream Grok Voice output deltas directly into Fluxer LiveKit, and drain final playout.
 - Verified live remote human-speaker capture and streamed response publishing against hosted Fluxer. The measured turn started assistant audio at `first_audio_seconds: 1.999`; final playout drain was `0.840s`, replacing the earlier full-WAV publish wait.
-- Next: tune VAD/silence tail and add real barge-in/interruption rather than queueing speech while Žofka is answering.
+- Tightened end-of-turn capture defaults after live testing: the loop now waits for `600ms` silence, keeps only `180ms` final silence in the PCM sent to xAI, and requires `750ms` minimum captured audio to avoid false/too-short bursts. Timing now reports both wall-clock `capture_seconds` and `captured_audio_seconds`.
+- Tightened realtime answer instructions to default to one short sentence and avoid multiple follow-up questions, reducing generated-audio length.
+- Added `--xai-first-audio-timeout` so a provider turn that emits no audio delta fails fast and the room can resume listening instead of waiting for the full response timeout.
+- Next: add real barge-in/interruption rather than queueing speech while Žofka is answering.
 
 ### Phase 4 — real-time Žofka loop
 
