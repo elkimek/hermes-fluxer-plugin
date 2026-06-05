@@ -2108,6 +2108,51 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.debug("Fluxer application-command defer response failed: %s", exc)
         await self.handle_message(MessageEvent(text=text, message_type=MessageType.TEXT, source=source, raw_message={"interaction": data}, message_id=str(data.get("id") or "") or None))
 
+    def set_voice_server_update_handler(
+        self,
+        handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Any]],
+    ) -> None:
+        """Register an in-memory LiveKit bridge handoff for VOICE_SERVER_UPDATE.
+
+        The handler receives `(raw_update, safe_update)`. `raw_update` may contain
+        the ephemeral LiveKit token and must not be stored by the adapter.
+        """
+        self._voice_server_update_handler = handler
+
+    async def _handle_voice_server_update(self, data: Dict[str, Any]) -> None:
+        """Capture Fluxer LiveKit server metadata without retaining the token."""
+        guild_id = data.get("guild_id")
+        channel_id = data.get("channel_id")
+        key = _voice_join_key(
+            str(guild_id) if guild_id is not None else None,
+            str(channel_id) if channel_id is not None else None,
+        )
+        pending = self._pending_voice_joins.pop(key, None)
+        matched = pending is not None
+        safe_update = _sanitize_voice_server_update(data, matched_pending_join=matched)
+        self._last_voice_server_update = safe_update
+        logger.info(
+            "Fluxer voice server update captured endpoint=%s has_token=%s matched_pending_join=%s channel=%s guild=%s connection=%s",
+            safe_url_for_log(str(safe_update.get("endpoint") or "")),
+            safe_update.get("has_token"),
+            matched,
+            safe_update.get("channel_id") or "<none>",
+            safe_update.get("guild_id") or "<dm>",
+            safe_update.get("connection_id") or "<none>",
+        )
+        if self._voice_server_update_handler is not None:
+            try:
+                result = self._voice_server_update_handler(dict(data), dict(safe_update))
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                logger.error(
+                    "Fluxer voice server update bridge handler failed channel=%s guild=%s connection=%s",
+                    safe_update.get("channel_id") or "<none>",
+                    safe_update.get("guild_id") or "<dm>",
+                    safe_update.get("connection_id") or "<none>",
+                )
+
     async def _handle_gateway_dispatch(self, payload: Dict[str, Any]) -> None:
         op = payload.get("op")
         self._last_seq = _event_seq(payload) or self._last_seq
@@ -2147,6 +2192,9 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         if event_name == "INTERACTION_CREATE":
             await self._handle_interaction_create(data)
+            return
+        if event_name == "VOICE_SERVER_UPDATE":
+            await self._handle_voice_server_update(data)
             return
         if event_name in {"MESSAGE_REACTION_ADD", "REACTION_ADD", "MESSAGE_REACTION_CREATE"}:
             await self._handle_reaction_add(data)

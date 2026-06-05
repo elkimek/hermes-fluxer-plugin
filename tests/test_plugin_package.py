@@ -496,6 +496,48 @@ def test_realtime_voice_spike_doc_records_fluxer_livekit_flow():
     assert "standalone plugin" in doc
 
 @pytest.mark.asyncio
+async def test_voice_server_update_bridge_handler_receives_raw_token_safely(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    received = []
+
+    adapter._pending_voice_joins["guild-1:voice-1"] = {"guild_id": "guild-1", "channel_id": "voice-1"}
+    adapter.set_voice_server_update_handler(lambda raw, safe: received.append((raw, safe)))
+
+    await adapter._handle_gateway_dispatch(
+        {
+            "op": 0,
+            "t": "VOICE_SERVER_UPDATE",
+            "d": {
+                "guild_id": "guild-1",
+                "channel_id": "voice-1",
+                "connection_id": "conn-1",
+                "endpoint": "wss://voice.example.test",
+                "token": "livekit-secret-token",
+            },
+        }
+    )
+
+    assert len(received) == 1
+    raw, safe = received[0]
+    assert raw["token"] == "livekit-secret-token"
+    assert safe == {
+        "guild_id": "guild-1",
+        "channel_id": "voice-1",
+        "connection_id": "conn-1",
+        "endpoint": "wss://voice.example.test",
+        "has_token": True,
+        "matched_pending_join": True,
+    }
+    assert adapter._last_voice_server_update == safe
+    assert adapter._last_voice_server_update is not None
+    assert "token" not in adapter._last_voice_server_update
+
+
+@pytest.mark.asyncio
 async def test_gateway_ready_event_is_set_on_ready_dispatch(monkeypatch):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
