@@ -100,6 +100,33 @@ async def test_xai_realtime_force_message_does_not_send_response_create(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_xai_realtime_text_response_streams_deltas_to_sink():
+    ws = FakeRealtimeWebSocket(
+        [
+            {"type": "response.created"},
+            pcm_delta(b"\x02\x00"),
+            {"type": "response.output_audio_transcript.delta", "delta": "four"},
+            {"type": "response.done"},
+        ]
+    )
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
+    chunks = []
+
+    async def sink(chunk: bytes):
+        chunks.append(chunk)
+
+    result = await client._text_response_to_sink_on_ws(ws, "what is 2+2", sink)
+
+    assert ws.sent[1]["type"] == "conversation.item.create"
+    assert ws.sent[1]["item"]["content"][0] == {"type": "input_text", "text": "what is 2+2"}
+    assert ws.sent[2] == {"type": "response.create"}
+    assert chunks == [b"\x02\x00"]
+    assert result.wav_path is None
+    assert result.bytes_written == 2
+    assert result.transcript == "four"
+
+
+@pytest.mark.asyncio
 async def test_xai_realtime_audio_response_creates_input_audio_item_and_response(tmp_path):
     ws = FakeRealtimeWebSocket([pcm_delta(b"\x02\x00"), {"type": "response.done"}])
     client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)

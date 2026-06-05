@@ -38,6 +38,7 @@ for candidate in (ROOT, HERMES_ROOT):
 from adapter import FluxerAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
+from scripts.fluxer_xai_room_loop import _capture_one_speech_segment  # noqa: E402
 from tools.transcription_tools import transcribe_audio  # noqa: E402
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
@@ -143,18 +144,21 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
 
             for turn_no in range(1, args.max_turns + 1):
                 turn_started = time.monotonic()
-                pcm = await bridge.collect_remote_audio_pcm16(
-                    duration_seconds=args.capture_window_seconds,
-                    sample_rate=args.sample_rate,
-                    frame_size_ms=args.frame_ms,
-                    participant_identity=args.participant_identity,
-                    participant_identity_prefix=args.participant_identity_prefix,
-                    timeout=args.capture_timeout,
-                )
+                if args.capture_mode == "vad":
+                    pcm = await _capture_one_speech_segment(args, bridge, timeout=args.capture_timeout)
+                else:
+                    pcm = await bridge.collect_remote_audio_pcm16(
+                        duration_seconds=args.capture_window_seconds,
+                        sample_rate=args.sample_rate,
+                        frame_size_ms=args.frame_ms,
+                        participant_identity=args.participant_identity,
+                        participant_identity_prefix=args.participant_identity_prefix,
+                        timeout=args.capture_timeout,
+                    )
                 wav_path = Path(tempfile.gettempdir()) / f"zofka_stt_loop_input_{turn_no}.wav"
                 write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
                 stt_started = time.monotonic()
-                stt_result = transcribe_audio(str(wav_path))
+                stt_result = transcribe_audio(str(wav_path), model=args.stt_model)
                 stt_seconds = time.monotonic() - stt_started
                 transcript = (stt_result.get("transcript") or "").strip()
                 turn: dict[str, Any] = {
@@ -176,16 +180,36 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     continue
 
                 prompt = build_answer_prompt(transcript, history=history)
-                output_path = Path(tempfile.gettempdir()) / f"zofka_stt_loop_reply_{turn_no}.wav"
                 voice = XAIRealtimeVoiceClient(
                     sample_rate=args.sample_rate,
                     voice=args.voice,
                     instructions="Speak Žofka's answer naturally, briefly, and without extra preamble.",
                 )
                 xai_started = time.monotonic()
-                xai_result = await voice.text_response_to_wav(prompt, output_path, timeout=args.xai_timeout)
+                first_audio_seconds: float | None = None
+                publisher = bridge.pcm16_publisher(
+                    sample_rate=args.sample_rate,
+                    frame_ms=args.frame_ms,
+                    track_name=f"zofka-stt-loop-reply-{turn_no}",
+                )
+                await publisher.__aenter__()
+
+                async def publish_delta(chunk: bytes) -> None:
+                    nonlocal first_audio_seconds
+                    if first_audio_seconds is None:
+                        first_audio_seconds = time.monotonic() - xai_started
+                    await publisher.write(chunk)
+
+                try:
+                    xai_result = await voice.text_response_to_sink(
+                        prompt,
+                        publish_delta,
+                        timeout=args.xai_timeout,
+                        first_audio_timeout=args.xai_first_audio_timeout,
+                    )
+                finally:
+                    await publisher.__aexit__(None, None, None)
                 xai_seconds = time.monotonic() - xai_started
-                await bridge.publish_wav_file(str(output_path), track_name=f"zofka-stt-loop-reply-{turn_no}")
                 history.append({"user": transcript, "assistant": xai_result.transcript})
                 turn.update(
                     {
@@ -196,6 +220,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         "timing": {
                             "turn_seconds": round(time.monotonic() - turn_started, 3),
                             "stt_seconds": round(stt_seconds, 3),
+                            "xai_first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
                             "xai_seconds": round(xai_seconds, 3),
                         },
                     }
@@ -236,13 +261,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Only capture remote LiveKit participants whose identity starts with this prefix, e.g. user_<FluxerUserId>_",
     )
     parser.add_argument("--max-turns", type=int, default=3)
-    parser.add_argument("--capture-window-seconds", type=float, default=5.0)
+    parser.add_argument("--capture-mode", choices=("vad", "fixed"), default="fixed")
+    parser.add_argument("--capture-window-seconds", type=float, default=3.0)
     parser.add_argument("--capture-timeout", type=float, default=25.0)
     parser.add_argument("--initial-settle-seconds", type=float, default=0.8)
     parser.add_argument("--sample-rate", type=int, default=24_000)
     parser.add_argument("--frame-ms", type=int, default=20)
+    parser.add_argument("--energy-threshold", type=int, default=550)
+    parser.add_argument("--silence-ms", type=int, default=500)
+    parser.add_argument("--end-padding-ms", type=int, default=120)
+    parser.add_argument("--min-segment-ms", type=int, default=500)
+    parser.add_argument("--max-segment-seconds", type=float, default=6.0)
     parser.add_argument("--voice", default="eve")
+    parser.add_argument("--stt-model", default="tiny.en", help="Hermes STT/faster-whisper model; tiny.en is fastest locally")
     parser.add_argument("--xai-timeout", type=float, default=45.0)
+    parser.add_argument("--xai-first-audio-timeout", type=float, default=12.0)
     parser.add_argument("--connect-timeout", type=float, default=30.0)
     parser.add_argument("--max-runtime-seconds", type=float, default=180.0)
     parser.add_argument("--env-file", default="/home/elkim/.hermes/.env")

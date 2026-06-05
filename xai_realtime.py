@@ -113,6 +113,32 @@ class XAIRealtimeVoiceClient:
         finally:
             await ws.close()
 
+    async def text_response_to_sink(
+        self,
+        text: str,
+        on_audio_delta: Callable[[bytes], Awaitable[None]],
+        *,
+        timeout: float = 30.0,
+        first_audio_timeout: Optional[float] = None,
+    ) -> XAIRealtimeAudioResult:
+        """Ask xAI Realtime to answer text and stream returned PCM16 deltas to a sink."""
+
+        if not self.api_key:
+            raise RuntimeError("XAI_API_KEY is required for xAI Realtime")
+        if not text.strip():
+            raise ValueError("text must not be empty")
+        ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
+        try:
+            return await self._text_response_to_sink_on_ws(
+                ws,
+                text,
+                on_audio_delta,
+                timeout=timeout,
+                first_audio_timeout=first_audio_timeout,
+            )
+        finally:
+            await ws.close()
+
     async def force_message_to_wav(
         self,
         text: str,
@@ -199,7 +225,23 @@ class XAIRealtimeVoiceClient:
         finally:
             await ws.close()
 
+    async def _text_response_to_sink_on_ws(
+        self,
+        ws: Any,
+        text: str,
+        on_audio_delta: Callable[[bytes], Awaitable[None]],
+        *,
+        timeout: float = 30.0,
+        first_audio_timeout: Optional[float] = None,
+    ) -> XAIRealtimeAudioResult:
+        await self._send_text_response_request(ws, text)
+        return await self._collect_audio_to_sink(ws, on_audio_delta, timeout=timeout, first_audio_timeout=first_audio_timeout)
+
     async def _text_response_to_wav_on_ws(self, ws: Any, text: str, output_path: str | Path) -> XAIRealtimeAudioResult:
+        await self._send_text_response_request(ws, text)
+        return await self._collect_audio_to_wav(ws, output_path)
+
+    async def _send_text_response_request(self, ws: Any, text: str) -> None:
         await self._configure_session(ws)
         await ws.send(
             json.dumps(
@@ -214,7 +256,6 @@ class XAIRealtimeVoiceClient:
             )
         )
         await ws.send(json.dumps({"type": "response.create"}))
-        return await self._collect_audio_to_wav(ws, output_path)
 
     async def _audio_response_from_pcm16_on_ws(
         self,

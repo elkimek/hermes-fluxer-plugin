@@ -3,7 +3,13 @@ from __future__ import annotations
 import os
 import wave
 
-from scripts.fluxer_stt_voice_loop import build_answer_prompt, load_env_file, safe_stt_summary, write_pcm16_wav
+from scripts.fluxer_stt_voice_loop import (
+    build_answer_prompt,
+    load_env_file,
+    parse_args,
+    safe_stt_summary,
+    write_pcm16_wav,
+)
 
 
 def test_build_answer_prompt_grounds_latest_transcript_and_history():
@@ -38,6 +44,15 @@ def test_safe_stt_summary_drops_extra_provider_payload():
         "model": "medium.en",
         "error": None,
     }
+
+
+def test_parse_args_defaults_to_fast_local_stt_and_fixed_capture():
+    args = parse_args(["--channel-id", "voice-room"])
+
+    assert args.stt_model == "tiny.en"
+    assert args.capture_mode == "fixed"
+    assert args.capture_window_seconds == 3.0
+    assert args.silence_ms == 500
 
 
 def test_write_pcm16_wav_roundtrip(tmp_path):
