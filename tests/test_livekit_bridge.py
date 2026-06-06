@@ -203,6 +203,8 @@ async def test_publish_test_tone_publishes_pcm_audio_frames(monkeypatch):
     assert all(frame.sample_rate == 1000 and frame.num_channels == 1 for frame in source.frames)
     assert source.waited is True
     assert source.closed is True
+    assert room.local_participant.published[0][0].stopped is True
+    assert room.local_participant.unpublished == ["track-sid"]
 
 
 @pytest.mark.asyncio
@@ -236,6 +238,27 @@ async def test_publish_wav_file_publishes_pcm_audio_frames(monkeypatch, tmp_path
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
     assert source.waited is True
     assert source.closed is True
+    assert room.local_participant.published[0][0].stopped is True
+    assert room.local_participant.unpublished == ["track-sid"]
+
+
+@pytest.mark.asyncio
+async def test_publish_pcm16_unpublishes_track_after_playout(monkeypatch):
+    FakeAudioSource.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FakeRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+
+    await bridge.publish_pcm16(b"\x01\x00" * 40, sample_rate=1000, frame_ms=20)
+
+    source = FakeAudioSource.instances[0]
+    assert room.local_participant.published[0][0].name == "fluxer-realtime-response"
+    assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
+    assert source.waited is True
+    assert source.closed is True
+    assert room.local_participant.published[0][0].stopped is True
+    assert room.local_participant.unpublished == ["track-sid"]
 
 
 @pytest.mark.asyncio

@@ -127,7 +127,7 @@ async def test_xai_realtime_text_response_writes_pcm_wav(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_xai_realtime_force_message_does_not_send_response_create(tmp_path):
+async def test_xai_realtime_force_message_sends_response_create(tmp_path):
     ws = FakeRealtimeWebSocket([pcm_delta(b"\x00\x00"), {"type": "response.done"}])
     client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")
 
@@ -136,7 +136,7 @@ async def test_xai_realtime_force_message_does_not_send_response_create(tmp_path
     assert ws.sent[1]["type"] == "conversation.item.create"
     assert ws.sent[1]["item"]["type"] == "force_message"
     assert ws.sent[1]["item"]["content"][0] == {"type": "output_text", "text": "exact words"}
-    assert all(message.get("type") != "response.create" for message in ws.sent)
+    assert ws.sent[2] == {"type": "response.create"}
 
 
 @pytest.mark.asyncio

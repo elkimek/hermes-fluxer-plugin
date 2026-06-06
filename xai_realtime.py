@@ -401,6 +401,7 @@ class XAIRealtimeVoiceClient:
                 }
             )
         )
+        await ws.send(json.dumps({"type": "response.create"}))
 
     async def _collect_audio_to_wav(self, ws: Any, output_path: str | Path) -> XAIRealtimeAudioResult:
         pcm_parts: list[bytes] = []

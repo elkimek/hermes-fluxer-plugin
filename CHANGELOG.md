@@ -8,7 +8,7 @@ This project uses simple semantic versioning while the plugin is young:
 - minor versions for new user-visible capabilities;
 - major versions only for breaking configuration or runtime behavior.
 
-## Unreleased
+## [0.2.0] - 2026-06-06
 
 ### Added
 
@@ -42,17 +42,24 @@ This project uses simple semantic versioning while the plugin is young:
 - Added a production-safe realtime voice configuration surface: `FLUXER_VOICE_*` optional environment variables in `plugin.yaml`, plus equivalent `platforms.fluxer.extra.voice` YAML mapping through the Hermes platform adapter.
 - Added `docs/voice-configuration.md` with the full realtime voice dashboard/config reference, provider and hardware tuning notes, VAD guidance, troubleshooting, and public-repo hygiene rules.
 - Added regression coverage for the YAML-to-env bridge, plugin-managed voice supervisor lifecycle, and for keeping private dogfood IDs, local paths, and deployment context files out of the public tree.
+- Added persisted Hermes voice-session headers so live voice turns can appear in normal Hermes session history instead of only local JSONL diagnostics.
+- Added crash-recovery and live barge-in coverage for the auto-join supervisor and STT loop, including child restart, tuned barge-in argument propagation, and independent interruption while xAI/audio streaming stalls.
 
 ### Changed
 
 - Realtime voice auto-join is now disabled by default, plugin-managed after Fluxer gateway connect, stopped during adapter disconnect, and refuses to join arbitrary voice rooms unless explicitly enabled and scoped with configured channel IDs.
 - Replaced dogfood-specific voice defaults with generic assistant prompts, deployment-local context file support, safe home-relative paths, and environment-driven STT/TTS/VAD/timeout knobs.
 - Removed the tracked deployment-local voice context cache; operators should provide private context via `FLUXER_VOICE_CONTEXT_FILE` or `platforms.fluxer.extra.voice.context_file`.
+- Defaulted realtime voice to the persisted Hermes brain for consistent assistant behavior, with faster provider modes still available as explicit tuning choices.
+- Hardened LiveKit smoke playback and xAI force-message generation after review: one-shot audio tracks are now unpublished/stopped after playout, and forced text-to-speech requests explicitly trigger `response.create`.
 
 ### Verification
 
-- `python3 -m pytest -q` → 87 passed
-- `python3 -m compileall -q adapter.py livekit_bridge.py xai_realtime.py scripts tests`
+- `PYTHONPATH=. pytest -q` → 117 passed
+- `python3 -m py_compile adapter.py livekit_bridge.py xai_realtime.py scripts/*.py`
+- `git diff --check`
+- Greptile local review against `origin/main` → accepted findings fixed: one-shot LiveKit track cleanup, xAI force-message `response.create`, release version bump
+- Voice env/config audit: 44 `FLUXER_VOICE_*` variables used by code, declared in `plugin.yaml`, and documented in `docs/voice-configuration.md`
 - Private dogfood grep audit for user IDs, voice/guild IDs, local paths, context-cache filename, and assistant-specific names → 0 shippable hits
 
 ## [0.1.1] - 2026-06-05

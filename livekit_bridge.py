@@ -113,6 +113,16 @@ async def _wait_for_livekit_subscription(publication: Any, *, timeout: float = 5
         return False
 
 
+async def _stop_published_track(room: LiveKitRoomLike, publication: Any, track: Any) -> None:
+    track_sid = getattr(publication, "sid", None) or getattr(publication, "track_sid", None)
+    unpublish = getattr(room.local_participant, "unpublish_track", None)
+    if track_sid and unpublish is not None:
+        await _maybe_await(unpublish(track_sid))
+    stop = getattr(track, "stop", None)
+    if stop is not None:
+        await _maybe_await(stop())
+
+
 def _sine_pcm16_frame(
     *,
     start_sample: int,
@@ -237,13 +247,7 @@ class _LiveKitPcm16Publisher:
         publication = self._publication
         self._track = None
         self._publication = None
-        track_sid = getattr(publication, "sid", None) or getattr(publication, "track_sid", None)
-        unpublish = getattr(self._room.local_participant, "unpublish_track", None)
-        if track_sid and unpublish is not None:
-            await _maybe_await(unpublish(track_sid))
-        stop = getattr(track, "stop", None)
-        if stop is not None:
-            await _maybe_await(stop())
+        await _stop_published_track(self._room, publication, track)
 
     async def interrupt(self) -> None:
         """Stop queued bot speech immediately and discard buffered PCM."""
@@ -380,31 +384,34 @@ class FluxerLiveKitSmokeBridge:
             getattr(publication, "kind", "<unknown>"),
             getattr(publication, "muted", "<unknown>"),
         )
-        await _wait_for_livekit_subscription(publication)
+        try:
+            await _wait_for_livekit_subscription(publication)
 
-        frame_samples = max(1, sample_rate * frame_ms // 1000)
-        total_samples = max(1, int(sample_rate * duration_seconds))
-        emitted = 0
-        while emitted < total_samples:
-            samples = min(frame_samples, total_samples - emitted)
-            frame = rtc.AudioFrame(
-                _sine_pcm16_frame(
-                    start_sample=emitted,
-                    samples=samples,
-                    sample_rate=sample_rate,
-                    frequency_hz=frequency_hz,
-                    amplitude=amplitude,
-                ),
-                sample_rate,
-                1,
-                samples,
-            )
-            await _maybe_await(source.capture_frame(frame))
-            emitted += samples
-        await _wait_for_source_playout(source, label="test-tone")
-        close = getattr(source, "aclose", None)
-        if close is not None:
-            await _maybe_await(close())
+            frame_samples = max(1, sample_rate * frame_ms // 1000)
+            total_samples = max(1, int(sample_rate * duration_seconds))
+            emitted = 0
+            while emitted < total_samples:
+                samples = min(frame_samples, total_samples - emitted)
+                frame = rtc.AudioFrame(
+                    _sine_pcm16_frame(
+                        start_sample=emitted,
+                        samples=samples,
+                        sample_rate=sample_rate,
+                        frequency_hz=frequency_hz,
+                        amplitude=amplitude,
+                    ),
+                    sample_rate,
+                    1,
+                    samples,
+                )
+                await _maybe_await(source.capture_frame(frame))
+                emitted += samples
+            await _wait_for_source_playout(source, label="test-tone")
+        finally:
+            await _stop_published_track(self._room, publication, track)
+            close = getattr(source, "aclose", None)
+            if close is not None:
+                await _maybe_await(close())
 
     async def publish_wav_file(
         self,
@@ -441,20 +448,23 @@ class FluxerLiveKitSmokeBridge:
                 getattr(publication, "kind", "<unknown>"),
                 getattr(publication, "muted", "<unknown>"),
             )
-            await _wait_for_livekit_subscription(publication)
+            try:
+                await _wait_for_livekit_subscription(publication)
 
-            frame_samples = max(1, sample_rate * frame_ms // 1000)
-            while True:
-                pcm = wav.readframes(frame_samples)
-                if not pcm:
-                    break
-                samples = len(pcm) // 2
-                frame = rtc.AudioFrame(pcm, sample_rate, 1, samples)
-                await _maybe_await(source.capture_frame(frame))
-            await _wait_for_source_playout(source, label="WAV-file")
-            close = getattr(source, "aclose", None)
-            if close is not None:
-                await _maybe_await(close())
+                frame_samples = max(1, sample_rate * frame_ms // 1000)
+                while True:
+                    pcm = wav.readframes(frame_samples)
+                    if not pcm:
+                        break
+                    samples = len(pcm) // 2
+                    frame = rtc.AudioFrame(pcm, sample_rate, 1, samples)
+                    await _maybe_await(source.capture_frame(frame))
+                await _wait_for_source_playout(source, label="WAV-file")
+            finally:
+                await _stop_published_track(self._room, publication, track)
+                close = getattr(source, "aclose", None)
+                if close is not None:
+                    await _maybe_await(close())
 
     async def publish_pcm16(
         self,
@@ -488,23 +498,26 @@ class FluxerLiveKitSmokeBridge:
             getattr(publication, "kind", "<unknown>"),
             getattr(publication, "muted", "<unknown>"),
         )
-        await _wait_for_livekit_subscription(publication)
+        try:
+            await _wait_for_livekit_subscription(publication)
 
-        frame_samples = max(1, sample_rate * frame_ms // 1000)
-        frame_bytes = frame_samples * 2
-        for offset in range(0, len(pcm), frame_bytes):
-            chunk = pcm[offset : offset + frame_bytes]
-            if len(chunk) % 2:
-                chunk = chunk[:-1]
-            if not chunk:
-                continue
-            samples = len(chunk) // 2
-            frame = rtc.AudioFrame(chunk, sample_rate, 1, samples)
-            await _maybe_await(source.capture_frame(frame))
-        await _wait_for_source_playout(source, label="PCM16")
-        close = getattr(source, "aclose", None)
-        if close is not None:
-            await _maybe_await(close())
+            frame_samples = max(1, sample_rate * frame_ms // 1000)
+            frame_bytes = frame_samples * 2
+            for offset in range(0, len(pcm), frame_bytes):
+                chunk = pcm[offset : offset + frame_bytes]
+                if len(chunk) % 2:
+                    chunk = chunk[:-1]
+                if not chunk:
+                    continue
+                samples = len(chunk) // 2
+                frame = rtc.AudioFrame(chunk, sample_rate, 1, samples)
+                await _maybe_await(source.capture_frame(frame))
+            await _wait_for_source_playout(source, label="PCM16")
+        finally:
+            await _stop_published_track(self._room, publication, track)
+            close = getattr(source, "aclose", None)
+            if close is not None:
+                await _maybe_await(close())
 
     def pcm16_publisher(
         self,
