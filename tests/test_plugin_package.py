@@ -70,6 +70,11 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
         "FLUXER_VOICE_FRAME_MS",
         "FLUXER_VOICE_ENERGY_THRESHOLD",
         "FLUXER_VOICE_START_COOLDOWN_SECONDS",
+        "FLUXER_VOICE_DISABLE_BARGE_IN",
+        "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_BARGE_IN_MIN_MS",
+        "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+        "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -89,6 +94,13 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
                 "hermes_session_key": "fluxer:voice:test",
                 "vad": {"silence_ms": 850, "frame_ms": 20, "energy_threshold": 300},
                 "timeouts": {"capture_seconds": 90, "start_cooldown_seconds": 5},
+                "barge_in": {
+                    "disable": True,
+                    "energy_threshold": 700,
+                    "min_ms": 180,
+                    "capture_timeout_seconds": 2,
+                    "after_first_audio_only": False,
+                },
             }
         },
     )
@@ -108,6 +120,11 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     assert os.environ["FLUXER_VOICE_ENERGY_THRESHOLD"] == "300"
     assert os.environ["FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS"] == "90"
     assert os.environ["FLUXER_VOICE_START_COOLDOWN_SECONDS"] == "5"
+    assert os.environ["FLUXER_VOICE_DISABLE_BARGE_IN"] == "true"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD"] == "700"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_MIN_MS"] == "180"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS"] == "2"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY"] == "false"
 
 
 def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_level(monkeypatch, tmp_path):
@@ -116,6 +133,8 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
         "FLUXER_VOICE_ENERGY_THRESHOLD",
         "FLUXER_VOICE_START_COOLDOWN_SECONDS",
         "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
+        "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_BARGE_IN_MIN_MS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -129,6 +148,7 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
                 "stop_timeout_seconds": 99,
                 "vad": {"frame_ms": 20, "energy_threshold": 300},
                 "timeouts": {"start_cooldown_seconds": 5, "stop_timeout_seconds": 2},
+                "barge_in": {"energy_threshold": 400, "min_ms": 120},
             }
         },
     )
@@ -139,6 +159,8 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
     assert env["FLUXER_VOICE_ENERGY_THRESHOLD"] == "300"
     assert env["FLUXER_VOICE_START_COOLDOWN_SECONDS"] == "5"
     assert env["FLUXER_VOICE_STOP_TIMEOUT_SECONDS"] == "2"
+    assert env["FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD"] == "400"
+    assert env["FLUXER_VOICE_BARGE_IN_MIN_MS"] == "120"
 
 
 def test_fluxer_voice_yaml_config_bridge_ignores_legacy_top_level_vad_timeouts(monkeypatch):

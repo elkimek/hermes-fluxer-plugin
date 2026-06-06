@@ -493,6 +493,13 @@ class FluxerVoiceSupervisorProcess:
                 "start_cooldown_seconds": "FLUXER_VOICE_START_COOLDOWN_SECONDS",
                 "stop_timeout_seconds": "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
             },
+            "barge_in": {
+                "disable": "FLUXER_VOICE_DISABLE_BARGE_IN",
+                "energy_threshold": "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
+                "min_ms": "FLUXER_VOICE_BARGE_IN_MIN_MS",
+                "capture_timeout_seconds": "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+                "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
+            },
         }.items():
             values = voice.get(section_name)
             if isinstance(values, dict):
@@ -2716,6 +2723,18 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
     }.items():
         if key in timeouts:
             _set_env_default(env_name, timeouts.get(key))
+
+    barge_in_raw = voice.get("barge_in")
+    barge_in: dict = barge_in_raw if isinstance(barge_in_raw, dict) else {}
+    for key, env_name in {
+        "disable": "FLUXER_VOICE_DISABLE_BARGE_IN",
+        "energy_threshold": "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
+        "min_ms": "FLUXER_VOICE_BARGE_IN_MIN_MS",
+        "capture_timeout_seconds": "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+        "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
+    }.items():
+        if key in barge_in:
+            _set_env_default(env_name, barge_in.get(key))
 
     return None
 

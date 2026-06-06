@@ -51,7 +51,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Replaced dogfood-specific voice defaults with generic assistant prompts, deployment-local context file support, safe home-relative paths, and environment-driven STT/TTS/VAD/timeout knobs.
 - Removed the tracked deployment-local voice context cache; operators should provide private context via `FLUXER_VOICE_CONTEXT_FILE` or `platforms.fluxer.extra.voice.context_file`.
 - Defaulted realtime voice to the persisted Hermes brain for consistent assistant behavior, with faster provider modes still available as explicit tuning choices.
-- Hardened LiveKit smoke playback, xAI force-message generation, and the legacy xAI room loop after review: one-shot audio tracks are now unpublished/stopped after playout, forced text-to-speech requests explicitly trigger `response.create`, remote stream end exits cleanly, and final partial speech segments are preserved.
+- Hardened LiveKit smoke playback, xAI force-message generation, the legacy xAI room loop, and nested barge-in config bridging after review: one-shot audio tracks are now unpublished/stopped after playout, forced text-to-speech requests explicitly trigger `response.create`, remote stream end exits cleanly, final partial speech segments are preserved, and YAML `voice.barge_in.*` settings reach both the gateway and child supervisor.
 
 ### Verification
 
