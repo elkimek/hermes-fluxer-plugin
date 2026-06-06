@@ -844,7 +844,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     if not connected_ok:
         raise RuntimeError("Fluxer adapter did not connect to gateway")
     try:
-        await adapter.wait_until_gateway_ready(timeout=args.connect_timeout)
+        if not await adapter.wait_until_gateway_ready(timeout=args.connect_timeout):
+            raise RuntimeError("Fluxer gateway did not emit READY before timeout")
         await adapter.send_voice_state_update(args.channel_id, guild_id=args.guild_id, self_mute=True, self_deaf=False)
         await asyncio.wait_for(connected.wait(), timeout=args.connect_timeout)
         await asyncio.wait_for(finished.wait(), timeout=args.max_runtime_seconds)

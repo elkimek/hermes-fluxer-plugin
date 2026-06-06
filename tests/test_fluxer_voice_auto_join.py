@@ -81,6 +81,46 @@ async def test_auto_join_run_refuses_empty_target_users(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auto_join_run_fails_if_gateway_ready_timeout(monkeypatch):
+    events = []
+
+    class FakeAdapter:
+        def __init__(self, config):
+            pass
+
+        def set_voice_state_update_handler(self, handler):
+            events.append("handler_set")
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            events.append(("ready", timeout))
+            return False
+
+        async def disconnect(self):
+            events.append("disconnect")
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("FLUXER_VOICE_ENABLED", "true")
+    monkeypatch.setenv("FLUXER_VOICE_AUTO_JOIN", "true")
+    monkeypatch.setattr("scripts.fluxer_voice_auto_join.FluxerAdapter", FakeAdapter)
+    args = parse_args([
+        "--target-user-ids",
+        "user-1",
+        "--channel-ids",
+        "voice-1",
+        "--connect-timeout",
+        "0.01",
+    ])
+
+    with pytest.raises(RuntimeError, match="READY"):
+        await run(args)
+
+    assert events == ["handler_set", ("ready", 0.01), "disconnect"]
+
+
+@pytest.mark.asyncio
 async def test_supervisor_starts_on_target_join_and_stops_on_leave(monkeypatch):
     args = parse_args(["--target-user-ids", "user-1", "--channel-ids", "voice-1", "--guild-ids", "guild-1"])
     sup = FluxerVoiceAutoJoinSupervisor(args)

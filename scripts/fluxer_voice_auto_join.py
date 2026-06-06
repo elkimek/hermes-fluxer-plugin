@@ -224,7 +224,8 @@ async def run(args: argparse.Namespace) -> int:
     if not await adapter.connect():
         raise RuntimeError("Fluxer adapter did not connect to gateway")
     try:
-        await adapter.wait_until_gateway_ready(timeout=args.connect_timeout)
+        if not await adapter.wait_until_gateway_ready(timeout=args.connect_timeout):
+            raise RuntimeError("Fluxer gateway did not emit READY before timeout")
         logger.info(
             "auto-join supervisor armed target_users=%s channels=%s guilds=%s",
             sorted(supervisor.target_user_ids) or ["<any>"],
