@@ -129,12 +129,15 @@ class XAIRealtimeVoiceClient:
             raise ValueError("text must not be empty")
         ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
         try:
-            return await self._text_response_to_sink_on_ws(
-                ws,
-                text,
-                on_audio_delta,
+            return await asyncio.wait_for(
+                self._text_response_to_sink_on_ws(
+                    ws,
+                    text,
+                    on_audio_delta,
+                    timeout=timeout,
+                    first_audio_timeout=first_audio_timeout,
+                ),
                 timeout=timeout,
-                first_audio_timeout=first_audio_timeout,
             )
         finally:
             await ws.close()
@@ -179,12 +182,16 @@ class XAIRealtimeVoiceClient:
             raise ValueError("text must not be empty")
         ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
         try:
-            await self._send_force_message_request(ws, text, interruptible=interruptible)
-            return await self._collect_audio_to_sink(
-                ws,
-                on_audio_delta,
+            return await asyncio.wait_for(
+                self._force_message_to_sink_on_ws(
+                    ws,
+                    text,
+                    on_audio_delta,
+                    timeout=timeout,
+                    first_audio_timeout=first_audio_timeout,
+                    interruptible=interruptible,
+                ),
                 timeout=timeout,
-                first_audio_timeout=first_audio_timeout,
             )
         finally:
             await ws.close()
@@ -242,12 +249,15 @@ class XAIRealtimeVoiceClient:
             raise ValueError("pcm_audio must not be empty")
         ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
         try:
-            return await self._audio_response_from_pcm16_to_sink_on_ws(
-                ws,
-                pcm_audio,
-                on_audio_delta,
+            return await asyncio.wait_for(
+                self._audio_response_from_pcm16_to_sink_on_ws(
+                    ws,
+                    pcm_audio,
+                    on_audio_delta,
+                    timeout=timeout,
+                    first_audio_timeout=first_audio_timeout,
+                ),
                 timeout=timeout,
-                first_audio_timeout=first_audio_timeout,
             )
         finally:
             await ws.close()
@@ -336,6 +346,24 @@ class XAIRealtimeVoiceClient:
     ) -> XAIRealtimeAudioResult:
         await self._send_force_message_request(ws, text, interruptible=interruptible)
         return await self._collect_audio_to_wav(ws, output_path)
+
+    async def _force_message_to_sink_on_ws(
+        self,
+        ws: Any,
+        text: str,
+        on_audio_delta: Callable[[bytes], Awaitable[None]],
+        *,
+        timeout: float = 30.0,
+        first_audio_timeout: Optional[float] = None,
+        interruptible: bool,
+    ) -> XAIRealtimeAudioResult:
+        await self._send_force_message_request(ws, text, interruptible=interruptible)
+        return await self._collect_audio_to_sink(
+            ws,
+            on_audio_delta,
+            timeout=timeout,
+            first_audio_timeout=first_audio_timeout,
+        )
 
     async def _send_force_message_request(self, ws: Any, text: str, *, interruptible: bool) -> None:
         await self._configure_session(ws)

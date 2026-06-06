@@ -28,6 +28,18 @@ class FakeRealtimeWebSocket:
         self.closed = True
 
 
+class SlowSendRealtimeWebSocket(FakeRealtimeWebSocket):
+    def __init__(self, events, *, delay):
+        super().__init__(events)
+        self.delay = delay
+
+    async def send(self, message):
+        import asyncio
+
+        await asyncio.sleep(self.delay)
+        await super().send(message)
+
+
 class SlowRealtimeWebSocket(FakeRealtimeWebSocket):
     def __init__(self, events, *, delay):
         super().__init__(events)
@@ -55,6 +67,34 @@ class SequenceDelayRealtimeWebSocket(FakeRealtimeWebSocket):
 
 def pcm_delta(data: bytes):
     return {"type": "response.output_audio.delta", "delta": base64.b64encode(data).decode("ascii")}
+
+
+@pytest.mark.asyncio
+async def test_xai_realtime_public_sink_methods_timeout_session_setup(monkeypatch):
+    opened = []
+
+    async def fake_connect(url, *, api_key):
+        ws = SlowSendRealtimeWebSocket([], delay=0.05)
+        opened.append(ws)
+        return ws
+
+    monkeypatch.setattr(xai_realtime, "_connect_websocket", fake_connect)
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
+
+    async def sink(chunk: bytes):
+        raise AssertionError("sink should not receive audio when setup stalls")
+
+    with pytest.raises(TimeoutError):
+        await client.force_message_to_sink("hello", sink, timeout=0.001)
+    assert opened[-1].closed is True
+
+    with pytest.raises(TimeoutError):
+        await client.text_response_to_sink("hello", sink, timeout=0.001)
+    assert opened[-1].closed is True
+
+    with pytest.raises(TimeoutError):
+        await client.audio_response_from_pcm16_to_sink(b"\x01\x00", sink, timeout=0.001)
+    assert opened[-1].closed is True
 
 
 @pytest.mark.asyncio
