@@ -233,6 +233,8 @@ def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
     assert '"allow_all_users": True' not in stt_loop_source
     assert '"allow_all_users": True' not in xai_room_loop_source
     assert "await asyncio.to_thread(_post_completion)" in stt_loop_source
+    assert "stt_result = await asyncio.to_thread(" in stt_loop_source
+    assert "__globals__" not in stt_loop_source
     assert "await _maybe_await(room.disconnect())" in livekit_source
     assert "logger.exception(\n                    \"Fluxer voice server update bridge handler failed" in adapter_source
 

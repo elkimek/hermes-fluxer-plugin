@@ -44,9 +44,14 @@ from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from scripts.fluxer_xai_room_loop import _capture_one_speech_segment  # noqa: E402
 from tools.transcription_tools import (  # noqa: E402
+    ELEVENLABS_STT_BASE_URL,
+    _extract_transcript_text,
+    _load_stt_config,
     _transcribe_elevenlabs,
     _transcribe_groq,
     _transcribe_xai,
+    get_env_value,
+    is_truthy_value,
     transcribe_audio,
 )
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
@@ -499,6 +504,68 @@ async def hermes_chat_completion(transcript: str, *, history: list[dict[str, str
     return content.strip()
 
 
+def transcribe_elevenlabs_with_language(file_path: str, model_name: str, language_code: str) -> dict[str, Any]:
+    api_key = get_env_value("ELEVENLABS_API_KEY")
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
+
+    stt_config = _load_stt_config()
+    elevenlabs_config = dict(stt_config.get("elevenlabs") or {})
+    base_url = str(
+        elevenlabs_config.get("base_url")
+        or get_env_value("ELEVENLABS_STT_BASE_URL")
+        or ELEVENLABS_STT_BASE_URL
+    ).strip().rstrip("/")
+    tag_audio_events = is_truthy_value(elevenlabs_config.get("tag_audio_events", False))
+    diarize = is_truthy_value(elevenlabs_config.get("diarize", False))
+
+    try:
+        import requests
+
+        data: dict[str, str] = {
+            "model_id": model_name,
+            "tag_audio_events": "true" if tag_audio_events else "false",
+            "diarize": "true" if diarize else "false",
+            "language_code": language_code,
+        }
+        with open(file_path, "rb") as audio_file:
+            response = requests.post(
+                f"{base_url}/speech-to-text",
+                headers={"xi-api-key": api_key},
+                files={"file": (Path(file_path).name, audio_file)},
+                data=data,
+                timeout=120,
+            )
+        if response.status_code != 200:
+            detail = ""
+            try:
+                err_body = response.json()
+                error_value = err_body.get("detail") or err_body.get("error")
+                if isinstance(error_value, dict):
+                    detail = str(error_value.get("message") or error_value)
+                elif error_value:
+                    detail = str(error_value)
+                else:
+                    detail = response.text[:300]
+            except Exception:
+                detail = response.text[:300]
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"ElevenLabs STT API error (HTTP {response.status_code}): {detail}",
+            }
+        result = response.json()
+        transcript_text = _extract_transcript_text(result)
+        if not transcript_text:
+            return {"success": False, "transcript": "", "error": "ElevenLabs STT returned empty transcript"}
+        return {"success": True, "transcript": transcript_text, "provider": "elevenlabs"}
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as exc:
+        logger.error("ElevenLabs STT transcription failed: %s", exc, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"ElevenLabs STT transcription failed: {exc}"}
+
+
 def transcribe_with_provider(
     file_path: str,
     *,
@@ -522,24 +589,7 @@ def transcribe_with_provider(
         language_code = (elevenlabs_language_code or "").strip()
         if not language_code:
             return _transcribe_elevenlabs(file_path, elevenlabs_model)
-
-        # Hermes' shared ElevenLabs helper reads language_code from config.
-        # For this spike loop, allow a per-run override without mutating the
-        # user's global Hermes config.
-        original_loader = _transcribe_elevenlabs.__globals__["_load_stt_config"]
-
-        def load_with_language_override() -> dict[str, Any]:
-            cfg = dict(original_loader() or {})
-            elevenlabs_cfg = dict(cfg.get("elevenlabs") or {})
-            elevenlabs_cfg["language_code"] = language_code
-            cfg["elevenlabs"] = elevenlabs_cfg
-            return cfg
-
-        _transcribe_elevenlabs.__globals__["_load_stt_config"] = load_with_language_override
-        try:
-            return _transcribe_elevenlabs(file_path, elevenlabs_model)
-        finally:
-            _transcribe_elevenlabs.__globals__["_load_stt_config"] = original_loader
+        return transcribe_elevenlabs_with_language(file_path, elevenlabs_model, language_code)
     raise ValueError(f"Unsupported STT provider: {provider}")
 
 
@@ -647,7 +697,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 wav_path = Path(tempfile.gettempdir()) / f"fluxer_stt_loop_input_{turn_no}.wav"
                 write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
                 stt_started = time.monotonic()
-                stt_result = transcribe_with_provider(
+                stt_result = await asyncio.to_thread(
+                    transcribe_with_provider,
                     str(wav_path),
                     provider=args.stt_provider,
                     model=args.stt_model,

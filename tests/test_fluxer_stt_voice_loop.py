@@ -304,12 +304,15 @@ def test_transcribe_with_provider_uses_elevenlabs_default_for_local_model_name(m
 def test_transcribe_with_provider_overrides_elevenlabs_language_without_global_config(monkeypatch, tmp_path):
     seen = {}
 
-    def fake_elevenlabs(file_path, model):
-        seen["config"] = fake_elevenlabs.__globals__["_load_stt_config"]()
+    def fake_language_call(file_path, model, language_code):
+        seen["file_path"] = file_path
+        seen["model"] = model
+        seen["language_code"] = language_code
         return {"success": True, "transcript": "ok", "provider": "elevenlabs"}
 
-    fake_elevenlabs.__globals__["_load_stt_config"] = lambda: {"elevenlabs": {"language_code": ""}}
-    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._transcribe_elevenlabs", fake_elevenlabs)
+    original_loader = object()
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._load_stt_config", original_loader)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.transcribe_elevenlabs_with_language", fake_language_call)
 
     result = transcribe_with_provider(
         str(tmp_path / "voice.wav"),
@@ -319,8 +322,11 @@ def test_transcribe_with_provider_overrides_elevenlabs_language_without_global_c
     )
 
     assert result["provider"] == "elevenlabs"
-    assert seen["config"]["elevenlabs"]["language_code"] == "eng"
-    assert fake_elevenlabs.__globals__["_load_stt_config"]() == {"elevenlabs": {"language_code": ""}}
+    assert seen["model"] == "scribe_v2"
+    assert seen["language_code"] == "eng"
+    from scripts import fluxer_stt_voice_loop
+
+    assert fluxer_stt_voice_loop._load_stt_config is original_loader
 
 
 def test_write_pcm16_wav_roundtrip(tmp_path):
