@@ -10,6 +10,7 @@ from scripts.fluxer_stt_voice_loop import (
     compose_system_prompt,
     load_env_file,
     load_voice_context_cache,
+    looks_like_clipped_non_english_noise,
     normalize_voice_transcript,
     parse_args,
     safe_stt_summary,
@@ -34,6 +35,7 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
     assert "xAI Eve TTS" in prompt
     assert "Fluxer implementation" in prompt
     assert "Speak English by default" in prompt
+    assert "under 8 words" in prompt
     assert "Do not switch to Czech" in prompt
     assert "No filler greetings" in prompt
 
@@ -85,6 +87,12 @@ def test_build_hermes_messages_does_not_treat_memory_context_as_user_speech():
     assert messages[-1] == {"role": "user", "content": "Improve it"}
 
 
+def test_looks_like_clipped_non_english_noise_rejects_short_vad_hallucinations():
+    assert looks_like_clipped_non_english_noise("Je to pračka nebo úplně?")
+    assert looks_like_clipped_non_english_noise("E aí")
+    assert not looks_like_clipped_non_english_noise("Yeah, I want to get Fluxer talking to you")
+
+
 def test_append_jsonl_writes_one_turn_per_line(tmp_path):
     path = tmp_path / "turns.jsonl"
 
@@ -123,12 +131,16 @@ def test_parse_args_defaults_to_realtime_voice_stack():
 
     assert args.stt_provider == "elevenlabs"
     assert args.stt_model == "medium.en"
+    assert args.elevenlabs_language_code == "eng"
     assert args.capture_mode == "vad"
     assert args.capture_window_seconds == 3.0
     assert args.brain_provider == "xai-fast"
     assert args.hermes_url == "http://127.0.0.1:8642"
     assert args.voice_context_file.endswith("VOICE_CONTEXT_CACHE.md")
-    assert args.silence_ms == 500
+    assert args.energy_threshold == 300
+    assert args.silence_ms == 1500
+    assert args.min_segment_ms == 1600
+    assert args.max_segment_seconds == 12.0
 
 
 def test_transcribe_with_provider_uses_groq_default_for_local_model_name(monkeypatch, tmp_path):
@@ -159,6 +171,28 @@ def test_transcribe_with_provider_uses_elevenlabs_default_for_local_model_name(m
 
     assert result["provider"] == "elevenlabs"
     assert seen["model"] == "scribe_v2"
+
+
+def test_transcribe_with_provider_overrides_elevenlabs_language_without_global_config(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_elevenlabs(file_path, model):
+        seen["config"] = fake_elevenlabs.__globals__["_load_stt_config"]()
+        return {"success": True, "transcript": "ok", "provider": "elevenlabs"}
+
+    fake_elevenlabs.__globals__["_load_stt_config"] = lambda: {"elevenlabs": {"language_code": ""}}
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._transcribe_elevenlabs", fake_elevenlabs)
+
+    result = transcribe_with_provider(
+        str(tmp_path / "voice.wav"),
+        provider="elevenlabs",
+        model="scribe_v2",
+        elevenlabs_language_code="eng",
+    )
+
+    assert result["provider"] == "elevenlabs"
+    assert seen["config"]["elevenlabs"]["language_code"] == "eng"
+    assert fake_elevenlabs.__globals__["_load_stt_config"]() == {"elevenlabs": {"language_code": ""}}
 
 
 def test_write_pcm16_wav_roundtrip(tmp_path):

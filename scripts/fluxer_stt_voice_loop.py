@@ -52,7 +52,7 @@ from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 logger = logging.getLogger("fluxer_stt_voice_loop")
 
 DEFAULT_TEXT_SYSTEM = """You are Žofka, not a generic xAI assistant. You are in a live Fluxer voice chat with Elkim.
-Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and very brief for realtime voice. Default to one short spoken sentence under 12 words unless Elkim explicitly asks for detail.
+Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and very brief for realtime voice. Default to one short spoken sentence under 8 words unless Elkim explicitly asks for detail. Call him Elkim in voice, not Michal, unless he asks otherwise.
 
 Current implementation context you know:
 - We are dogfooding Fluxer realtime voice in the spike worktree /home/elkim/.hermes/plugins/fluxer-realtime-spike on branch feat/realtime-voice-livekit-spike.
@@ -64,7 +64,8 @@ Current implementation context you know:
 - If Elkim asks about Fluxer implementation, realtime voice, LiveKit capture, STT providers, xAI TTS, ElevenLabs, barge-in, latency, or today's debugging, answer from this context instead of pretending not to know.
 
 Conversation rules:
-- Answer the transcript directly and briefly: one short spoken sentence by default, under 12 words when possible.
+- Answer the transcript directly and briefly: one short spoken sentence by default, under 8 words when possible.
+- Avoid generic follow-up questions unless needed to continue the task.
 - No filler greetings unless Elkim greeted you.
 - If STT writes Shevka, Shovka, Jefka, Zofka, Jovka, Żabka, or Jessica, treat it as Žofka.
 - Correct obvious ASR homophones when context is clear, e.g. "past", "plast", or "plastic" can mean "plus" in arithmetic.
@@ -100,6 +101,20 @@ def write_pcm16_wav(path: Path, pcm: bytes, *, sample_rate: int) -> Path:
 
 _MEMORY_CONTEXT_RE = re.compile(r"<memory-context>.*?</memory-context>", re.IGNORECASE | re.DOTALL)
 _SYSTEM_NOTE_RE = re.compile(r"\[System note:.*?\]", re.IGNORECASE | re.DOTALL)
+_NON_ENGLISH_DIACRITIC_RE = re.compile(r"[ÁČĎÉĚÍŇÓŘŠŤÚŮÝŽáčďéěíňóřšťúůýžÃÁÀÂÉÊÍÓÔÕÚÇãáàâéêíóôõúç]")
+
+
+def looks_like_clipped_non_english_noise(transcript: str) -> bool:
+    """Reject tiny VAD fragments that STT hallucinates as non-English speech."""
+
+    text = " ".join((transcript or "").split()).strip()
+    if not text:
+        return False
+    words = text.split()
+    if len(words) <= 6 and _NON_ENGLISH_DIACRITIC_RE.search(text):
+        return True
+    lower = text.lower().strip(" .!?…")
+    return lower in {"e aí", "je to", "je to pračka", "ahoj", "dobře"}
 
 
 def normalize_voice_transcript(transcript: str) -> str:
@@ -204,7 +219,13 @@ def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], ar
     return content.strip()
 
 
-def transcribe_with_provider(file_path: str, *, provider: str, model: str | None) -> dict[str, Any]:
+def transcribe_with_provider(
+    file_path: str,
+    *,
+    provider: str,
+    model: str | None,
+    elevenlabs_language_code: str | None = None,
+) -> dict[str, Any]:
     """Transcribe with an explicit provider for this spike loop."""
 
     if provider == "auto":
@@ -218,7 +239,27 @@ def transcribe_with_provider(file_path: str, *, provider: str, model: str | None
         return _transcribe_xai(file_path, model or "grok-stt")
     if provider == "elevenlabs":
         elevenlabs_model = model if model and model not in {"tiny.en", "base.en", "small.en", "medium.en"} else "scribe_v2"
-        return _transcribe_elevenlabs(file_path, elevenlabs_model)
+        language_code = (elevenlabs_language_code or "").strip()
+        if not language_code:
+            return _transcribe_elevenlabs(file_path, elevenlabs_model)
+
+        # Hermes' shared ElevenLabs helper reads language_code from config.
+        # For this spike loop, allow a per-run override without mutating the
+        # user's global Hermes config.
+        original_loader = _transcribe_elevenlabs.__globals__["_load_stt_config"]
+
+        def load_with_language_override() -> dict[str, Any]:
+            cfg = dict(original_loader() or {})
+            elevenlabs_cfg = dict(cfg.get("elevenlabs") or {})
+            elevenlabs_cfg["language_code"] = language_code
+            cfg["elevenlabs"] = elevenlabs_cfg
+            return cfg
+
+        _transcribe_elevenlabs.__globals__["_load_stt_config"] = load_with_language_override
+        try:
+            return _transcribe_elevenlabs(file_path, elevenlabs_model)
+        finally:
+            _transcribe_elevenlabs.__globals__["_load_stt_config"] = original_loader
     raise ValueError(f"Unsupported STT provider: {provider}")
 
 
@@ -315,6 +356,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     str(wav_path),
                     provider=args.stt_provider,
                     model=args.stt_model,
+                    elevenlabs_language_code=args.elevenlabs_language_code,
                 )
                 stt_seconds = time.monotonic() - stt_started
                 transcript = normalize_voice_transcript((stt_result.get("transcript") or "").strip())
@@ -337,6 +379,14 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         break
                     continue
 
+                if looks_like_clipped_non_english_noise(transcript):
+                    result["ignored_turn_count"] += 1
+                    turn["published"] = False
+                    turn["reason"] = "clipped_non_english_noise"
+                    result["turns"].append(turn)
+                    append_jsonl(args.turn_log_jsonl, turn)
+                    continue
+
                 brain_started = time.monotonic()
                 if args.brain_provider == "hermes":
                     reply_text = hermes_chat_completion(transcript, history=history, args=args)
@@ -349,7 +399,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 voice = XAIRealtimeVoiceClient(
                     sample_rate=args.sample_rate,
                     voice=args.voice,
-                    instructions="Speak Žofka's answer naturally, briefly, and without extra preamble.",
+                    instructions="Speak Žofka's answer naturally, briefly, and without extra preamble. One short sentence, under 8 words when possible.",
                 )
                 xai_started = time.monotonic()
                 first_audio_seconds: float | None = None
@@ -446,11 +496,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--initial-settle-seconds", type=float, default=0.8)
     parser.add_argument("--sample-rate", type=int, default=24_000)
     parser.add_argument("--frame-ms", type=int, default=20)
-    parser.add_argument("--energy-threshold", type=int, default=550)
-    parser.add_argument("--silence-ms", type=int, default=500)
-    parser.add_argument("--end-padding-ms", type=int, default=120)
-    parser.add_argument("--min-segment-ms", type=int, default=500)
-    parser.add_argument("--max-segment-seconds", type=float, default=6.0)
+    parser.add_argument("--energy-threshold", type=int, default=300)
+    parser.add_argument("--silence-ms", type=int, default=1500)
+    parser.add_argument("--end-padding-ms", type=int, default=300)
+    parser.add_argument("--min-segment-ms", type=int, default=1600)
+    parser.add_argument("--max-segment-seconds", type=float, default=12.0)
     parser.add_argument("--voice", default="eve")
     parser.add_argument("--brain-provider", choices=("xai-fast", "xai", "hermes"), default="xai-fast")
     parser.add_argument("--hermes-url", default="http://127.0.0.1:8642")
@@ -460,6 +510,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hermes-temperature", type=float, default=0.4)
     parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="elevenlabs")
     parser.add_argument("--stt-model", default="medium.en", help="STT model; ElevenLabs default scribe_v2, local default medium.en for accuracy, Groq default whisper-large-v3-turbo")
+    parser.add_argument(
+        "--elevenlabs-language-code",
+        default="eng",
+        help="Per-run ElevenLabs Scribe language_code override; use empty string for autodetect",
+    )
     parser.add_argument("--xai-timeout", type=float, default=45.0)
     parser.add_argument("--xai-first-audio-timeout", type=float, default=12.0)
     parser.add_argument("--connect-timeout", type=float, default=30.0)
