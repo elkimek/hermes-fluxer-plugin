@@ -623,7 +623,7 @@ class FluxerLiveKitSmokeBridge:
             raise ValueError("duration_seconds must be positive")
         target_bytes = int(sample_rate * duration_seconds) * 2
         collected = bytearray()
-        async with asyncio.timeout(timeout):
+        async def _collect() -> bytes:
             async for chunk in self.iter_remote_audio_pcm16(
                 sample_rate=sample_rate,
                 frame_size_ms=frame_size_ms,
@@ -633,7 +633,9 @@ class FluxerLiveKitSmokeBridge:
                 collected.extend(chunk)
                 if len(collected) >= target_bytes:
                     return bytes(collected[:target_bytes])
-        return bytes(collected)
+            return bytes(collected)
+
+        return await asyncio.wait_for(_collect(), timeout=timeout)
 
     async def disconnect(self) -> None:
         room = self._room

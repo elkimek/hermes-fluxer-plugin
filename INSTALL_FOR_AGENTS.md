@@ -9,7 +9,7 @@ Ask the user for any missing values:
 - Fluxer bot token: `FLUXER_BOT_TOKEN` in `<applicationId>.<secret>` form.
 - Allowed Fluxer user ID(s): `FLUXER_ALLOWED_USERS`.
 - Optional default channel/DM ID: `FLUXER_HOME_CHANNEL`.
-- Optional realtime voice auto-join: `FLUXER_VOICE_ENABLED`, `FLUXER_VOICE_AUTO_JOIN`, `FLUXER_VOICE_TARGET_USER_IDS`, and `FLUXER_VOICE_CHANNEL_IDS`.
+- Optional realtime voice auto-join: `FLUXER_VOICE_ENABLED`, `FLUXER_VOICE_AUTO_JOIN`, `FLUXER_VOICE_TARGET_USER_IDS`, and `FLUXER_VOICE_CHANNEL_IDS`. Internal guard `FLUXER_VOICE_SUPERVISOR_DISABLED` is for child scripts only; leave it empty/false in normal user config.
 - For self-hosted Fluxer only: `FLUXER_BASE_URL` and optionally `FLUXER_GATEWAY_URL`.
 
 Do not guess these values. Do not print the token.
@@ -74,7 +74,7 @@ FLUXER_VOICE_TARGET_USER_IDS=your_fluxer_user_id
 FLUXER_VOICE_CHANNEL_IDS=your_voice_channel_id
 ```
 
-Equivalent YAML can be placed under `platforms.fluxer.extra.voice` / `fluxer.voice` depending on the user's config shape; see `README.md` for the complete voice matrix. Keep deployment-local assistant context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed.
+Equivalent YAML can be placed under `platforms.fluxer.extra.voice` / `fluxer.voice` depending on the user's config shape; see `README.md` for the complete voice matrix. Auto-join must have both target user IDs and channel IDs; empty target users intentionally means it will not watch anyone. Keep deployment-local assistant context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed. `FLUXER_VOICE_SUPERVISOR_DISABLED` is an internal child-process recursion guard and should not be used as a normal setup toggle.
 
 ## Restart
 

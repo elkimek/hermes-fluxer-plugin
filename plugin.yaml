@@ -129,6 +129,10 @@ optional_env:
     description: "Automatically join configured voice rooms when a target user joins (true/false)"
     prompt: "Auto-join voice rooms?"
     password: false
+  - name: FLUXER_VOICE_SUPERVISOR_DISABLED
+    description: "Internal recursion guard for child voice scripts; leave empty/false in normal plugin configuration"
+    prompt: "Disable voice supervisor lifecycle guard?"
+    password: false
   - name: FLUXER_VOICE_TARGET_USER_IDS
     description: "Comma-separated Fluxer user IDs whose LiveKit audio may be captured; empty means no targeted capture"
     prompt: "Realtime voice target user IDs"

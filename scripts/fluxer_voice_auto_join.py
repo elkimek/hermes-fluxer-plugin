@@ -77,7 +77,7 @@ class FluxerVoiceAutoJoinSupervisor:
         self.last_start_monotonic = 0.0
 
     def should_watch_user(self, user_id: str) -> bool:
-        return bool(user_id and (not self.target_user_ids or user_id in self.target_user_ids))
+        return bool(user_id and user_id in self.target_user_ids)
 
     def should_join_channel(self, *, guild_id: str | None, channel_id: str | None) -> bool:
         if not channel_id:
@@ -133,8 +133,13 @@ class FluxerVoiceAutoJoinSupervisor:
 
     async def start_voice_loop(self, *, guild_id: str | None, channel_id: str) -> None:
         if self.process and self.process.returncode is None:
-            logger.info("voice loop already running for channel=%s", self.active_channel_id)
-            return
+            if channel_id == self.active_channel_id and (guild_id or "") == (self.active_guild_id or ""):
+                logger.info("voice loop already running for channel=%s", self.active_channel_id)
+                return
+            await self.stop_voice_loop(
+                f"target user moved from guild={self.active_guild_id or '<none>'} channel={self.active_channel_id} "
+                f"to guild={guild_id or '<none>'} channel={channel_id}"
+            )
         now = asyncio.get_running_loop().time()
         if now - self.last_start_monotonic < self.args.start_cooldown_seconds:
             logger.info("voice loop start suppressed by cooldown")
@@ -190,11 +195,23 @@ async def run(args: argparse.Namespace) -> int:
     if not args.channel_ids:
         logger.info("Fluxer realtime voice auto-join has no configured channel IDs; refusing to join arbitrary voice rooms")
         return 0
+    if not args.target_user_ids:
+        logger.info("Fluxer realtime voice auto-join has no target user IDs; refusing to watch arbitrary users")
+        return 0
     bot_token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
     if not bot_token:
         raise RuntimeError("FLUXER_BOT_TOKEN is required")
     supervisor = FluxerVoiceAutoJoinSupervisor(args)
-    adapter = FluxerAdapter(PlatformConfig(enabled=True, extra={"bot_token": bot_token, "allow_all_users": True}))
+    adapter = FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": bot_token,
+                "allow_all_users": env_truthy("FLUXER_ALLOW_ALL_USERS"),
+                "voice": {"supervisor_disabled": True},
+            },
+        )
+    )
     adapter.set_voice_state_update_handler(supervisor.handle_voice_state_update)
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -216,6 +233,13 @@ async def run(args: argparse.Namespace) -> int:
         await supervisor.stop_voice_loop("supervisor shutting down")
         await adapter.disconnect()
     return 0
+
+
+def _preload_env_file(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--env-file", default=os.getenv("HERMES_ENV_FILE", str(Path.home() / ".hermes" / ".env")))
+    args, _ = parser.parse_known_args(argv)
+    load_env_file(Path(args.env_file).expanduser())
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -247,6 +271,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _preload_env_file(argv)
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     for noisy_secret_logger in ("websockets", "websockets.client", "httpcore", "httpx", "urllib3"):

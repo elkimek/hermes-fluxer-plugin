@@ -238,7 +238,16 @@ def test_safe_stt_summary_drops_extra_provider_payload():
     }
 
 
-def test_parse_args_defaults_to_realtime_voice_stack():
+def test_parse_args_defaults_to_realtime_voice_stack(monkeypatch):
+    for key in (
+        "FLUXER_VOICE_SILENCE_MS",
+        "FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS",
+        "FLUXER_VOICE_INITIAL_SETTLE_SECONDS",
+        "FLUXER_VOICE_SAMPLE_RATE",
+        "FLUXER_VOICE_FRAME_MS",
+        "FLUXER_VOICE_ENERGY_THRESHOLD",
+    ):
+        monkeypatch.delenv(key, raising=False)
     args = parse_args(["--channel-id", "voice-room"])
 
     assert args.stt_provider == "elevenlabs"

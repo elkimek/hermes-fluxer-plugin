@@ -350,6 +350,7 @@ Optional tuning:
 # Scope / routing
 FLUXER_VOICE_GUILD_IDS=your_guild_id
 FLUXER_VOICE_PARTICIPANT_PREFIX=user_<id>_
+FLUXER_VOICE_SUPERVISOR_DISABLED=false  # internal child-process recursion guard; normally leave false/empty
 FLUXER_VOICE_BRAIN_PROVIDER=auto        # auto | xai-fast | xai | hermes
 
 # STT / TTS

@@ -54,7 +54,7 @@ FLUXER_VOICE_TARGET_USER_IDS=your_fluxer_user_id
 FLUXER_VOICE_CHANNEL_IDS=your_voice_channel_id
 ```
 
-Or configure the equivalent `fluxer.voice` block in `~/.hermes/config.yaml`. Keep any deployment-local assistant/personality context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed.
+Or configure the equivalent `fluxer.voice` block in `~/.hermes/config.yaml`. Auto-join refuses to arm unless both `FLUXER_VOICE_TARGET_USER_IDS` and `FLUXER_VOICE_CHANNEL_IDS` are set, so an enabled plugin cannot silently listen to arbitrary users. Keep any deployment-local assistant/personality context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed. `FLUXER_VOICE_SUPERVISOR_DISABLED` is an internal child-process recursion guard and should normally be left empty/false.
 
 ## 6. Restart and test
 

@@ -73,6 +73,10 @@ Conversation rules:
 """.strip()
 
 
+def env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def load_env_file(path: Path) -> None:
     """Load simple KEY=value lines without shell-sourcing secrets."""
 
@@ -552,7 +556,14 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     args.voice_system_prompt = compose_system_prompt(voice_context_cache=voice_context_cache)
 
     adapter = FluxerAdapter(
-        PlatformConfig(enabled=True, extra={"bot_token": bot_token, "allow_all_users": True})
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": bot_token,
+                "allow_all_users": env_truthy("FLUXER_ALLOW_ALL_USERS"),
+                "voice": {"supervisor_disabled": True},
+            },
+        )
     )
     bridge = FluxerLiveKitSmokeBridge(auto_subscribe=True)
     connected = asyncio.Event()
@@ -765,7 +776,9 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, request_shutdown_from_signal)
 
-    await adapter.connect()
+    connected_ok = await adapter.connect()
+    if not connected_ok:
+        raise RuntimeError("Fluxer adapter did not connect to gateway")
     try:
         await adapter.wait_until_gateway_ready(timeout=args.connect_timeout)
         await adapter.send_voice_state_update(args.channel_id, guild_id=args.guild_id, self_mute=True, self_deaf=False)
@@ -783,6 +796,13 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             if old_handler not in (None, signal.SIG_DFL):
                 signal.signal(sig, old_handler)
     return result
+
+
+def _preload_env_file(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--env-file", default=os.getenv("HERMES_ENV_FILE", str(Path.home() / ".hermes" / ".env")))
+    args, _ = parser.parse_known_args(argv)
+    load_env_file(Path(args.env_file).expanduser())
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -846,6 +866,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _preload_env_file(argv)
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     # Avoid leaking Authorization/Cookie headers from websocket/http debug logs.

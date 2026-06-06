@@ -17,6 +17,7 @@ import logging
 import mimetypes
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -415,11 +416,20 @@ class FluxerVoiceSupervisorProcess:
         return _voice_bool_setting(self.extra, "auto_join", "FLUXER_VOICE_AUTO_JOIN", False)
 
     @property
+    def supervisor_disabled(self) -> bool:
+        return _voice_bool_setting(
+            self.extra,
+            "supervisor_disabled",
+            "FLUXER_VOICE_SUPERVISOR_DISABLED",
+            False,
+        )
+
+    @property
     def configured_channel_ids(self) -> str:
         return _voice_csv_setting(self.extra, "channel_ids", "FLUXER_VOICE_CHANNEL_IDS")
 
     def should_start(self) -> bool:
-        return self.enabled and self.auto_join and bool(self.configured_channel_ids)
+        return not self.supervisor_disabled and self.enabled and self.auto_join and bool(self.configured_channel_ids)
 
     def build_command(self) -> list[str]:
         python = os.getenv("FLUXER_VOICE_PYTHON", sys.executable)
@@ -427,6 +437,12 @@ class FluxerVoiceSupervisorProcess:
 
     def _child_env(self) -> Dict[str, str]:
         env = os.environ.copy()
+        # Child scripts create their own FluxerAdapter instances to listen for
+        # voice gateway events / perform the LiveKit handshake. Those internal
+        # adapters must not start another plugin-managed supervisor from their
+        # own connect() call, while the scripts still need ENABLED/AUTO_JOIN to
+        # pass their explicit run gates.
+        env["FLUXER_VOICE_SUPERVISOR_DISABLED"] = "true"
         voice = _voice_config_dict(self.extra)
         mappings = {
             "enabled": "FLUXER_VOICE_ENABLED",
@@ -492,7 +508,8 @@ class FluxerVoiceSupervisorProcess:
             return True
         if not self.should_start():
             logger.info(
-                "Fluxer realtime voice supervisor disabled or not scoped; enabled=%s auto_join=%s channels_configured=%s",
+                "Fluxer realtime voice supervisor disabled or not scoped; disabled=%s enabled=%s auto_join=%s channels_configured=%s",
+                self.supervisor_disabled,
                 self.enabled,
                 self.auto_join,
                 bool(self.configured_channel_ids),
@@ -516,13 +533,33 @@ class FluxerVoiceSupervisorProcess:
         self.process = None
         if proc is None or proc.poll() is not None:
             return
-        proc.terminate()
+        self._terminate_process(proc)
         try:
             await asyncio.to_thread(proc.wait, 8)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            self._kill_process(proc)
             await asyncio.to_thread(proc.wait, 5)
         logger.info("Fluxer realtime voice supervisor stopped")
+
+    def _terminate_process(self, proc: subprocess.Popen) -> None:
+        self._signal_process_group(proc, getattr(signal, "SIGTERM", 15), fallback=proc.terminate)
+
+    def _kill_process(self, proc: subprocess.Popen) -> None:
+        self._signal_process_group(proc, getattr(signal, "SIGKILL", 9), fallback=proc.kill)
+
+    @staticmethod
+    def _signal_process_group(proc: subprocess.Popen, sig: int, *, fallback: Callable[[], None]) -> None:
+        pid = getattr(proc, "pid", None)
+        if os.name == "posix" and isinstance(pid, int) and pid > 0:
+            try:
+                os.killpg(os.getpgid(pid), sig)
+                return
+            except ProcessLookupError:
+                fallback()
+                return
+            except Exception:
+                pass
+        fallback()
 
 
 
@@ -2332,7 +2369,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 if asyncio.iscoroutine(result):
                     await result
             except Exception:
-                logger.error(
+                logger.exception(
                     "Fluxer voice server update bridge handler failed channel=%s guild=%s connection=%s",
                     safe_update.get("channel_id") or "<none>",
                     safe_update.get("guild_id") or "<dm>",

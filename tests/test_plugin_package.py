@@ -182,9 +182,25 @@ def test_voice_supervisor_spawns_when_enabled_scoped_and_auto_join(tmp_path, mon
     assert kwargs["cwd"] == str(root)
     assert kwargs["env"]["FLUXER_VOICE_ENABLED"] == "true"
     assert kwargs["env"]["FLUXER_VOICE_AUTO_JOIN"] == "true"
+    assert kwargs["env"]["FLUXER_VOICE_SUPERVISOR_DISABLED"] == "true"
     assert kwargs["env"]["FLUXER_VOICE_CHANNEL_IDS"] == "voice-1"
     assert kwargs["env"]["FLUXER_VOICE_TARGET_USER_IDS"] == "user-1"
     assert kwargs["env"]["FLUXER_VOICE_SILENCE_MS"] == "850"
+
+
+def test_voice_supervisor_internal_disable_guard_prevents_recursive_spawn(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLUXER_VOICE_ENABLED", "true")
+    monkeypatch.setenv("FLUXER_VOICE_AUTO_JOIN", "true")
+    monkeypatch.setenv("FLUXER_VOICE_CHANNEL_IDS", "voice-1")
+    monkeypatch.setenv("FLUXER_VOICE_SUPERVISOR_DISABLED", "true")
+    calls = []
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(extra={}, plugin_root=root, popen_factory=lambda *a, **kw: calls.append((a, kw)))
+
+    assert supervisor.start() is False
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -203,6 +219,18 @@ async def test_voice_supervisor_stop_terminates_child(tmp_path, monkeypatch):
 
     assert fake_proc.terminated is True
     assert fake_proc.wait_calls == [8]
+
+
+def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
+    livekit_source = (ROOT / "livekit_bridge.py").read_text(encoding="utf-8")
+    auto_join_source = (ROOT / "scripts" / "fluxer_voice_auto_join.py").read_text(encoding="utf-8")
+    stt_loop_source = (ROOT / "scripts" / "fluxer_stt_voice_loop.py").read_text(encoding="utf-8")
+    adapter_source = (ROOT / "adapter.py").read_text(encoding="utf-8")
+
+    assert "asyncio.timeout" not in livekit_source
+    assert '"allow_all_users": True' not in auto_join_source
+    assert '"allow_all_users": True' not in stt_loop_source
+    assert "logger.exception(\n                    \"Fluxer voice server update bridge handler failed" in adapter_source
 
 
 def test_public_tree_contains_no_private_voice_dogfood_defaults():
