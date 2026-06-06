@@ -141,6 +141,7 @@ async def test_supervisor_starts_on_target_join_and_stops_on_leave(monkeypatch):
     await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": None})
 
     assert events == [
+        ("stop", "target user user-1 moved to unconfigured voice channel voice-1"),
         ("start", "guild-1", "voice-1"),
         ("stop", "target user user-1 left voice"),
     ]
@@ -183,6 +184,86 @@ async def test_supervisor_restarts_when_target_moves_channels(monkeypatch):
     await sup.start_voice_loop(guild_id="guild-1", channel_id="voice-2")
 
     assert events == [("spawn", "voice-1"), ("terminate", "voice-1"), ("spawn", "voice-2")]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_restarts_crashed_loop_while_target_remains(monkeypatch):
+    args = parse_args(
+        [
+            "--target-user-ids",
+            "user-1",
+            "--channel-ids",
+            "voice-1",
+            "--guild-ids",
+            "guild-1",
+            "--start-cooldown-seconds",
+            "0",
+        ]
+    )
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    events = []
+
+    class CrashedProcess:
+        returncode = 1
+
+        async def wait(self):
+            return 1
+
+    async def fake_start(*, guild_id, channel_id):
+        events.append(("restart", guild_id, channel_id))
+
+    proc = CrashedProcess()
+    sup.process = proc  # type: ignore[assignment]
+    sup.active_guild_id = "guild-1"
+    sup.active_channel_id = "voice-1"
+    sup.desired_guild_id = "guild-1"
+    sup.desired_channel_id = "voice-1"
+    monkeypatch.setattr(sup, "start_voice_loop", fake_start)
+
+    await sup._watch_process(proc)  # type: ignore[arg-type]
+
+    assert sup.process is None
+    assert events == [("restart", "guild-1", "voice-1")]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_restart_after_target_left(monkeypatch):
+    args = parse_args(
+        [
+            "--target-user-ids",
+            "user-1",
+            "--channel-ids",
+            "voice-1",
+            "--guild-ids",
+            "guild-1",
+            "--start-cooldown-seconds",
+            "0",
+        ]
+    )
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    events = []
+
+    class StoppedProcess:
+        returncode = -15
+
+        async def wait(self):
+            return -15
+
+    async def fake_start(*, guild_id, channel_id):
+        events.append(("restart", guild_id, channel_id))
+
+    proc = StoppedProcess()
+    sup.process = proc  # type: ignore[assignment]
+    sup.active_guild_id = "guild-1"
+    sup.active_channel_id = "voice-1"
+    sup.desired_guild_id = None
+    sup.desired_channel_id = None
+    monkeypatch.setattr(sup, "start_voice_loop", fake_start)
+
+    await sup._watch_process(proc)  # type: ignore[arg-type]
+
+    assert sup.process is None
+    assert events == []
 
 
 @pytest.mark.asyncio

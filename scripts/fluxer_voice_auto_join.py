@@ -74,6 +74,8 @@ class FluxerVoiceAutoJoinSupervisor:
         self.process: asyncio.subprocess.Process | None = None
         self.active_channel_id: str | None = None
         self.active_guild_id: str | None = None
+        self.desired_channel_id: str | None = None
+        self.desired_guild_id: str | None = None
         self.last_start_monotonic = 0.0
 
     def should_watch_user(self, user_id: str) -> bool:
@@ -175,6 +177,25 @@ class FluxerVoiceAutoJoinSupervisor:
             self.process = None
             self.active_channel_id = None
             self.active_guild_id = None
+            desired_channel_id = self.desired_channel_id
+            desired_guild_id = self.desired_guild_id
+            if desired_channel_id and self.should_join_channel(guild_id=desired_guild_id, channel_id=desired_channel_id):
+                await self._restart_desired_loop_after_exit(code=code, guild_id=desired_guild_id, channel_id=desired_channel_id)
+
+    async def _restart_desired_loop_after_exit(self, *, code: int | None, guild_id: str | None, channel_id: str) -> None:
+        now = asyncio.get_running_loop().time()
+        remaining = max(0.0, self.args.start_cooldown_seconds - (now - self.last_start_monotonic))
+        if remaining:
+            logger.info("voice loop exited code=%s; restarting in %.1fs while target remains in channel=%s", code, remaining, channel_id)
+            await asyncio.sleep(remaining)
+        if self.desired_channel_id != channel_id or (self.desired_guild_id or "") != (guild_id or ""):
+            logger.info("voice loop restart skipped; desired target moved or left")
+            return
+        if self.process and self.process.returncode is None:
+            logger.info("voice loop restart skipped; process already running")
+            return
+        logger.info("restarting voice loop after exit while target remains in guild=%s channel=%s", guild_id or "<none>", channel_id)
+        await self.start_voice_loop(guild_id=guild_id, channel_id=channel_id)
 
     async def handle_voice_state_update(self, data: dict[str, Any]) -> None:
         user_id = voice_state_user_id(data)
@@ -183,10 +204,17 @@ class FluxerVoiceAutoJoinSupervisor:
         channel_id = voice_state_channel_id(data)
         guild_id = voice_state_guild_id(data)
         if channel_id is None:
+            self.desired_channel_id = None
+            self.desired_guild_id = None
             await self.stop_voice_loop(f"target user {user_id} left voice")
             return
         if not self.should_join_channel(guild_id=guild_id, channel_id=channel_id):
+            self.desired_channel_id = None
+            self.desired_guild_id = None
+            await self.stop_voice_loop(f"target user {user_id} moved to unconfigured voice channel {channel_id}")
             return
+        self.desired_channel_id = channel_id
+        self.desired_guild_id = guild_id
         await self.start_voice_loop(guild_id=guild_id, channel_id=channel_id)
 
 
@@ -234,6 +262,8 @@ async def run(args: argparse.Namespace) -> int:
         )
         await stop_event.wait()
     finally:
+        supervisor.desired_channel_id = None
+        supervisor.desired_guild_id = None
         await supervisor.stop_voice_loop("supervisor shutting down")
         await adapter.disconnect()
     return 0
