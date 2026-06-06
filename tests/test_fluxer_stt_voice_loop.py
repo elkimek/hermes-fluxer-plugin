@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import wave
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +12,7 @@ from scripts.fluxer_stt_voice_loop import (
     append_jsonl,
     build_answer_prompt,
     build_hermes_messages,
+    collect_voice_session_recall,
     compose_system_prompt,
     is_voice_stop_request,
     load_env_file,
@@ -17,9 +20,13 @@ from scripts.fluxer_stt_voice_loop import (
     looks_like_clipped_non_english_noise,
     normalize_voice_transcript,
     parse_args,
+    requested_brain_mode_switch,
+    resolve_voice_brain_provider,
     run_stt_voice_loop,
     safe_stt_summary,
     transcribe_with_provider,
+    voice_mode_ack,
+    voice_recall_time_window,
     write_pcm16_wav,
 )
 
@@ -100,6 +107,82 @@ def test_is_voice_stop_request_detects_clear_stop_phrases():
     assert not is_voice_stop_request("stop asking generic questions")
 
 
+def test_voice_brain_router_auto_escalates_and_supports_spoken_switches():
+    assert requested_brain_mode_switch("Okay, switch to full Hermes mode") == "hermes"
+    assert requested_brain_mode_switch("Go back to fast mode now") == "xai-fast"
+
+    provider, sticky, reason = resolve_voice_brain_provider(
+        "auto",
+        "xai-fast",
+        "What were we doing last Monday?",
+    )
+    assert (provider, sticky, reason) == ("hermes", "xai-fast", "auto_escalate_memory_context")
+
+    provider, sticky, reason = resolve_voice_brain_provider("auto", "xai-fast", "Switch to full brain")
+    assert (provider, sticky, reason) == ("hermes", "hermes", "voice_switch_hermes")
+
+    provider, sticky, reason = resolve_voice_brain_provider("auto", sticky, "What is two plus two?")
+    assert (provider, sticky, reason) == ("hermes", "hermes", "sticky_hermes")
+
+    provider, sticky, reason = resolve_voice_brain_provider("auto", sticky, "Back to fast mode")
+    assert (provider, sticky, reason) == ("xai-fast", "xai-fast", "voice_switch_xai-fast")
+
+    provider, sticky, reason = resolve_voice_brain_provider("auto", sticky, "What is two plus two?")
+    assert (provider, sticky, reason) == ("xai-fast", "xai-fast", "auto_fast")
+
+    provider, sticky, reason = resolve_voice_brain_provider("xai-fast", "xai-fast", "Switch to full brain")
+    assert (provider, sticky, reason) == ("xai-fast", "xai-fast", "configured_provider_ignores_voice_switch")
+    assert "full Hermes brain" in voice_mode_ack("hermes")
+    assert "fast voice mode" in voice_mode_ack("xai-fast")
+
+
+def test_voice_recall_time_window_for_last_monday():
+    now = datetime(2026, 6, 6, 12, 0, 0)
+    window = voice_recall_time_window("What were we doing last Monday?", now=now)
+    assert window is not None
+    start, end, label = window
+    assert label == "last Monday"
+    assert start.isoformat() == "2026-06-01T00:00:00"
+    assert end.isoformat() == "2026-06-02T00:00:00"
+
+
+def test_collect_voice_session_recall_reads_local_state_db(tmp_path):
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        create table sessions (id text primary key, title text, source text, started_at real, ended_at real);
+        create table messages (id integer primary key, session_id text, role text, content text, timestamp real);
+        """
+    )
+    con.execute(
+        "insert into sessions values (?, ?, ?, ?, ?)",
+        (
+            "s1",
+            "Fluxer work",
+            "fluxer",
+            datetime(2026, 6, 1, 9, 0, 0).timestamp(),
+            datetime(2026, 6, 1, 10, 0, 0).timestamp(),
+        ),
+    )
+    con.execute(
+        "insert into messages(session_id, role, content, timestamp) values (?, ?, ?, ?)",
+        ("s1", "user", "We built the hybrid voice router", datetime(2026, 6, 1, 9, 30, 0).timestamp()),
+    )
+    con.commit()
+    con.close()
+
+    recall = collect_voice_session_recall(
+        "What did we do last Monday?",
+        db_path=str(db),
+        now=datetime(2026, 6, 6, 12, 0, 0),
+    )
+
+    assert "Local Hermes session excerpts for last Monday" in recall
+    assert "We built the hybrid voice router" in recall
+    assert "Fluxer work" in recall
+
+
 def test_looks_like_clipped_non_english_noise_rejects_short_vad_hallucinations():
     assert looks_like_clipped_non_english_noise("Je to pračka nebo úplně?")
     assert looks_like_clipped_non_english_noise("E aí")
@@ -147,7 +230,7 @@ def test_parse_args_defaults_to_realtime_voice_stack():
     assert args.elevenlabs_language_code == "eng"
     assert args.capture_mode == "vad"
     assert args.capture_window_seconds == 3.0
-    assert args.brain_provider == "xai-fast"
+    assert args.brain_provider == "auto"
     assert args.hermes_url == "http://127.0.0.1:8642"
     assert args.voice_context_file.endswith("VOICE_CONTEXT_CACHE.md")
     assert args.energy_threshold == 300

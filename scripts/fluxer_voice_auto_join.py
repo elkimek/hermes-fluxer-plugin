@@ -216,7 +216,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--participant-identity-prefix", default=os.getenv("FLUXER_AUTO_JOIN_PARTICIPANT_PREFIX", ""))
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--env-file", default="/home/elkim/.hermes/.env")
-    parser.add_argument("--brain-provider", choices=("xai-fast", "xai", "hermes"), default="xai-fast")
+    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default="auto")
     parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="elevenlabs")
     parser.add_argument("--stt-model", default="scribe_v2")
     parser.add_argument("--elevenlabs-language-code", default="eng")

@@ -24,11 +24,13 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import sys
 import tempfile
 import time
 import urllib.request
 import wave
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +144,100 @@ def is_voice_stop_request(transcript: str) -> bool:
     return any(phrase in lower for phrase in stop_phrases)
 
 
+def requested_brain_mode_switch(transcript: str) -> str | None:
+    """Detect spoken requests to stick future turns to fast or full Hermes brain."""
+
+    lower = " ".join((transcript or "").lower().split()).strip(" .!?…")
+    if not lower:
+        return None
+    fast_phrases = (
+        "switch back to fast",
+        "go back to fast",
+        "use fast mode",
+        "use the fast brain",
+        "switch to fast brain",
+        "back to xai fast",
+        "back to fast mode",
+        "casual mode",
+    )
+    hermes_phrases = (
+        "switch to full brain",
+        "switch to full hermes",
+        "switch to hermes",
+        "use full brain",
+        "use the full brain",
+        "use hermes mode",
+        "use full hermes",
+        "full hermes mode",
+        "full brain hermes mode",
+        "turn on full brain",
+        "deep mode",
+    )
+    if any(phrase in lower for phrase in fast_phrases):
+        return "xai-fast"
+    if any(phrase in lower for phrase in hermes_phrases):
+        return "hermes"
+    return None
+
+
+def transcript_needs_full_brain(transcript: str) -> bool:
+    """Heuristic for one-turn escalation from fast voice brain to Hermes brain."""
+
+    lower = " ".join((transcript or "").lower().split()).strip(" .!?…")
+    if not lower:
+        return False
+    temporal_memory_terms = (
+        "last monday",
+        "yesterday",
+        "last week",
+        "earlier today",
+        "what were we doing",
+        "what did we do",
+        "what did we talk about",
+        "where did we leave",
+        "remember when",
+        "do you remember",
+        "session history",
+        "conversation history",
+        "past conversation",
+        "previous conversation",
+        "look at the transcript",
+        "check the transcript",
+        "check memory",
+        "search memory",
+        "use honcho",
+        "use gbrain",
+        "use tools",
+        "full brain",
+        "full hermes",
+        "hermes mode",
+    )
+    return any(term in lower for term in temporal_memory_terms)
+
+
+def resolve_voice_brain_provider(configured_provider: str, sticky_provider: str, transcript: str) -> tuple[str, str, str]:
+    """Return provider for this turn, new sticky provider, and routing reason."""
+
+    requested = requested_brain_mode_switch(transcript)
+    if configured_provider != "auto":
+        if requested and requested != configured_provider:
+            return configured_provider, configured_provider, "configured_provider_ignores_voice_switch"
+        return configured_provider, configured_provider, "configured_provider"
+    if requested:
+        return requested, requested, f"voice_switch_{requested}"
+    if sticky_provider == "hermes":
+        return "hermes", sticky_provider, "sticky_hermes"
+    if transcript_needs_full_brain(transcript):
+        return "hermes", sticky_provider, "auto_escalate_memory_context"
+    return "xai-fast", sticky_provider, "auto_fast"
+
+
+def voice_mode_ack(mode: str) -> str:
+    if mode == "hermes":
+        return "Switched to full Hermes brain. I’ll be slower, but deeper."
+    return "Back to fast voice mode."
+
+
 def normalize_voice_transcript(transcript: str) -> str:
     """Drop non-spoken context wrappers before routing STT text to Hermes.
 
@@ -200,8 +296,22 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
     )
 
 
-def build_hermes_messages(transcript: str, *, history: list[dict[str, str]], system: str = DEFAULT_TEXT_SYSTEM) -> list[dict[str, str]]:
+def build_hermes_messages(
+    transcript: str,
+    *,
+    history: list[dict[str, str]],
+    system: str = DEFAULT_TEXT_SYSTEM,
+    recall_context: str = "",
+) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": system}]
+    recall_context = recall_context.strip()
+    if recall_context:
+        messages.append(
+            {
+                "role": "system",
+                "content": "Relevant read-only session/memory context retrieved for this voice turn:\n" + recall_context,
+            }
+        )
     for item in history[-8:]:
         user = (item.get("user") or "").strip()
         assistant = (item.get("assistant") or "").strip()
@@ -213,17 +323,117 @@ def build_hermes_messages(transcript: str, *, history: list[dict[str, str]], sys
     return messages
 
 
+def _last_monday_window(now: datetime | None = None) -> tuple[datetime, datetime]:
+    now = now or datetime.now().astimezone()
+    days_since_monday = now.weekday()
+    last_monday = now - timedelta(days=days_since_monday + (7 if days_since_monday == 0 else 0))
+    start = last_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
+
+
+def voice_recall_time_window(transcript: str, *, now: datetime | None = None) -> tuple[datetime, datetime, str] | None:
+    lower = " ".join((transcript or "").lower().split())
+    now = now or datetime.now().astimezone()
+    if "last monday" in lower:
+        start, end = _last_monday_window(now)
+        return start, end, "last Monday"
+    if "yesterday" in lower:
+        start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return start, start + timedelta(days=1), "yesterday"
+    return None
+
+
+def collect_voice_session_recall(
+    transcript: str,
+    *,
+    db_path: str,
+    max_messages: int = 24,
+    now: datetime | None = None,
+) -> str:
+    """Return compact read-only session DB excerpts for temporal voice questions."""
+
+    window = voice_recall_time_window(transcript, now=now)
+    if not window:
+        return ""
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return ""
+    start, end, label = window
+    start_ts = start.timestamp()
+    end_ts = end.timestamp()
+    uri = f"file:{path}?mode=ro"
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+        sessions = con.execute(
+            """
+            select id, coalesce(title, ''), source
+            from sessions
+            where started_at < ? and coalesce(ended_at, started_at) >= ?
+            order by started_at asc
+            limit 12
+            """,
+            (end_ts, start_ts),
+        ).fetchall()
+        rows: list[tuple[float, str, str, str, str]] = []
+        per_session_limit = max(2, max_messages // max(1, len(sessions))) if sessions else max_messages
+        for session_id, title, source in sessions:
+            rows.extend(
+                con.execute(
+                    """
+                    select timestamp, role, content, ?, ?
+                    from messages
+                    where session_id = ?
+                      and timestamp >= ? and timestamp < ?
+                      and role in ('user', 'assistant')
+                      and content is not null
+                      and length(trim(content)) > 0
+                    order by timestamp asc
+                    limit ?
+                    """,
+                    (title, source, session_id, start_ts, end_ts, per_session_limit),
+                ).fetchall()
+            )
+        rows.sort(key=lambda row: row[0])
+        rows = rows[:max_messages]
+    except sqlite3.Error as exc:
+        return f"Session recall lookup failed: {type(exc).__name__}: {exc}"
+    finally:
+        with contextlib.suppress(Exception):
+            con.close()  # type: ignore[possibly-undefined]
+    if not rows:
+        return f"No local Hermes session messages found for {label} ({start.date()})."
+    lines = [f"Local Hermes session excerpts for {label} ({start.date()}):"]
+    for ts, role, content, title, source in rows:
+        when = datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+        snippet = " ".join(str(content).split())[:360]
+        title_part = f" [{title}]" if title else ""
+        lines.append(f"- {when} {role}{title_part} ({source}): {snippet}")
+    return "\n".join(lines)
+
+
+def build_full_brain_transcript(transcript: str, *, args: argparse.Namespace) -> tuple[str, str]:
+    recall = collect_voice_session_recall(
+        transcript,
+        db_path=getattr(args, "voice_session_db", "/home/elkim/.hermes/state.db"),
+    )
+    if not recall:
+        return transcript, ""
+    return transcript, recall
+
+
 def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], args: argparse.Namespace) -> str:
     api_key = os.getenv("API_SERVER_KEY", "").strip()
     if not api_key:
         raise RuntimeError("API_SERVER_KEY is required for Hermes brain mode")
+    full_transcript, recall_context = build_full_brain_transcript(transcript, args=args)
     payload = json.dumps(
         {
             "model": args.hermes_model,
             "messages": build_hermes_messages(
-                transcript,
+                full_transcript,
                 history=history,
                 system=getattr(args, "voice_system_prompt", DEFAULT_TEXT_SYSTEM),
+                recall_context=recall_context,
             ),
             "max_tokens": args.hermes_max_tokens,
             "temperature": args.hermes_temperature,
@@ -335,9 +545,10 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         "voice_context_cache_chars": len(voice_context_cache),
     }
     history: list[dict[str, str]] = []
+    sticky_brain_provider = "xai-fast"
 
     async def handler(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
-        nonlocal leave_connection_id
+        nonlocal leave_connection_id, sticky_brain_provider
         try:
             info = await bridge.connect_from_voice_server_update(raw_update)
             leave_connection_id = info.connection_id
@@ -422,11 +633,19 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     continue
 
                 should_stop_after_reply = is_voice_stop_request(transcript)
+                selected_brain_provider, sticky_brain_provider, brain_route_reason = resolve_voice_brain_provider(
+                    args.brain_provider,
+                    sticky_brain_provider,
+                    transcript,
+                )
                 brain_started = time.monotonic()
                 if should_stop_after_reply:
                     reply_text = "Got it, stopping here."
                     prompt = reply_text
-                elif args.brain_provider == "hermes":
+                elif brain_route_reason.startswith("voice_switch_"):
+                    reply_text = voice_mode_ack(selected_brain_provider)
+                    prompt = reply_text
+                elif selected_brain_provider == "hermes":
                     reply_text = hermes_chat_completion(transcript, history=history, args=args)
                     prompt = reply_text
                 else:
@@ -477,7 +696,10 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 turn.update(
                     {
                         "published": True,
-                        "brain_provider": args.brain_provider,
+                        "brain_provider": selected_brain_provider,
+                        "brain_provider_config": args.brain_provider,
+                        "brain_route_reason": brain_route_reason,
+                        "sticky_brain_provider": sticky_brain_provider,
                         "brain_seconds": round(brain_seconds, 3),
                         "reply_transcript": spoken_reply,
                         "reply_bytes": xai_result.bytes_written,
@@ -562,7 +784,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-segment-ms", type=int, default=1600)
     parser.add_argument("--max-segment-seconds", type=float, default=12.0)
     parser.add_argument("--voice", default="eve")
-    parser.add_argument("--brain-provider", choices=("xai-fast", "xai", "hermes"), default="xai-fast")
+    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default="auto")
     parser.add_argument("--hermes-url", default="http://127.0.0.1:8642")
     parser.add_argument("--hermes-model", default=os.getenv("API_SERVER_MODEL_NAME") or "Žofka")
     parser.add_argument("--hermes-timeout", type=float, default=90.0)
@@ -584,6 +806,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--voice-context-file",
         default=str(ROOT / "VOICE_CONTEXT_CACHE.md"),
         help="Compact Žofka/Elkim context loaded once into RAM at startup for fast voice mode",
+    )
+    parser.add_argument(
+        "--voice-session-db",
+        default="/home/elkim/.hermes/state.db",
+        help="Read-only Hermes session DB used to augment full-brain temporal recall questions",
     )
     parser.add_argument("--stop-on-empty-stt", action="store_true")
     parser.add_argument(
