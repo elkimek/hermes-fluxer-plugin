@@ -396,7 +396,8 @@ class XAIRealtimeVoiceClient:
                 break
             except TimeoutError as exc:
                 if bytes_written == 0:
-                    message = f"xAI Realtime emitted no audio within {first_audio_timeout}s"
+                    limit = first_audio_timeout if first_audio_timeout is not None else timeout
+                    message = f"xAI Realtime emitted no audio within {limit}s"
                 else:
                     message = f"xAI Realtime response did not finish within {timeout}s"
                 raise XAIRealtimeStreamError(

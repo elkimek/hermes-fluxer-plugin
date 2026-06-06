@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import audioop
 import contextlib
 import json
 import logging
@@ -75,6 +74,20 @@ Conversation rules:
 
 def env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def pcm16_rms(pcm: bytes) -> int:
+    if not pcm:
+        return 0
+    width = 2
+    sample_count = len(pcm) // width
+    if sample_count <= 0:
+        return 0
+    total = 0
+    for i in range(0, sample_count * width, width):
+        sample = int.from_bytes(pcm[i : i + width], byteorder="little", signed=True)
+        total += sample * sample
+    return int((total / sample_count) ** 0.5)
 
 
 def load_env_file(path: Path) -> None:
@@ -643,7 +656,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     "turn": turn_no,
                     "captured_pcm_bytes": len(pcm),
                     "captured_audio_seconds": round(len(pcm) / 2 / args.sample_rate, 3),
-                    "input_rms": audioop.rms(pcm, 2) if pcm else 0,
+                    "input_rms": pcm16_rms(pcm),
                     "stt": safe_stt_summary(stt_result),
                     "stt_seconds": round(stt_seconds, 3),
                 }

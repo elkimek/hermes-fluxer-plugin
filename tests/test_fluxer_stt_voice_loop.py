@@ -20,6 +20,7 @@ from scripts.fluxer_stt_voice_loop import (
     looks_like_clipped_non_english_noise,
     normalize_voice_transcript,
     parse_args,
+    pcm16_rms,
     requested_brain_mode_switch,
     resolve_voice_brain_provider,
     run_stt_voice_loop,
@@ -236,6 +237,12 @@ def test_safe_stt_summary_drops_extra_provider_payload():
         "model": "medium.en",
         "error": None,
     }
+
+
+def test_pcm16_rms_is_pure_python_audioop_replacement():
+    assert pcm16_rms(b"") == 0
+    assert pcm16_rms((3).to_bytes(2, "little", signed=True) + (4).to_bytes(2, "little", signed=True)) == 3
+    assert pcm16_rms((-300).to_bytes(2, "little", signed=True) + (300).to_bytes(2, "little", signed=True)) == 300
 
 
 def test_parse_args_defaults_to_realtime_voice_stack(monkeypatch):
