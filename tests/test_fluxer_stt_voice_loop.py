@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import wave
@@ -430,3 +431,77 @@ async def test_stt_voice_loop_leaves_with_fluxer_connection_id(monkeypatch, tmp_
     assert result["connection"]["connection_id"] == "conn-123"
     assert sends[0] == ("voice-1", {"guild_id": "guild-1", "self_mute": True, "self_deaf": False})
     assert (None, {"guild_id": "guild-1", "connection_id": "conn-123"}) in sends
+
+
+@pytest.mark.asyncio
+async def test_stt_voice_loop_surfaces_livekit_connect_failure_without_connect_timeout(monkeypatch, tmp_path):
+    sends = []
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            sends.append((channel_id, kwargs))
+            if channel_id is not None:
+                assert self.handler is not None
+                await self.handler(
+                    {
+                        "endpoint": "wss://voice.example",
+                        "token": "secret-token",
+                        "guild_id": kwargs.get("guild_id"),
+                        "channel_id": channel_id,
+                        "connection_id": "conn-fail",
+                    },
+                    {"connection_id": "conn-fail", "has_token": True},
+                )
+            return True
+
+        async def disconnect(self):
+            sends.append(("adapter_disconnect", {}))
+
+    class FakeBridge:
+        def __init__(self, auto_subscribe=True):
+            pass
+
+        async def connect_from_voice_server_update(self, raw_update):
+            raise RuntimeError("livekit unavailable")
+
+        async def disconnect(self):
+            sends.append(("bridge_disconnect", {}))
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("XAI_API_KEY", "xai")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
+
+    args = parse_args(
+        [
+            "--channel-id",
+            "voice-1",
+            "--guild-id",
+            "guild-1",
+            "--max-turns",
+            "0",
+            "--connect-timeout",
+            "30",
+            "--voice-context-file",
+            str(tmp_path / "missing-context.md"),
+        ]
+    )
+
+    result = await asyncio.wait_for(run_stt_voice_loop(args), timeout=1.0)
+
+    assert result["error"] == "RuntimeError"
+    assert result["message"] == "livekit unavailable"
+    assert sends[0] == ("voice-1", {"guild_id": "guild-1", "self_mute": True, "self_deaf": False})
+    assert (None, {"guild_id": "guild-1", "connection_id": None}) in sends
