@@ -40,11 +40,11 @@ This project uses simple semantic versioning while the plugin is young:
 - Added explicit `--stt-provider elevenlabs` support for ElevenLabs Scribe (`scribe_v2`) alongside local/Groq/xAI STT; live test was very fast (~0.86s STT) but misheard the Fluxer room capture as "Asia FC", confirming provider swaps are not enough and the next focus should be LiveKit capture timing/quality.
 - Hardened the STT-backed loop against non-spoken recalled-context wrappers by stripping `<memory-context>` and `[System note: ...]` blocks before prompting Hermes or writing safe turn summaries; this keeps live voice answers focused on what the user actually said.
 - Added a production-safe realtime voice configuration surface: `FLUXER_VOICE_*` optional environment variables in `plugin.yaml`, plus equivalent `fluxer.voice` YAML mapping through the Hermes platform adapter.
-- Added regression coverage for the YAML-to-env bridge and for keeping private dogfood IDs, local paths, and deployment context files out of the public tree.
+- Added regression coverage for the YAML-to-env bridge, plugin-managed voice supervisor lifecycle, and for keeping private dogfood IDs, local paths, and deployment context files out of the public tree.
 
 ### Changed
 
-- Realtime voice auto-join is now disabled by default and refuses to join arbitrary voice rooms unless explicitly enabled and scoped with configured channel IDs.
+- Realtime voice auto-join is now disabled by default, plugin-managed after Fluxer gateway connect, stopped during adapter disconnect, and refuses to join arbitrary voice rooms unless explicitly enabled and scoped with configured channel IDs.
 - Replaced dogfood-specific voice defaults with generic assistant prompts, deployment-local context file support, safe home-relative paths, and environment-driven STT/TTS/VAD/timeout knobs.
 - Removed the tracked deployment-local voice context cache; operators should provide private context via `FLUXER_VOICE_CONTEXT_FILE` or `fluxer.voice.context_file`.
 

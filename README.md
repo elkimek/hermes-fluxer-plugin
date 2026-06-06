@@ -331,7 +331,9 @@ If no STT provider is configured, Hermes will still receive the voice attachment
 
 ### Realtime voice rooms
 
-Realtime voice is **disabled by default**. The plugin will not join voice rooms unless the operator explicitly enables it and scopes the rooms/users it may listen to.
+Realtime voice is **disabled by default**. When enabled, the Fluxer adapter manages the auto-join supervisor as part of its own lifecycle: the gateway starts it after the Fluxer websocket connects and stops it during adapter disconnect/shutdown. Operators should not need to hand-launch `scripts/fluxer_voice_auto_join.py` in production.
+
+The plugin will not join voice rooms unless the operator explicitly enables it and scopes the rooms/users it may listen to.
 
 Minimum env-var setup:
 

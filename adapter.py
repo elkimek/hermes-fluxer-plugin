@@ -18,6 +18,7 @@ import mimetypes
 import os
 import re
 import subprocess
+import sys
 import time
 import uuid
 from collections import OrderedDict
@@ -66,6 +67,7 @@ _SLASH_CONFIRM_REACTIONS = (
     ("♾️", "always", "always approve"),
     ("❌", "cancel", "cancel"),
 )
+_PLUGIN_ROOT = Path(__file__).resolve().parent
 
 
 def _strip_slash(url: str) -> str:
@@ -363,6 +365,147 @@ def _split_ids(value: Any) -> set[str]:
     if isinstance(value, (list, tuple, set)):
         return {str(item).strip() for item in value if str(item).strip()}
     return {part.strip() for part in str(value).split(",") if part.strip()}
+
+
+def _voice_config_dict(extra: Dict[str, Any]) -> Dict[str, Any]:
+    raw = extra.get("voice") if isinstance(extra, dict) else None
+    return raw if isinstance(raw, dict) else {}
+
+
+def _voice_setting(extra: Dict[str, Any], key: str, env_name: str, default: Any = None) -> Any:
+    env_value = os.getenv(env_name)
+    if env_value is not None:
+        return env_value
+    voice = _voice_config_dict(extra)
+    if key in voice:
+        return voice.get(key)
+    return default
+
+
+def _voice_bool_setting(extra: Dict[str, Any], key: str, env_name: str, default: bool = False) -> bool:
+    return _coerce_bool(_voice_setting(extra, key, env_name, default), default)
+
+
+def _voice_csv_setting(extra: Dict[str, Any], key: str, env_name: str) -> str:
+    value = _voice_setting(extra, key, env_name, "")
+    return ",".join(sorted(_split_ids(value)))
+
+
+class FluxerVoiceSupervisorProcess:
+    """Plugin-managed wrapper for the optional realtime voice auto-join supervisor."""
+
+    def __init__(
+        self,
+        *,
+        extra: Dict[str, Any],
+        plugin_root: Path = _PLUGIN_ROOT,
+        popen_factory: Callable[..., Any] = subprocess.Popen,
+    ) -> None:
+        self.extra = extra
+        self.plugin_root = plugin_root
+        self.popen_factory = popen_factory
+        self.process: Optional[subprocess.Popen] = None
+
+    @property
+    def enabled(self) -> bool:
+        return _voice_bool_setting(self.extra, "enabled", "FLUXER_VOICE_ENABLED", False)
+
+    @property
+    def auto_join(self) -> bool:
+        return _voice_bool_setting(self.extra, "auto_join", "FLUXER_VOICE_AUTO_JOIN", False)
+
+    @property
+    def configured_channel_ids(self) -> str:
+        return _voice_csv_setting(self.extra, "channel_ids", "FLUXER_VOICE_CHANNEL_IDS")
+
+    def should_start(self) -> bool:
+        return self.enabled and self.auto_join and bool(self.configured_channel_ids)
+
+    def build_command(self) -> list[str]:
+        python = os.getenv("FLUXER_VOICE_PYTHON", sys.executable)
+        return [python, "scripts/fluxer_voice_auto_join.py"]
+
+    def _child_env(self) -> Dict[str, str]:
+        env = os.environ.copy()
+        voice = _voice_config_dict(self.extra)
+        mappings = {
+            "enabled": "FLUXER_VOICE_ENABLED",
+            "auto_join": "FLUXER_VOICE_AUTO_JOIN",
+            "target_user_ids": "FLUXER_VOICE_TARGET_USER_IDS",
+            "channel_ids": "FLUXER_VOICE_CHANNEL_IDS",
+            "guild_ids": "FLUXER_VOICE_GUILD_IDS",
+            "participant_prefix": "FLUXER_VOICE_PARTICIPANT_PREFIX",
+            "brain_provider": "FLUXER_VOICE_BRAIN_PROVIDER",
+            "stt_provider": "FLUXER_VOICE_STT_PROVIDER",
+            "stt_model": "FLUXER_VOICE_STT_MODEL",
+            "elevenlabs_language_code": "FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE",
+            "tts_voice": "FLUXER_VOICE_TTS_VOICE",
+            "context_file": "FLUXER_VOICE_CONTEXT_FILE",
+            "session_db": "FLUXER_VOICE_SESSION_DB",
+            "turn_log_jsonl": "FLUXER_VOICE_TURN_LOG_JSONL",
+        }
+        for key, env_name in mappings.items():
+            if env_name not in env and key in voice:
+                value = voice.get(key)
+                env[env_name] = _coerce_env_value(value)
+        for section_name, nested in {
+            "vad": {
+                "silence_ms": "FLUXER_VOICE_SILENCE_MS",
+                "end_padding_ms": "FLUXER_VOICE_END_PADDING_MS",
+                "min_segment_ms": "FLUXER_VOICE_MIN_SEGMENT_MS",
+                "max_segment_seconds": "FLUXER_VOICE_MAX_SEGMENT_SECONDS",
+            },
+            "timeouts": {
+                "capture_seconds": "FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS",
+                "connect_seconds": "FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS",
+                "xai_seconds": "FLUXER_VOICE_XAI_TIMEOUT_SECONDS",
+                "xai_first_audio_seconds": "FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS",
+                "max_runtime_seconds": "FLUXER_VOICE_MAX_RUNTIME_SECONDS",
+            },
+        }.items():
+            values = voice.get(section_name)
+            if isinstance(values, dict):
+                for key, env_name in nested.items():
+                    if env_name not in env and key in values:
+                        env[env_name] = str(values[key])
+        return env
+
+    def start(self) -> bool:
+        if self.process and self.process.poll() is None:
+            return True
+        if not self.should_start():
+            logger.info(
+                "Fluxer realtime voice supervisor disabled or not scoped; enabled=%s auto_join=%s channels_configured=%s",
+                self.enabled,
+                self.auto_join,
+                bool(self.configured_channel_ids),
+            )
+            return False
+        script = self.plugin_root / "scripts" / "fluxer_voice_auto_join.py"
+        if not script.exists():
+            logger.warning("Fluxer realtime voice supervisor script missing: %s", script)
+            return False
+        self.process = self.popen_factory(
+            self.build_command(),
+            cwd=str(self.plugin_root),
+            env=self._child_env(),
+            start_new_session=True,
+        )
+        logger.info("Fluxer realtime voice supervisor started with PID %s", getattr(self.process, "pid", None))
+        return True
+
+    async def stop(self) -> None:
+        proc = self.process
+        self.process = None
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            await asyncio.to_thread(proc.wait, 8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            await asyncio.to_thread(proc.wait, 5)
+        logger.info("Fluxer realtime voice supervisor stopped")
 
 
 
@@ -675,6 +818,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._last_voice_server_update: Optional[Dict[str, Any]] = None
         self._voice_server_update_handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Any]] = None
         self._voice_state_update_handler: Optional[Callable[[Dict[str, Any]], Any]] = None
+        self._voice_supervisor = FluxerVoiceSupervisorProcess(extra=extra)
         self._gateway_ready_event = asyncio.Event()
 
     async def connect(self) -> bool:
@@ -690,14 +834,17 @@ class FluxerAdapter(BasePlatformAdapter):
             self._mark_connected()
             await self._connect_gateway_once()
             await self._maybe_register_native_commands()
+            self._voice_supervisor.start()
             return True
         except Exception as exc:
+            await self._voice_supervisor.stop()
             self._mark_disconnected()
             logger.warning("Fluxer connect failed: %s", exc)
             self._set_fatal_error("connect_failed", f"Fluxer connect failed: {exc}", retryable=True)
             return False
 
     async def disconnect(self) -> None:
+        await self._voice_supervisor.stop()
         self._closing = True
         self._running = False
         for task in (self._heartbeat_task, self._listener_task, self._reconnect_task):

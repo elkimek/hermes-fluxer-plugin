@@ -1,5 +1,6 @@
 from pathlib import Path
 import ast
+import os
 from unittest.mock import AsyncMock
 
 import pytest
@@ -63,14 +64,118 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
         },
     )
 
-    assert __import__("os").environ["FLUXER_VOICE_ENABLED"] == "true"
-    assert __import__("os").environ["FLUXER_VOICE_AUTO_JOIN"] == "true"
-    assert __import__("os").environ["FLUXER_VOICE_TARGET_USER_IDS"] == "user-1,user-2"
-    assert __import__("os").environ["FLUXER_VOICE_CHANNEL_IDS"] == "voice-1"
-    assert __import__("os").environ["FLUXER_VOICE_BRAIN_PROVIDER"] == "auto"
-    assert __import__("os").environ["FLUXER_VOICE_STT_PROVIDER"] == "elevenlabs"
-    assert __import__("os").environ["FLUXER_VOICE_SILENCE_MS"] == "850"
-    assert __import__("os").environ["FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS"] == "90"
+    assert os.environ["FLUXER_VOICE_ENABLED"] == "true"
+    assert os.environ["FLUXER_VOICE_AUTO_JOIN"] == "true"
+    assert os.environ["FLUXER_VOICE_TARGET_USER_IDS"] == "user-1,user-2"
+    assert os.environ["FLUXER_VOICE_CHANNEL_IDS"] == "voice-1"
+    assert os.environ["FLUXER_VOICE_BRAIN_PROVIDER"] == "auto"
+    assert os.environ["FLUXER_VOICE_STT_PROVIDER"] == "elevenlabs"
+    assert os.environ["FLUXER_VOICE_SILENCE_MS"] == "850"
+    assert os.environ["FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS"] == "90"
+
+
+class _FakeVoiceProcess:
+    pid = 4242
+
+    def __init__(self):
+        self.terminated = False
+        self.killed = False
+        self.wait_calls = []
+
+    def poll(self):
+        return None if not (self.terminated or self.killed) else 0
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        return 0
+
+
+def test_voice_supervisor_disabled_by_default_does_not_spawn(tmp_path, monkeypatch):
+    for key in (
+        "FLUXER_VOICE_ENABLED",
+        "FLUXER_VOICE_AUTO_JOIN",
+        "FLUXER_VOICE_CHANNEL_IDS",
+        "FLUXER_VOICE_TARGET_USER_IDS",
+        "FLUXER_VOICE_SILENCE_MS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    calls = []
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(extra={}, plugin_root=root, popen_factory=lambda *a, **kw: calls.append((a, kw)))
+
+    assert supervisor.start() is False
+    assert calls == []
+
+
+def test_voice_supervisor_spawns_when_enabled_scoped_and_auto_join(tmp_path, monkeypatch):
+    for key in (
+        "FLUXER_VOICE_ENABLED",
+        "FLUXER_VOICE_AUTO_JOIN",
+        "FLUXER_VOICE_CHANNEL_IDS",
+        "FLUXER_VOICE_TARGET_USER_IDS",
+        "FLUXER_VOICE_SILENCE_MS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    calls = []
+    fake_proc = _FakeVoiceProcess()
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        return fake_proc
+
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(
+        extra={
+            "voice": {
+                "enabled": True,
+                "auto_join": True,
+                "channel_ids": ["voice-1"],
+                "target_user_ids": ["user-1"],
+                "vad": {"silence_ms": 850},
+            }
+        },
+        plugin_root=root,
+        popen_factory=fake_popen,
+    )
+
+    assert supervisor.start() is True
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0][1] == "scripts/fluxer_voice_auto_join.py"
+    assert kwargs["cwd"] == str(root)
+    assert kwargs["env"]["FLUXER_VOICE_ENABLED"] == "true"
+    assert kwargs["env"]["FLUXER_VOICE_AUTO_JOIN"] == "true"
+    assert kwargs["env"]["FLUXER_VOICE_CHANNEL_IDS"] == "voice-1"
+    assert kwargs["env"]["FLUXER_VOICE_TARGET_USER_IDS"] == "user-1"
+    assert kwargs["env"]["FLUXER_VOICE_SILENCE_MS"] == "850"
+
+
+@pytest.mark.asyncio
+async def test_voice_supervisor_stop_terminates_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLUXER_VOICE_ENABLED", "true")
+    monkeypatch.setenv("FLUXER_VOICE_AUTO_JOIN", "true")
+    monkeypatch.setenv("FLUXER_VOICE_CHANNEL_IDS", "voice-1")
+    fake_proc = _FakeVoiceProcess()
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(extra={}, plugin_root=root, popen_factory=lambda *a, **kw: fake_proc)
+
+    assert supervisor.start() is True
+    await supervisor.stop()
+
+    assert fake_proc.terminated is True
+    assert fake_proc.wait_calls == [8]
 
 
 def test_public_tree_contains_no_private_voice_dogfood_defaults():

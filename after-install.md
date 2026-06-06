@@ -43,7 +43,20 @@ FLUXER_HOME_CHANNEL=your_default_channel_or_dm_id
 FLUXER_HOME_CHANNEL_NAME="Fluxer Home"
 ```
 
-## 5. Restart and test
+## 5. Optional realtime voice auto-join
+
+Realtime voice is disabled by default. To let the plugin-managed supervisor automatically join specific voice rooms after the Fluxer gateway connects, add:
+
+```bash
+FLUXER_VOICE_ENABLED=true
+FLUXER_VOICE_AUTO_JOIN=true
+FLUXER_VOICE_TARGET_USER_IDS=your_fluxer_user_id
+FLUXER_VOICE_CHANNEL_IDS=your_voice_channel_id
+```
+
+Or configure the equivalent `fluxer.voice` block in `~/.hermes/config.yaml`. Keep any deployment-local assistant/personality context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed.
+
+## 6. Restart and test
 
 ```bash
 hermes gateway restart
