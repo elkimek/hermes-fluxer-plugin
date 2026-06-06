@@ -468,10 +468,6 @@ class FluxerVoiceSupervisorProcess:
             "max_turns": "FLUXER_VOICE_MAX_TURNS",
             "initial_settle_seconds": "FLUXER_VOICE_INITIAL_SETTLE_SECONDS",
             "sample_rate": "FLUXER_VOICE_SAMPLE_RATE",
-            "frame_ms": "FLUXER_VOICE_FRAME_MS",
-            "energy_threshold": "FLUXER_VOICE_ENERGY_THRESHOLD",
-            "start_cooldown_seconds": "FLUXER_VOICE_START_COOLDOWN_SECONDS",
-            "stop_timeout_seconds": "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
         }
         for key, env_name in mappings.items():
             if env_name not in env and key in voice:
@@ -975,6 +971,8 @@ class FluxerAdapter(BasePlatformAdapter):
                 await asyncio.sleep(delay)
                 await self._connect_gateway_once()
                 self._mark_connected()
+                if self._voice_supervisor:
+                    self._voice_supervisor.start()
                 logger.info("Fluxer gateway reconnected after %s", reason)
                 return
             except asyncio.CancelledError:

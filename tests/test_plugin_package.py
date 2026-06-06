@@ -101,6 +101,37 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     assert os.environ["FLUXER_VOICE_START_COOLDOWN_SECONDS"] == "5"
 
 
+def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_level(monkeypatch, tmp_path):
+    for key in (
+        "FLUXER_VOICE_FRAME_MS",
+        "FLUXER_VOICE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_START_COOLDOWN_SECONDS",
+        "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(
+        plugin_root=tmp_path,
+        extra={
+            "voice": {
+                "frame_ms": 99,
+                "energy_threshold": 999,
+                "start_cooldown_seconds": 99,
+                "stop_timeout_seconds": 99,
+                "vad": {"frame_ms": 20, "energy_threshold": 300},
+                "timeouts": {"start_cooldown_seconds": 5, "stop_timeout_seconds": 2},
+            }
+        },
+    )
+
+    env = supervisor._child_env()
+
+    assert env["FLUXER_VOICE_FRAME_MS"] == "20"
+    assert env["FLUXER_VOICE_ENERGY_THRESHOLD"] == "300"
+    assert env["FLUXER_VOICE_START_COOLDOWN_SECONDS"] == "5"
+    assert env["FLUXER_VOICE_STOP_TIMEOUT_SECONDS"] == "2"
+
+
 class _FakeVoiceProcess:
     pid = 4242
 
@@ -219,6 +250,26 @@ async def test_voice_supervisor_stop_terminates_child(tmp_path, monkeypatch):
 
     assert fake_proc.terminated is True
     assert fake_proc.wait_calls == [8]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_restarts_voice_supervisor(monkeypatch):
+    starts = []
+
+    class FakeSupervisor:
+        def start(self):
+            starts.append("start")
+            return True
+
+    adapter = fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra={"bot_token": "app.secret"}))
+    adapter._voice_supervisor = FakeSupervisor()  # type: ignore[assignment]
+    monkeypatch.setattr(fluxer_adapter.asyncio, "sleep", AsyncMock(return_value=None))
+    adapter._connect_gateway_once = AsyncMock(return_value=None)
+    adapter._mark_connected = lambda: starts.append("mark_connected")
+
+    await adapter._reconnect_loop("test")
+
+    assert starts == ["mark_connected", "start"]
 
 
 def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
