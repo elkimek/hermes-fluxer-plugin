@@ -472,7 +472,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
             finally:
                 if barge_in_task is not None:
                     if barge_in_capture.event.is_set():
-                        with contextlib.suppress(TimeoutError):
+                        with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
                             await asyncio.wait_for(
                                 barge_in_capture.ready.wait(),
                                 timeout=getattr(args, "barge_in_capture_timeout", 2.0),
@@ -666,7 +666,7 @@ async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 break
             try:
                 chunk = await asyncio.wait_for(anext(iterator), timeout=min(1.0, remaining))
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):
                 continue
             except StopAsyncIteration:
                 break

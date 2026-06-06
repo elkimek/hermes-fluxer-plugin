@@ -140,7 +140,7 @@ class XAIRealtimeVoiceClient:
                     ),
                     timeout=timeout,
                 )
-            except TimeoutError as exc:
+            except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
                     f"xAI Realtime response did not finish within {timeout}s",
                     events_seen=[],
@@ -201,7 +201,7 @@ class XAIRealtimeVoiceClient:
                     ),
                     timeout=timeout,
                 )
-            except TimeoutError as exc:
+            except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
                     f"xAI Realtime response did not finish within {timeout}s",
                     events_seen=[],
@@ -274,7 +274,7 @@ class XAIRealtimeVoiceClient:
                     ),
                     timeout=timeout,
                 )
-            except TimeoutError as exc:
+            except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
                     f"xAI Realtime response did not finish within {timeout}s",
                     events_seen=[],
@@ -444,7 +444,7 @@ class XAIRealtimeVoiceClient:
                 raw = await asyncio.wait_for(anext(iterator), timeout=read_timeout) if read_timeout is not None else await anext(iterator)
             except StopAsyncIteration:
                 break
-            except TimeoutError as exc:
+            except (TimeoutError, asyncio.TimeoutError) as exc:
                 if bytes_written == 0:
                     limit = first_audio_timeout if first_audio_timeout is not None else timeout
                     message = f"xAI Realtime emitted no audio within {limit}s"

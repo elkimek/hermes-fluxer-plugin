@@ -744,7 +744,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                             participant_identity_prefix=args.participant_identity_prefix,
                             timeout=args.capture_timeout,
                         )
-                except TimeoutError:
+                except (TimeoutError, asyncio.TimeoutError):
                     turn = {
                         "turn": turn_no,
                         "published": False,
@@ -934,7 +934,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 except BargeInInterrupt:
                     logger.info("Barge-in interrupted STT-backed voice turn %s", turn_no)
                     if barge_in_capture.event.is_set():
-                        with contextlib.suppress(TimeoutError):
+                        with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
                             await asyncio.wait_for(
                                 barge_in_capture.ready.wait(),
                                 timeout=getattr(args, "barge_in_capture_timeout", 2.0),

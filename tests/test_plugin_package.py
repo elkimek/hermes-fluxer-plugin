@@ -53,6 +53,21 @@ def test_voice_env_surface_is_declared_and_documented():
     assert used - documented == set()
 
 
+def test_asyncio_wait_for_timeout_handlers_are_python310_safe():
+    for path in (
+        "xai_realtime.py",
+        "livekit_bridge.py",
+        "scripts/fluxer_xai_room_loop.py",
+        "scripts/fluxer_stt_voice_loop.py",
+    ):
+        source = (ROOT / path).read_text(encoding="utf-8")
+        assert "except TimeoutError" not in source
+        assert "contextlib.suppress(TimeoutError)" not in source
+    for path in ("scripts/fluxer_xai_room_loop.py", "scripts/fluxer_stt_voice_loop.py"):
+        source = (ROOT / path).read_text(encoding="utf-8")
+        assert "contextlib.suppress(TimeoutError, asyncio.TimeoutError)" in source
+
+
 def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     for key in (
         "FLUXER_VOICE_ENABLED",

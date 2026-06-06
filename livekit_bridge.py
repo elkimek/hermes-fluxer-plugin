@@ -81,7 +81,7 @@ async def _maybe_await(value: Any) -> Any:
 async def _wait_for_source_playout(source: Any, *, label: str, timeout: float = 5.0) -> None:
     try:
         await asyncio.wait_for(_maybe_await(source.wait_for_playout()), timeout=timeout)
-    except TimeoutError:
+    except (TimeoutError, asyncio.TimeoutError):
         logger.warning("Fluxer LiveKit %s playout wait timed out; closing anyway", label)
 
 
@@ -101,7 +101,7 @@ async def _wait_for_livekit_subscription(publication: Any, *, timeout: float = 5
             getattr(publication, "muted", "<unknown>"),
         )
         return True
-    except TimeoutError:
+    except (TimeoutError, asyncio.TimeoutError):
         logger.warning(
             "Fluxer LiveKit local track had no subscriber before timeout sid=%s source=%s kind=%s muted=%s timeout=%.1fs",
             getattr(publication, "sid", "<none>"),
