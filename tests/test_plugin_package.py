@@ -538,6 +538,38 @@ async def test_voice_server_update_bridge_handler_receives_raw_token_safely(monk
 
 
 @pytest.mark.asyncio
+async def test_voice_state_update_handler_receives_user_join_and_leave(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    received = []
+
+    adapter.set_voice_state_update_handler(lambda raw: received.append(raw))
+
+    await adapter._handle_gateway_dispatch(
+        {
+            "op": 0,
+            "t": "VOICE_STATE_UPDATE",
+            "d": {"guild_id": "guild-1", "channel_id": "voice-1", "user_id": "user-1"},
+        }
+    )
+    await adapter._handle_gateway_dispatch(
+        {
+            "op": 0,
+            "t": "VOICE_STATE_UPDATE",
+            "d": {"guild_id": "guild-1", "channel_id": None, "user_id": "user-1"},
+        }
+    )
+
+    assert received == [
+        {"guild_id": "guild-1", "channel_id": "voice-1", "user_id": "user-1"},
+        {"guild_id": "guild-1", "channel_id": None, "user_id": "user-1"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_gateway_ready_event_is_set_on_ready_dispatch(monkeypatch):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)

@@ -674,6 +674,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._pending_voice_joins: Dict[str, Dict[str, Any]] = {}
         self._last_voice_server_update: Optional[Dict[str, Any]] = None
         self._voice_server_update_handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Any]] = None
+        self._voice_state_update_handler: Optional[Callable[[Dict[str, Any]], Any]] = None
         self._gateway_ready_event = asyncio.Event()
 
     async def connect(self) -> bool:
@@ -2119,6 +2120,27 @@ class FluxerAdapter(BasePlatformAdapter):
         """
         self._voice_server_update_handler = handler
 
+    def set_voice_state_update_handler(
+        self,
+        handler: Optional[Callable[[Dict[str, Any]], Any]],
+    ) -> None:
+        """Register a callback for user VOICE_STATE_UPDATE events.
+
+        The handler receives the raw, non-token voice-state payload so a local
+        supervisor can react to a target user joining/leaving voice channels.
+        """
+        self._voice_state_update_handler = handler
+
+    async def _handle_voice_state_update(self, data: Dict[str, Any]) -> None:
+        if self._voice_state_update_handler is None:
+            return
+        try:
+            result = self._voice_state_update_handler(dict(data))
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            logger.warning("Fluxer voice-state update handler failed: %s", exc)
+
     async def _handle_voice_server_update(self, data: Dict[str, Any]) -> None:
         """Capture Fluxer LiveKit server metadata without retaining the token."""
         guild_id = data.get("guild_id")
@@ -2195,6 +2217,9 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         if event_name == "VOICE_SERVER_UPDATE":
             await self._handle_voice_server_update(data)
+            return
+        if event_name == "VOICE_STATE_UPDATE":
+            await self._handle_voice_state_update(data)
             return
         if event_name in {"MESSAGE_REACTION_ADD", "REACTION_ADD", "MESSAGE_REACTION_CREATE"}:
             await self._handle_reaction_add(data)
