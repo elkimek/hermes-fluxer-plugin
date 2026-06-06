@@ -508,6 +508,157 @@ async def test_stt_voice_loop_surfaces_livekit_connect_failure_without_connect_t
 
 
 @pytest.mark.asyncio
+async def test_stt_voice_loop_returns_json_when_voice_server_update_times_out(monkeypatch, tmp_path):
+    sends = []
+
+    class FakeAdapter:
+        def __init__(self, config):
+            pass
+
+        def set_voice_server_update_handler(self, handler):
+            pass
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            sends.append((channel_id, kwargs))
+            return True
+
+        async def disconnect(self):
+            sends.append(("adapter_disconnect", {}))
+
+    class FakeBridge:
+        def __init__(self, auto_subscribe=True):
+            pass
+
+        async def disconnect(self):
+            sends.append(("bridge_disconnect", {}))
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("XAI_API_KEY", "xai")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
+
+    args = parse_args(
+        [
+            "--channel-id",
+            "voice-1",
+            "--guild-id",
+            "guild-1",
+            "--connect-timeout",
+            "0.01",
+            "--voice-context-file",
+            str(tmp_path / "missing-context.md"),
+        ]
+    )
+
+    result = await run_stt_voice_loop(args)
+
+    assert result["error"] == "TimeoutError"
+    assert "voice server update" in result["message"]
+    assert sends[0] == ("voice-1", {"guild_id": "guild-1", "self_mute": True, "self_deaf": False})
+    assert (None, {"guild_id": "guild-1", "connection_id": None}) in sends
+
+
+@pytest.mark.asyncio
+async def test_stt_voice_loop_returns_json_when_max_runtime_times_out(monkeypatch, tmp_path):
+    sends = []
+    release_capture = asyncio.Event()
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+            self.task = None
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            sends.append((channel_id, kwargs))
+            if channel_id is not None:
+                assert self.handler is not None
+                self.task = asyncio.create_task(
+                    self.handler(
+                        {
+                            "endpoint": "wss://voice.example",
+                            "token": "secret-token",
+                            "guild_id": kwargs.get("guild_id"),
+                            "channel_id": channel_id,
+                            "connection_id": "conn-slow",
+                        },
+                        {"connection_id": "conn-slow", "has_token": True},
+                    )
+                )
+            return True
+
+        async def disconnect(self):
+            sends.append(("adapter_disconnect", {}))
+
+    class FakeBridge:
+        def __init__(self, auto_subscribe=True):
+            pass
+
+        async def connect_from_voice_server_update(self, raw_update):
+            return SimpleNamespace(
+                endpoint=raw_update["endpoint"],
+                guild_id=raw_update["guild_id"],
+                channel_id=raw_update["channel_id"],
+                connection_id=raw_update["connection_id"],
+                room_name="room",
+                participant_identity="bot_conn-slow",
+            )
+
+        async def disconnect(self):
+            sends.append(("bridge_disconnect", {}))
+            release_capture.set()
+
+    async def slow_capture(*args, **kwargs):
+        await release_capture.wait()
+        raise TimeoutError
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("XAI_API_KEY", "xai")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._capture_one_speech_segment", slow_capture)
+
+    args = parse_args(
+        [
+            "--channel-id",
+            "voice-1",
+            "--guild-id",
+            "guild-1",
+            "--max-turns",
+            "1",
+            "--initial-settle-seconds",
+            "0",
+            "--max-runtime-seconds",
+            "0.01",
+            "--voice-context-file",
+            str(tmp_path / "missing-context.md"),
+        ]
+    )
+
+    result = await run_stt_voice_loop(args)
+    await asyncio.sleep(0)
+
+    assert result["error"] == "TimeoutError"
+    assert "max runtime" in result["message"]
+    assert result["connection"]["connection_id"] == "conn-slow"
+    assert (None, {"guild_id": "guild-1", "connection_id": "conn-slow"}) in sends
+
+
+@pytest.mark.asyncio
 async def test_stt_voice_loop_fails_before_voice_state_when_gateway_ready_times_out(monkeypatch, tmp_path):
     sends = []
 

@@ -132,6 +132,35 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
     assert env["FLUXER_VOICE_STOP_TIMEOUT_SECONDS"] == "2"
 
 
+def test_fluxer_voice_yaml_config_bridge_ignores_legacy_top_level_vad_timeouts(monkeypatch):
+    for key in (
+        "FLUXER_VOICE_FRAME_MS",
+        "FLUXER_VOICE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_START_COOLDOWN_SECONDS",
+        "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    fluxer_adapter._apply_yaml_config(
+        {},
+        {
+            "voice": {
+                "frame_ms": 99,
+                "energy_threshold": 999,
+                "start_cooldown_seconds": 99,
+                "stop_timeout_seconds": 99,
+                "vad": {"frame_ms": 20, "energy_threshold": 300},
+                "timeouts": {"start_cooldown_seconds": 5, "stop_timeout_seconds": 2},
+            }
+        },
+    )
+
+    assert os.environ["FLUXER_VOICE_FRAME_MS"] == "20"
+    assert os.environ["FLUXER_VOICE_ENERGY_THRESHOLD"] == "300"
+    assert os.environ["FLUXER_VOICE_START_COOLDOWN_SECONDS"] == "5"
+    assert os.environ["FLUXER_VOICE_STOP_TIMEOUT_SECONDS"] == "2"
+
+
 class _FakeVoiceProcess:
     pid = 4242
 

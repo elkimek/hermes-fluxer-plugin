@@ -2681,10 +2681,6 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "max_turns": "FLUXER_VOICE_MAX_TURNS",
         "initial_settle_seconds": "FLUXER_VOICE_INITIAL_SETTLE_SECONDS",
         "sample_rate": "FLUXER_VOICE_SAMPLE_RATE",
-        "frame_ms": "FLUXER_VOICE_FRAME_MS",
-        "energy_threshold": "FLUXER_VOICE_ENERGY_THRESHOLD",
-        "start_cooldown_seconds": "FLUXER_VOICE_START_COOLDOWN_SECONDS",
-        "stop_timeout_seconds": "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
     }
     for key, env_name in voice_scalar_env.items():
         if key in voice:
