@@ -118,6 +118,27 @@ def looks_like_clipped_non_english_noise(transcript: str) -> bool:
     return lower in {"e aí", "je to", "je to pračka", "ahoj", "dobře"}
 
 
+def is_voice_stop_request(transcript: str) -> bool:
+    """Return true when Elkim clearly asks the live voice loop to stop."""
+
+    lower = " ".join((transcript or "").lower().split()).strip(" .!?…")
+    if not lower:
+        return False
+    stop_phrases = (
+        "we can stop here",
+        "let's stop here",
+        "stop here",
+        "stop the voice chat",
+        "stop voice chat",
+        "end the voice chat",
+        "end voice chat",
+        "that's enough",
+        "we are done",
+        "i'm done talking",
+    )
+    return any(phrase in lower for phrase in stop_phrases)
+
+
 def normalize_voice_transcript(transcript: str) -> str:
     """Drop non-spoken context wrappers before routing STT text to Hermes.
 
@@ -388,6 +409,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     append_jsonl(args.turn_log_jsonl, turn)
                     continue
 
+                should_stop_after_reply = is_voice_stop_request(transcript)
                 brain_started = time.monotonic()
                 if args.brain_provider == "hermes":
                     reply_text = hermes_chat_completion(transcript, history=history, args=args)
@@ -400,7 +422,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 voice = XAIRealtimeVoiceClient(
                     sample_rate=args.sample_rate,
                     voice=args.voice,
-                    instructions="Speak Žofka's answer naturally, briefly, and without extra preamble. One short sentence, under 8 words when possible.",
+                    instructions="Speak Žofka's answer naturally, briefly, and without extra preamble. One short sentence, under 8 words when possible. Use subtle xAI speech effects sparingly, like <soft>, [breath], or [chuckle], only when they improve the feeling.",
                 )
                 xai_started = time.monotonic()
                 first_audio_seconds: float | None = None
@@ -457,6 +479,9 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 result["published_turn_count"] += 1
                 result["turns"].append(turn)
                 append_jsonl(args.turn_log_jsonl, turn)
+                if should_stop_after_reply:
+                    result["stop_requested"] = True
+                    break
 
             result["turn_count"] = len(result["turns"])
         except Exception as exc:

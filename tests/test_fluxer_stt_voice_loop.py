@@ -8,6 +8,7 @@ from scripts.fluxer_stt_voice_loop import (
     build_answer_prompt,
     build_hermes_messages,
     compose_system_prompt,
+    is_voice_stop_request,
     load_env_file,
     load_voice_context_cache,
     looks_like_clipped_non_english_noise,
@@ -85,6 +86,13 @@ def test_build_hermes_messages_does_not_treat_memory_context_as_user_speech():
     )
 
     assert messages[-1] == {"role": "user", "content": "Improve it"}
+
+
+def test_is_voice_stop_request_detects_clear_stop_phrases():
+    assert is_voice_stop_request("Okay, we can stop here")
+    assert is_voice_stop_request("let's stop the voice chat")
+    assert is_voice_stop_request("that's enough")
+    assert not is_voice_stop_request("stop asking generic questions")
 
 
 def test_looks_like_clipped_non_english_noise_rejects_short_vad_hallucinations():
