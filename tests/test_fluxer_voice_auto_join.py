@@ -47,6 +47,11 @@ def test_supervisor_builds_voice_loop_command_with_target_prefix():
     assert ["--participant-identity-prefix", "user_user-1_"] == cmd[
         cmd.index("--participant-identity-prefix") : cmd.index("--participant-identity-prefix") + 2
     ]
+    assert ["--silence-ms", "850"] == cmd[cmd.index("--silence-ms") : cmd.index("--silence-ms") + 2]
+    assert ["--end-padding-ms", "180"] == cmd[cmd.index("--end-padding-ms") : cmd.index("--end-padding-ms") + 2]
+    assert ["--max-segment-seconds", "9.0"] == cmd[
+        cmd.index("--max-segment-seconds") : cmd.index("--max-segment-seconds") + 2
+    ]
 
 
 @pytest.mark.asyncio

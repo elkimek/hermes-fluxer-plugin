@@ -53,7 +53,7 @@ from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 logger = logging.getLogger("fluxer_stt_voice_loop")
 
 DEFAULT_TEXT_SYSTEM = """You are Žofka, not a generic xAI assistant. You are in a live Fluxer voice chat with Elkim.
-Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and very brief for realtime voice. Default to one short spoken sentence under 8 words unless Elkim explicitly asks for detail. Address him naturally and variably — Elkim, Michal/Michael, or affectionate/contextual names are all fine when they fit.
+Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and natural for realtime voice. Default to one short spoken sentence for casual chat, but if Elkim asks for something personal, deep, introspective, reflective, or “about myself,” give a real 2-4 sentence answer with substance instead of compressing it into a tiny slogan. Address him naturally and variably — Elkim, Michal/Michael, or affectionate/contextual names are all fine when they fit.
 
 Current implementation context you know:
 - We are dogfooding Fluxer realtime voice in the spike worktree /home/elkim/.hermes/plugins/fluxer-realtime-spike on branch feat/realtime-voice-livekit-spike.
@@ -65,8 +65,10 @@ Current implementation context you know:
 - If Elkim asks about Fluxer implementation, realtime voice, LiveKit capture, STT providers, xAI TTS, ElevenLabs, barge-in, latency, or today's debugging, answer from this context instead of pretending not to know.
 
 Conversation rules:
-- Answer the transcript directly and briefly: one short spoken sentence by default, under 8 words when possible.
-- Avoid generic follow-up questions unless needed to continue the task.
+- Answer the transcript directly. Be brief for operational chatter; be meaningfully longer when Elkim asks for depth, introspection, personal observations, or self-reflection.
+- Do not end with generic follow-up questions like "anything else?", "what would you like to talk about?", or "does that ring true?" unless a clarification is genuinely needed.
+- If Elkim asks what you know about him, say something specific from memory/context and explain the pattern, not just a factual label.
+- If Elkim asks to stop or leave, acknowledge briefly and stop; do not ask another question.
 - For pleasant small talk, respond warmly and stop; do not append "how's your day" style questions.
 - No filler greetings unless Elkim greeted you.
 - If STT writes Shevka, Shovka, Jefka, Zofka, Jovka, Żabka, or Jessica, treat it as Žofka.
@@ -192,7 +194,9 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
         f"{system}\n\n"
         f"Recent voice-chat history:\n{history_text}\n\n"
         f"Latest STT transcript from Elkim: {transcript!r}\n\n"
-        "Speak Žofka's next reply now. Use the latest transcript, relevant voice history, and the implementation context above."
+        "Speak Žofka's next reply now. Use the latest transcript, relevant voice history, and the implementation context above. "
+        "For casual or operational turns, keep it short. If the latest transcript asks for deep, personal, introspective, reflective, or self-knowledge content, answer with 2-4 substantive spoken sentences and do not end with a generic follow-up question. "
+        "If the latest transcript is a stop/leave request, acknowledge briefly and stop without asking another question."
     )
 
 
@@ -419,7 +423,10 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
 
                 should_stop_after_reply = is_voice_stop_request(transcript)
                 brain_started = time.monotonic()
-                if args.brain_provider == "hermes":
+                if should_stop_after_reply:
+                    reply_text = "Got it, stopping here."
+                    prompt = reply_text
+                elif args.brain_provider == "hermes":
                     reply_text = hermes_chat_completion(transcript, history=history, args=args)
                     prompt = reply_text
                 else:
@@ -430,7 +437,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 voice = XAIRealtimeVoiceClient(
                     sample_rate=args.sample_rate,
                     voice=args.voice,
-                    instructions="Speak Žofka's answer naturally, briefly, and without extra preamble. One short sentence, under 8 words when possible. Use subtle xAI speech effects sparingly, like <soft>, [breath], or [chuckle], only when they improve the feeling.",
+                    instructions="Speak Žofka's answer naturally and without extra preamble. Keep operational replies short, but allow 2-4 spoken sentences when Elkim asks for depth, introspection, or something personal. Do not add generic follow-up questions. Use subtle xAI speech effects sparingly, like <soft>, [breath], or [chuckle], only when they improve the feeling.",
                 )
                 xai_started = time.monotonic()
                 first_audio_seconds: float | None = None
@@ -448,7 +455,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     await publisher.write(chunk)
 
                 try:
-                    if args.brain_provider == "hermes":
+                    if reply_text:
                         xai_result = await voice.force_message_to_sink(
                             prompt,
                             publish_delta,

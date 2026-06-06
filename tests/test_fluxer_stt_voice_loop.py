@@ -40,9 +40,10 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
     assert "xAI Eve TTS" in prompt
     assert "Fluxer implementation" in prompt
     assert "Speak English by default" in prompt
-    assert "under 8 words" in prompt
     assert "Do not switch to Czech" in prompt
-    assert "No filler greetings" in prompt
+    assert "deep, personal" in prompt
+    assert "2-4 substantive spoken sentences" in prompt
+    assert "do not end with a generic follow-up question" in prompt
 
 
 def test_build_hermes_messages_preserves_history_and_latest_transcript():

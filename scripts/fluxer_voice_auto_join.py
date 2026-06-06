@@ -106,6 +106,14 @@ class FluxerVoiceAutoJoinSupervisor:
             str(self.args.max_turns),
             "--capture-timeout",
             str(self.args.capture_timeout),
+            "--silence-ms",
+            str(self.args.silence_ms),
+            "--end-padding-ms",
+            str(self.args.end_padding_ms),
+            "--min-segment-ms",
+            str(self.args.min_segment_ms),
+            "--max-segment-seconds",
+            str(self.args.max_segment_seconds),
             "--max-runtime-seconds",
             str(self.args.max_runtime_seconds),
             "--turn-log-jsonl",
@@ -215,6 +223,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--voice", default="eve")
     parser.add_argument("--max-turns", type=int, default=50)
     parser.add_argument("--capture-timeout", type=float, default=90.0)
+    parser.add_argument("--silence-ms", type=int, default=850)
+    parser.add_argument("--end-padding-ms", type=int, default=180)
+    parser.add_argument("--min-segment-ms", type=int, default=1200)
+    parser.add_argument("--max-segment-seconds", type=float, default=9.0)
     parser.add_argument("--max-runtime-seconds", type=float, default=3600.0)
     parser.add_argument("--connect-timeout", type=float, default=30.0)
     parser.add_argument("--start-cooldown-seconds", type=float, default=5.0)
