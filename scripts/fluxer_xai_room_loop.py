@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -42,6 +43,17 @@ logger = logging.getLogger("fluxer_xai_room_loop")
 
 def env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _redact_exception_message(exc: Exception, *secrets: str | None) -> str:
+    message = str(exc) or repr(exc)
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[redacted-token]")
+    message = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted-token]", message)
+    message = re.sub(r"token=([A-Za-z0-9._~+/=-]+)", "token=[redacted-token]", message, flags=re.IGNORECASE)
+    message = re.sub(r'("token"\s*:\s*")([^"]+)(")', r"\1[redacted-token]\3", message, flags=re.IGNORECASE)
+    return message[:500]
 
 
 class BargeInInterrupt(Exception):
@@ -705,7 +717,7 @@ async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         if close_chunks is not None:
             await close_chunks()
         publish_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
             await publish_task
         if not getattr(publisher, "interrupted", False):
             await publisher.close(wait_for_playout=False, flush_remainder=False)
@@ -772,7 +784,7 @@ async def run(args: argparse.Namespace) -> int:
             connected.set()
         except Exception as exc:  # token intentionally not included
             result["error"] = type(exc).__name__
-            result["message"] = str(exc)
+            result["message"] = _redact_exception_message(exc, str(raw_update.get("token") or ""))
             connected.set()
 
     adapter.set_voice_server_update_handler(on_voice_server_update)

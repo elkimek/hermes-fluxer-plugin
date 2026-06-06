@@ -586,3 +586,20 @@ async def test_conversation_loop_closes_publisher_when_enter_fails(monkeypatch):
     assert bridge.publisher.closed is True
     assert result["turns"][0]["published"] is False
     assert result["turns"][0]["error"] == "RuntimeError: publish failed"
+
+
+def test_redact_exception_message_removes_livekit_tokens():
+    exc = RuntimeError('connect failed Bearer abc.def token=secret123 {"token":"json-secret"}')
+
+    message = room_loop._redact_exception_message(exc, "abc.def", "secret123", "json-secret")
+
+    assert "abc.def" not in message
+    assert "secret123" not in message
+    assert "json-secret" not in message
+    assert "[redacted-token]" in message
+
+
+def test_diagnose_barge_in_publish_task_cleanup_suppresses_closed_publisher_race():
+    source = (room_loop.ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text(encoding="utf-8")
+
+    assert "contextlib.suppress(asyncio.CancelledError, RuntimeError)" in source
