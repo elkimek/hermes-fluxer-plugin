@@ -513,3 +513,76 @@ async def test_conversation_loop_exits_cleanly_when_remote_stream_ends(monkeypat
 
     assert result["turns"] == []
     assert result["turn_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_loop_closes_publisher_when_enter_fails(monkeypatch):
+    args = argparse.Namespace(
+        max_runtime_seconds=10.0,
+        max_turns=1,
+        sample_rate=1000,
+        frame_ms=20,
+        participant_identity=None,
+        energy_threshold=350,
+        silence_ms=80,
+        end_padding_ms=20,
+        min_segment_ms=60,
+        max_segment_seconds=2.0,
+        disable_wake_gate=True,
+        xai_model="grok-voice-latest",
+        xai_voice="eve",
+        xai_instructions="test",
+        wake_gate_instructions="gate",
+        xai_timeout=5.0,
+        xai_first_audio_timeout=5.0,
+        disable_barge_in=True,
+        barge_in_energy_threshold=700,
+        barge_in_min_ms=60,
+        barge_in_capture_timeout=2.0,
+    )
+
+    class FailingPublisher:
+        interrupted = False
+
+        def __init__(self):
+            self.closed = False
+
+        async def __aenter__(self):
+            raise RuntimeError("publish failed")
+
+        async def close(self, **kwargs):
+            self.closed = True
+
+    class FakeBridge:
+        def __init__(self):
+            self.publisher = FailingPublisher()
+
+        def iter_remote_audio_pcm16(self, **kwargs):
+            return FakeChunkIterator(
+                [
+                    pcm16(1200, 20),
+                    pcm16(1200, 20),
+                    pcm16(1200, 20),
+                    pcm16(1200, 20),
+                    pcm16(0, 20),
+                    pcm16(0, 20),
+                    pcm16(0, 20),
+                    pcm16(0, 20),
+                ]
+            )
+
+        def pcm16_publisher(self, **kwargs):
+            return self.publisher
+
+    class FakeXAI:
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(room_loop, "XAIRealtimeVoiceClient", FakeXAI)
+    bridge = FakeBridge()
+
+    result = await room_loop._conversation_loop(args, bridge)
+
+    assert bridge.publisher.closed is True
+    assert result["turns"][0]["published"] is False
+    assert result["turns"][0]["error"] == "RuntimeError: publish failed"

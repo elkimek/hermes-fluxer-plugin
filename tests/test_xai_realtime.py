@@ -70,7 +70,7 @@ def pcm_delta(data: bytes):
 
 
 @pytest.mark.asyncio
-async def test_xai_realtime_public_sink_methods_timeout_session_setup(monkeypatch):
+async def test_xai_realtime_public_sink_methods_timeout_session_setup(monkeypatch, tmp_path):
     opened = []
 
     async def fake_connect(url, *, api_key):
@@ -94,6 +94,18 @@ async def test_xai_realtime_public_sink_methods_timeout_session_setup(monkeypatc
 
     with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="did not finish within 0.001s"):
         await client.audio_response_from_pcm16_to_sink(b"\x01\x00", sink, timeout=0.001)
+    assert opened[-1].closed is True
+
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="did not finish within 0.001s"):
+        await client.text_response_to_wav("hello", tmp_path / "text.wav", timeout=0.001)
+    assert opened[-1].closed is True
+
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="did not finish within 0.001s"):
+        await client.force_message_to_wav("hello", tmp_path / "force.wav", timeout=0.001)
+    assert opened[-1].closed is True
+
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="did not finish within 0.001s"):
+        await client.audio_response_from_pcm16(b"\x01\x00", tmp_path / "audio.wav", timeout=0.001)
     assert opened[-1].closed is True
 
 
