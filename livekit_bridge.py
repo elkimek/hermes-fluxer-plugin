@@ -584,6 +584,17 @@ class FluxerLiveKitSmokeBridge:
         if room is None:
             raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
 
+        def remove_track_subscribed_handler() -> None:
+            off = getattr(room, "off", None)
+            if callable(off):
+                with contextlib.suppress(Exception):
+                    off("track_subscribed", on_track_subscribed)
+                    return
+            remove_listener = getattr(room, "remove_listener", None)
+            if callable(remove_listener):
+                with contextlib.suppress(Exception):
+                    remove_listener("track_subscribed", on_track_subscribed)
+
         async def generator() -> AsyncIterator[bytes]:
             room.on("track_subscribed", on_track_subscribed)
             for participant in getattr(room, "remote_participants", {}).values():
@@ -595,6 +606,7 @@ class FluxerLiveKitSmokeBridge:
                 while True:
                     yield await queue.get()
             finally:
+                remove_track_subscribed_handler()
                 for task in stream_tasks:
                     task.cancel()
                 for task in stream_tasks:

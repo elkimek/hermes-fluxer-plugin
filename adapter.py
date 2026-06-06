@@ -538,7 +538,10 @@ class FluxerVoiceSupervisorProcess:
             await asyncio.to_thread(proc.wait, 8)
         except subprocess.TimeoutExpired:
             self._kill_process(proc)
-            await asyncio.to_thread(proc.wait, 5)
+            try:
+                await asyncio.to_thread(proc.wait, 5)
+            except subprocess.TimeoutExpired:
+                logger.warning("Fluxer realtime voice supervisor did not exit after SIGKILL")
         logger.info("Fluxer realtime voice supervisor stopped")
 
     def _terminate_process(self, proc: subprocess.Popen) -> None:
@@ -2339,8 +2342,8 @@ class FluxerAdapter(BasePlatformAdapter):
             result = self._voice_state_update_handler(dict(data))
             if asyncio.iscoroutine(result):
                 await result
-        except Exception as exc:
-            logger.warning("Fluxer voice-state update handler failed: %s", exc)
+        except Exception:
+            logger.exception("Fluxer voice-state update handler failed")
 
     async def _handle_voice_server_update(self, data: Dict[str, Any]) -> None:
         """Capture Fluxer LiveKit server metadata without retaining the token."""

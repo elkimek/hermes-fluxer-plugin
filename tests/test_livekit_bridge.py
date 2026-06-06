@@ -31,6 +31,10 @@ class FakeRoom:
         self.handlers[event] = callback
         return callback
 
+    def off(self, event, callback=None):
+        if self.handlers.get(event) is callback:
+            self.handlers.pop(event, None)
+
     async def connect(self, url, token, options=None):
         self.connected.append((url, token, options))
 
@@ -381,4 +385,4 @@ async def test_collect_remote_audio_pcm16_from_existing_track(monkeypatch):
 
     assert len(pcm) == 480
     assert FakeAudioStream.tracks == [(track, 24000, 1, 20)]
-    assert room.handlers["track_subscribed"] is not None
+    assert "track_subscribed" not in room.handlers
