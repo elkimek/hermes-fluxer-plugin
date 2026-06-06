@@ -668,6 +668,4 @@ class FluxerLiveKitSmokeBridge:
         room = self._room
         self._room = None
         if room is not None:
-            result = room.disconnect()
-            if asyncio.iscoroutine(result):
-                await result
+            await _maybe_await(room.disconnect())

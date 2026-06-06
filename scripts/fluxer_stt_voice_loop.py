@@ -461,7 +461,7 @@ def build_full_brain_transcript(transcript: str, *, args: argparse.Namespace) ->
     return transcript, recall
 
 
-def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], args: argparse.Namespace) -> str:
+async def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], args: argparse.Namespace) -> str:
     api_key = os.getenv("API_SERVER_KEY", "").strip()
     if not api_key:
         raise RuntimeError("API_SERVER_KEY is required for Hermes brain mode")
@@ -488,8 +488,11 @@ def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], ar
             "Authorization": f"Bearer {api_key}",
         },
     )
-    with urllib.request.urlopen(req, timeout=args.hermes_timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    def _post_completion() -> dict[str, Any]:
+        with urllib.request.urlopen(req, timeout=args.hermes_timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    data = await asyncio.to_thread(_post_completion)
     content = data["choices"][0]["message"]["content"]
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("Hermes API returned empty assistant content")
@@ -693,7 +696,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     reply_text = voice_mode_ack(selected_brain_provider)
                     prompt = reply_text
                 elif selected_brain_provider == "hermes":
-                    reply_text = hermes_chat_completion(transcript, history=history, args=args)
+                    reply_text = await hermes_chat_completion(transcript, history=history, args=args)
                     prompt = reply_text
                 else:
                     prompt = build_answer_prompt(transcript, history=history, system=args.voice_system_prompt)

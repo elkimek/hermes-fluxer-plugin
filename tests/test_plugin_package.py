@@ -225,11 +225,15 @@ def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
     livekit_source = (ROOT / "livekit_bridge.py").read_text(encoding="utf-8")
     auto_join_source = (ROOT / "scripts" / "fluxer_voice_auto_join.py").read_text(encoding="utf-8")
     stt_loop_source = (ROOT / "scripts" / "fluxer_stt_voice_loop.py").read_text(encoding="utf-8")
+    xai_room_loop_source = (ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text(encoding="utf-8")
     adapter_source = (ROOT / "adapter.py").read_text(encoding="utf-8")
 
     assert "asyncio.timeout" not in livekit_source
     assert '"allow_all_users": True' not in auto_join_source
     assert '"allow_all_users": True' not in stt_loop_source
+    assert '"allow_all_users": True' not in xai_room_loop_source
+    assert "await asyncio.to_thread(_post_completion)" in stt_loop_source
+    assert "await _maybe_await(room.disconnect())" in livekit_source
     assert "logger.exception(\n                    \"Fluxer voice server update bridge handler failed" in adapter_source
 
 
