@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-HERMES_ROOT = Path(os.getenv("HERMES_AGENT_ROOT", "/home/elkim/.hermes/hermes-agent"))
+HERMES_ROOT = Path(os.getenv("HERMES_AGENT_ROOT", str(Path.home() / ".hermes" / "hermes-agent")))
 for candidate in (ROOT, HERMES_ROOT):
     if str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
@@ -36,6 +36,10 @@ def split_csv(value: str | None) -> set[str]:
     if not value:
         return set()
     return {part.strip() for part in value.split(",") if part.strip()}
+
+
+def env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def voice_state_user_id(data: dict[str, Any]) -> str:
@@ -180,6 +184,12 @@ class FluxerVoiceAutoJoinSupervisor:
 
 async def run(args: argparse.Namespace) -> int:
     load_env_file(Path(args.env_file).expanduser())
+    if not env_truthy("FLUXER_VOICE_ENABLED") or not env_truthy("FLUXER_VOICE_AUTO_JOIN"):
+        logger.info("Fluxer realtime voice auto-join is disabled; set FLUXER_VOICE_ENABLED=true and FLUXER_VOICE_AUTO_JOIN=true to enable")
+        return 0
+    if not args.channel_ids:
+        logger.info("Fluxer realtime voice auto-join has no configured channel IDs; refusing to join arbitrary voice rooms")
+        return 0
     bot_token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
     if not bot_token:
         raise RuntimeError("FLUXER_BOT_TOKEN is required")
@@ -210,28 +220,28 @@ async def run(args: argparse.Namespace) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Auto-join Fluxer voice when target user joins")
-    parser.add_argument("--target-user-ids", default=os.getenv("FLUXER_AUTO_JOIN_USER_IDS", "1503635769218148907"))
-    parser.add_argument("--channel-ids", default=os.getenv("FLUXER_AUTO_JOIN_CHANNEL_IDS", "1510905670319210500"))
-    parser.add_argument("--guild-ids", default=os.getenv("FLUXER_AUTO_JOIN_GUILD_IDS", "1510905670319210496"))
-    parser.add_argument("--participant-identity-prefix", default=os.getenv("FLUXER_AUTO_JOIN_PARTICIPANT_PREFIX", ""))
-    parser.add_argument("--python", default=sys.executable)
-    parser.add_argument("--env-file", default="/home/elkim/.hermes/.env")
-    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default="auto")
-    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="elevenlabs")
-    parser.add_argument("--stt-model", default="scribe_v2")
-    parser.add_argument("--elevenlabs-language-code", default="eng")
-    parser.add_argument("--voice", default="eve")
-    parser.add_argument("--max-turns", type=int, default=50)
-    parser.add_argument("--capture-timeout", type=float, default=90.0)
-    parser.add_argument("--silence-ms", type=int, default=850)
-    parser.add_argument("--end-padding-ms", type=int, default=180)
-    parser.add_argument("--min-segment-ms", type=int, default=1200)
-    parser.add_argument("--max-segment-seconds", type=float, default=9.0)
-    parser.add_argument("--max-runtime-seconds", type=float, default=3600.0)
-    parser.add_argument("--connect-timeout", type=float, default=30.0)
-    parser.add_argument("--start-cooldown-seconds", type=float, default=5.0)
-    parser.add_argument("--stop-timeout-seconds", type=float, default=8.0)
-    parser.add_argument("--turn-log-jsonl", default="/tmp/zofka_fluxer_auto_voice_turns.jsonl")
+    parser.add_argument("--target-user-ids", default=os.getenv("FLUXER_VOICE_TARGET_USER_IDS") or os.getenv("FLUXER_AUTO_JOIN_USER_IDS", ""))
+    parser.add_argument("--channel-ids", default=os.getenv("FLUXER_VOICE_CHANNEL_IDS") or os.getenv("FLUXER_AUTO_JOIN_CHANNEL_IDS", ""))
+    parser.add_argument("--guild-ids", default=os.getenv("FLUXER_VOICE_GUILD_IDS") or os.getenv("FLUXER_AUTO_JOIN_GUILD_IDS", ""))
+    parser.add_argument("--participant-identity-prefix", default=os.getenv("FLUXER_VOICE_PARTICIPANT_PREFIX") or os.getenv("FLUXER_AUTO_JOIN_PARTICIPANT_PREFIX", ""))
+    parser.add_argument("--python", default=os.getenv("FLUXER_VOICE_PYTHON", sys.executable))
+    parser.add_argument("--env-file", default=os.getenv("HERMES_ENV_FILE", str(Path.home() / ".hermes" / ".env")))
+    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default=os.getenv("FLUXER_VOICE_BRAIN_PROVIDER", "auto"))
+    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default=os.getenv("FLUXER_VOICE_STT_PROVIDER", "elevenlabs"))
+    parser.add_argument("--stt-model", default=os.getenv("FLUXER_VOICE_STT_MODEL", "scribe_v2"))
+    parser.add_argument("--elevenlabs-language-code", default=os.getenv("FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE", ""))
+    parser.add_argument("--voice", default=os.getenv("FLUXER_VOICE_TTS_VOICE", "eve"))
+    parser.add_argument("--max-turns", type=int, default=int(os.getenv("FLUXER_VOICE_MAX_TURNS", "50")))
+    parser.add_argument("--capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS", "90.0")))
+    parser.add_argument("--silence-ms", type=int, default=int(os.getenv("FLUXER_VOICE_SILENCE_MS", "850")))
+    parser.add_argument("--end-padding-ms", type=int, default=int(os.getenv("FLUXER_VOICE_END_PADDING_MS", "180")))
+    parser.add_argument("--min-segment-ms", type=int, default=int(os.getenv("FLUXER_VOICE_MIN_SEGMENT_MS", "1200")))
+    parser.add_argument("--max-segment-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_SEGMENT_SECONDS", "9.0")))
+    parser.add_argument("--max-runtime-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_RUNTIME_SECONDS", "3600.0")))
+    parser.add_argument("--connect-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS", "30.0")))
+    parser.add_argument("--start-cooldown-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_START_COOLDOWN_SECONDS", "5.0")))
+    parser.add_argument("--stop-timeout-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_STOP_TIMEOUT_SECONDS", "8.0")))
+    parser.add_argument("--turn-log-jsonl", default=os.getenv("FLUXER_VOICE_TURN_LOG_JSONL", "/tmp/hermes_fluxer_voice_auto_join_turns.jsonl"))
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 

@@ -22,6 +22,79 @@ def test_plugin_manifest_is_platform_plugin():
     assert manifest["kind"] == "platform"
     assert manifest["label"] == "Fluxer"
     assert {item["name"] for item in manifest["requires_env"]} == {"FLUXER_BOT_TOKEN"}
+    optional = {item["name"] for item in manifest["optional_env"]}
+    assert {
+        "FLUXER_VOICE_ENABLED",
+        "FLUXER_VOICE_AUTO_JOIN",
+        "FLUXER_VOICE_TARGET_USER_IDS",
+        "FLUXER_VOICE_CHANNEL_IDS",
+        "FLUXER_VOICE_BRAIN_PROVIDER",
+        "FLUXER_VOICE_STT_PROVIDER",
+        "FLUXER_VOICE_CONTEXT_FILE",
+    }.issubset(optional)
+
+
+def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
+    for key in (
+        "FLUXER_VOICE_ENABLED",
+        "FLUXER_VOICE_AUTO_JOIN",
+        "FLUXER_VOICE_TARGET_USER_IDS",
+        "FLUXER_VOICE_CHANNEL_IDS",
+        "FLUXER_VOICE_BRAIN_PROVIDER",
+        "FLUXER_VOICE_STT_PROVIDER",
+        "FLUXER_VOICE_SILENCE_MS",
+        "FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    fluxer_adapter._apply_yaml_config(
+        {},
+        {
+            "voice": {
+                "enabled": True,
+                "auto_join": True,
+                "target_user_ids": ["user-1", "user-2"],
+                "channel_ids": ["voice-1"],
+                "brain_provider": "auto",
+                "stt_provider": "elevenlabs",
+                "vad": {"silence_ms": 850},
+                "timeouts": {"capture_seconds": 90},
+            }
+        },
+    )
+
+    assert __import__("os").environ["FLUXER_VOICE_ENABLED"] == "true"
+    assert __import__("os").environ["FLUXER_VOICE_AUTO_JOIN"] == "true"
+    assert __import__("os").environ["FLUXER_VOICE_TARGET_USER_IDS"] == "user-1,user-2"
+    assert __import__("os").environ["FLUXER_VOICE_CHANNEL_IDS"] == "voice-1"
+    assert __import__("os").environ["FLUXER_VOICE_BRAIN_PROVIDER"] == "auto"
+    assert __import__("os").environ["FLUXER_VOICE_STT_PROVIDER"] == "elevenlabs"
+    assert __import__("os").environ["FLUXER_VOICE_SILENCE_MS"] == "850"
+    assert __import__("os").environ["FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS"] == "90"
+
+
+def test_public_tree_contains_no_private_voice_dogfood_defaults():
+    forbidden = [
+        "150363" + "5769218148907",
+        "151090" + "5670319210500",
+        "151090" + "5670319210496",
+        "/home/" + "elkim",
+        "VOICE_CONTEXT" + "_CACHE.md",
+    ]
+    checked = []
+    for path in ROOT.rglob("*"):
+        if not path.is_file() or ".git" in path.parts or "__pycache__" in path.parts:
+            continue
+        if path.suffix in {".pyc", ".wav"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        checked.append(path)
+        for item in forbidden:
+            assert item not in text, f"{item!r} leaked in {path.relative_to(ROOT)}"
+    assert checked
 
 
 def test_adapter_is_syntax_valid_and_registers_fluxer_platform():
@@ -586,21 +659,20 @@ async def test_gateway_ready_event_is_set_on_ready_dispatch(monkeypatch):
     assert await adapter.wait_until_gateway_ready(timeout=0.001) is True
 
 
-def test_xai_realtime_defaults_pin_english_not_spanish():
+def test_xai_realtime_defaults_are_generic_and_concise():
     source = (ROOT / "xai_realtime.py").read_text()
 
-    assert "Always answer in English" in source
-    assert "Do not answer in Spanish" in source
+    assert "configured assistant" in source
+    assert "default to English" in source
+    assert "Do not answer in Spanish" not in source
 
 
 def test_continuous_room_loop_script_has_noise_and_language_guardrails():
     source = (ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text()
 
-    assert "Always answer in English" in source
-    assert "Do not answer in Spanish" in source
+    assert "default to English" in source
     assert "Ignore background music" in source
-    assert "Jefka" in source
-    assert "obvious ASR confusion" in source
+    assert "clearly directed at the assistant" in source
     assert "WAKE_GATE_INSTRUCTIONS" in source
     assert "--disable-wake-gate" in source
     assert "RESPOND" in source

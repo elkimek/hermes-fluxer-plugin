@@ -12,7 +12,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Added
 
-- Continued the Fluxer realtime voice spike with `REALTIME_VOICE.md`, documenting the discovered LiveKit/opcode-4 voice handshake and the staged path toward a live Žofka voice-room bridge.
+- Continued the Fluxer realtime voice spike with `REALTIME_VOICE.md`, documenting the discovered LiveKit/opcode-4 voice handshake and the staged path toward a live assistant voice-room bridge.
 - Added tested gateway seams for future realtime voice work: `_build_voice_state_update_payload(...)` and `send_voice_state_update(...)` can send Fluxer `VOICE_STATE_UPDATE` payloads over the existing gateway websocket.
 - Added safe `VOICE_SERVER_UPDATE` capture for the spike path: the adapter tracks pending voice joins, records non-secret LiveKit endpoint/connection metadata, and only stores token presence — never the token itself.
 - Added an in-memory `VOICE_SERVER_UPDATE` bridge hook so a future LiveKit bridge can receive the raw ephemeral token payload without the adapter persisting or logging that token.
@@ -20,7 +20,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Added a muted/deaf `scripts/fluxer_livekit_smoke.py` probe for the first real Fluxer voice-room presence test.
 - Verified the presence-only LiveKit smoke path against hosted Fluxer without logging or storing the ephemeral token.
 - Added and verified low-amplitude sine-tone publishing to hosted Fluxer LiveKit for the first audible bot smoke path.
-- Added mono 16-bit PCM WAV publishing and verified a generated Žofka TTS clip through hosted Fluxer LiveKit.
+- Added mono 16-bit PCM WAV publishing and verified a generated assistant TTS clip through hosted Fluxer LiveKit.
 - Added a minimal xAI Realtime websocket client plus smoke-probe flags for generating Grok Voice audio and publishing it through Fluxer LiveKit.
 - Verified `grok-voice-latest` text-to-voice output through hosted Fluxer LiveKit with `xai_realtime_published: true`.
 - Added one-turn duplex smoke plumbing: Fluxer remote audio capture → xAI Realtime audio input → streamed Grok Voice PCM deltas → Fluxer LiveKit publish.
@@ -29,16 +29,30 @@ This project uses simple semantic versioning while the plugin is young:
 - Tightened realtime voice instructions to one short default answer and no multiple follow-up questions.
 - Added a first-audio timeout for streamed xAI responses so no-audio provider turns fail fast instead of blocking the room until the full response timeout.
 - Added barge-in interruption plumbing: sustained user speech during assistant output can clear the LiveKit audio queue, stop further xAI delta publishing, record an interrupted turn, and resume listening.
-- Added barge-in carryover: the interrupting utterance is captured as short-lived PCM, surfaced only as byte/duration diagnostics, and fed directly into the next xAI turn so Elkim does not need to repeat the interruption after Žofka stops.
+- Added barge-in carryover: the interrupting utterance is captured as short-lived PCM, surfaced only as byte/duration diagnostics, and fed directly into the next xAI turn so the user does not need to repeat the interruption after the assistant stops.
 - Hardened barge-in interruption after live testing showed assistant speech could continue: streamed xAI deltas are now checked between 20ms LiveKit frames, and interrupt stops/unpublishes the local LiveKit track in addition to clearing the audio queue.
 - Added `--diagnose-barge-in`, an audible LiveKit-only probe that keeps a local output track active while measuring remote mic RMS/detection, plus richer xAI failure messages for first-audio latency/debugging.
 - Fixed the xAI realtime audio-input path for captured Fluxer voice by sending captured PCM as an explicit `conversation.item.create` `input_audio` item before `response.create`; the older `input_audio_buffer.append`/`commit` path committed speech but did not produce responses for live Fluxer captures.
 - Added LiveKit subscriber confirmation before streaming local audio frames, so smoke tests now distinguish "track published" from "Fluxer client subscribed and can hear it".
-- Added `scripts/fluxer_stt_voice_loop.py`, a separate STT-backed realtime loop that targets Elkim's LiveKit participant prefix, captures a fixed audio window, transcribes with Hermes STT, prompts a text-grounded answer, and speaks it through xAI Voice back into Fluxer. This avoids the direct xAI audio-understanding path that live-tested as generic filler.
+- Added `scripts/fluxer_stt_voice_loop.py`, a separate STT-backed realtime loop that targets the user's LiveKit participant prefix, captures a fixed audio window, transcribes with Hermes STT, prompts a text-grounded answer, and speaks it through xAI Voice back into Fluxer. This avoids the direct xAI audio-understanding path that live-tested as generic filler.
 - Reduced STT-backed loop latency by shortening the reliable fixed capture window to 3s and streaming text-grounded xAI voice deltas directly into LiveKit instead of waiting for a full WAV before publishing; after live Groq/xAI tests proved fast but less accurate on Fluxer room captures, the default STT was restored to local `medium.en` for accuracy, with `--stt-provider groq|xai` still available as explicit overrides.
-- Added LiveKit participant-identity-prefix filtering so realtime capture can target Elkim's Fluxer user track (`user_<id>_*`) instead of listening to every remote audio source; targeted fixed-window STT verified the captured prompt as "Shevka, what is two past two?" while the unfiltered/VAD path produced generic/empty understanding.
+- Added LiveKit participant-identity-prefix filtering so realtime capture can target the user's Fluxer user track (`user_<id>_*`) instead of listening to every remote audio source; targeted fixed-window STT verified the captured prompt as "Shevka, what is two past two?" while the unfiltered/VAD path produced generic/empty understanding.
 - Added explicit `--stt-provider elevenlabs` support for ElevenLabs Scribe (`scribe_v2`) alongside local/Groq/xAI STT; live test was very fast (~0.86s STT) but misheard the Fluxer room capture as "Asia FC", confirming provider swaps are not enough and the next focus should be LiveKit capture timing/quality.
-- Hardened the STT-backed loop against non-spoken recalled-context wrappers by stripping `<memory-context>` and `[System note: ...]` blocks before prompting Hermes or writing safe turn summaries; this keeps live voice answers focused on what Elkim actually said.
+- Hardened the STT-backed loop against non-spoken recalled-context wrappers by stripping `<memory-context>` and `[System note: ...]` blocks before prompting Hermes or writing safe turn summaries; this keeps live voice answers focused on what the user actually said.
+- Added a production-safe realtime voice configuration surface: `FLUXER_VOICE_*` optional environment variables in `plugin.yaml`, plus equivalent `fluxer.voice` YAML mapping through the Hermes platform adapter.
+- Added regression coverage for the YAML-to-env bridge and for keeping private dogfood IDs, local paths, and deployment context files out of the public tree.
+
+### Changed
+
+- Realtime voice auto-join is now disabled by default and refuses to join arbitrary voice rooms unless explicitly enabled and scoped with configured channel IDs.
+- Replaced dogfood-specific voice defaults with generic assistant prompts, deployment-local context file support, safe home-relative paths, and environment-driven STT/TTS/VAD/timeout knobs.
+- Removed the tracked deployment-local voice context cache; operators should provide private context via `FLUXER_VOICE_CONTEXT_FILE` or `fluxer.voice.context_file`.
+
+### Verification
+
+- `python3 -m pytest -q` → 87 passed
+- `python3 -m compileall -q adapter.py livekit_bridge.py xai_realtime.py scripts tests`
+- Private dogfood grep audit for user IDs, voice/guild IDs, local paths, context-cache filename, and assistant-specific names → 0 shippable hits
 
 ## [0.1.1] - 2026-06-05
 

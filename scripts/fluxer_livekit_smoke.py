@@ -4,7 +4,7 @@
 Usage:
   FLUXER_BOT_TOKEN=... python scripts/fluxer_livekit_smoke.py --channel-id <voice-channel-id> [--guild-id <guild-id>]
 
-This script is intentionally a smoke probe, not the realtime Žofka loop. It:
+This script is intentionally a smoke probe, not the realtime the assistant loop. It:
 1. connects the standalone Fluxer adapter gateway,
 2. sends opcode-4 VOICE_STATE_UPDATE for the requested channel,
 3. waits for VOICE_SERVER_UPDATE,
@@ -54,7 +54,7 @@ async def run(args: argparse.Namespace) -> int:
     )
     generated_wav_path: str | None = None
     if args.xai_text:
-        generated_wav_path = str(Path(tempfile.gettempdir()) / "zofka_xai_realtime_fluxer.wav")
+        generated_wav_path = str(Path(tempfile.gettempdir()) / "fluxer_xai_realtime_fluxer.wav")
         xai = XAIRealtimeVoiceClient(model=args.xai_model, voice=args.xai_voice, instructions=args.xai_instructions)
         if args.xai_force_message:
             await xai.force_message_to_wav(args.xai_text, generated_wav_path, timeout=args.xai_timeout)
@@ -78,7 +78,7 @@ async def run(args: argparse.Namespace) -> int:
             if args.wav_path:
                 await bridge.publish_wav_file(args.wav_path)
             if generated_wav_path:
-                await bridge.publish_wav_file(generated_wav_path, track_name="zofka-xai-realtime")
+                await bridge.publish_wav_file(generated_wav_path, track_name="fluxer-xai-realtime")
             if args.post_publish_hold > 0:
                 await asyncio.sleep(args.post_publish_hold)
             result["safe_update"] = safe_update
@@ -150,7 +150,7 @@ def main() -> int:
     parser.add_argument("--xai-model", default="grok-voice-latest")
     parser.add_argument("--xai-voice", default="eve")
     parser.add_argument("--xai-timeout", type=float, default=30.0)
-    parser.add_argument("--xai-instructions", default="You are Žofka, warm, direct, and concise. Keep this voice reply short.")
+    parser.add_argument("--xai-instructions", default="You are the assistant, warm, direct, and concise. Keep this voice reply short.")
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 

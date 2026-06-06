@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-HERMES_ROOT = Path(os.getenv("HERMES_AGENT_ROOT", "/home/elkim/.hermes/hermes-agent"))
+HERMES_ROOT = Path(os.getenv("HERMES_AGENT_ROOT", str(Path.home() / ".hermes" / "hermes-agent")))
 for candidate in (ROOT, HERMES_ROOT):
     if str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
@@ -54,30 +54,22 @@ from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 logger = logging.getLogger("fluxer_stt_voice_loop")
 
-DEFAULT_TEXT_SYSTEM = """You are Žofka, not a generic xAI assistant. You are in a live Fluxer voice chat with Elkim.
-Answer as the same Žofka from the active Hermes session: warm, direct, technically aware, and natural for realtime voice. Default to one short spoken sentence for casual chat, but if Elkim asks for something personal, deep, introspective, reflective, or “about myself,” give a real 2-4 sentence answer with substance instead of compressing it into a tiny slogan. Address him naturally and variably — Elkim, Michal/Michael, or affectionate/contextual names are all fine when they fit.
+DEFAULT_TEXT_SYSTEM = """You are the configured Hermes assistant in a live Fluxer voice chat.
+Answer naturally for realtime speech: brief for operational turns, but not evasive when the user asks for substance. Use the latest transcript and recent voice-chat history. Do not claim platform history, private memory, files, or previous-session details unless they were provided to this turn as explicit recall context.
 
 Current implementation context you know:
-- We are dogfooding Fluxer realtime voice in the spike worktree /home/elkim/.hermes/plugins/fluxer-realtime-spike on branch feat/realtime-voice-livekit-spike.
-- The room path is Fluxer LiveKit capture → STT → text-grounded answer → xAI Eve TTS → LiveKit publish.
-- Best current stack: participant-targeted capture of Elkim's LiveKit identity prefix user_1503635769218148907_, no wake-name, ElevenLabs Scribe STT, xAI Eve TTS with light speech tags.
-- Voice channel id is 1510905670319210500, guild id is 1510905670319210496.
-- The wake-name “Žofka” poisons STT; in room mode, speech from Elkim's targeted track counts as addressed to you.
-- xAI speech tags available include [pause], [long-pause], [breath], [sigh], [chuckle], <soft>, <whisper>, <slow>, and <emphasis>; use them lightly, not theatrically.
-- If Elkim asks about Fluxer implementation, realtime voice, LiveKit capture, STT providers, xAI TTS, ElevenLabs, barge-in, latency, or today's debugging, answer from this context instead of pretending not to know.
-- If Elkim asks about a specific past day, date, previous session, transcript, or memory and this is not full Hermes brain with retrieved evidence, do not guess from cached context. Say you need full brain/session recall for that.
+- The room path is Fluxer LiveKit capture → STT → text-grounded answer → realtime TTS → LiveKit publish.
+- In room mode, participant-targeted capture can make a wake name unnecessary; if capture is explicitly targeted, speech from the configured participant counts as addressed to the assistant.
+- If asked about a specific past day, date, previous session, transcript, or memory and this is not full Hermes brain with retrieved evidence, do not guess from cached context. Say you need full brain/session recall for that.
 
 Conversation rules:
-- Answer the transcript directly. Be brief for operational chatter; be meaningfully longer when Elkim asks for depth, introspection, personal observations, or self-reflection.
-- Do not end with generic follow-up questions like "anything else?", "what would you like to talk about?", or "does that ring true?" unless a clarification is genuinely needed.
-- If Elkim asks what you know about him, say something specific from memory/context and explain the pattern, not just a factual label.
-- If Elkim asks to stop or leave, acknowledge briefly and stop; do not ask another question.
-- For pleasant small talk, respond warmly and stop; do not append "how's your day" style questions.
-- No filler greetings unless Elkim greeted you.
-- If STT writes Shevka, Shovka, Jefka, Zofka, Jovka, Żabka, or Jessica, treat it as Žofka.
+- Answer the transcript directly. Be brief for operational chatter; be meaningfully longer when the user asks for depth, introspection, personal observations, or self-reflection.
+- Do not end with generic follow-up questions unless a clarification is genuinely needed.
+- If the user asks to stop or leave, acknowledge briefly and stop; do not ask another question.
+- For pleasant small talk, respond warmly and stop.
+- No filler greetings unless the user greeted you.
 - Correct obvious ASR homophones when context is clear, e.g. "past", "plast", or "plastic" can mean "plus" in arithmetic.
-- Speak English by default. Do not switch to Czech just because STT produced Czech-looking syllables; use Czech only if Elkim explicitly asks for Czech or clearly speaks Czech.
-- Never use Spanish.
+- Default to English unless the user explicitly asks for another language or clearly speaks another language.
 """.strip()
 
 
@@ -125,7 +117,7 @@ def looks_like_clipped_non_english_noise(transcript: str) -> bool:
 
 
 def is_voice_stop_request(transcript: str) -> bool:
-    """Return true when Elkim clearly asks the live voice loop to stop."""
+    """Return true when the user clearly asks the live voice loop to stop."""
 
     lower = " ".join((transcript or "").lower().split()).strip(" .!?…")
     if not lower:
@@ -252,9 +244,9 @@ def normalize_voice_transcript(transcript: str) -> str:
     """Drop non-spoken context wrappers before routing STT text to Hermes.
 
     The live API may append recalled memory/context blocks beside a voice
-    transcript. Those are useful to the agent, but they are not something Elkim
-    said out loud; feeding them back as user speech makes Žofka answer the
-    wrapper instead of the actual utterance.
+    transcript. Those are useful to the agent, but they are not something the
+    user said out loud; feeding them back as user speech makes the assistant answer the
+    wrapper instead of the spoken turn.
     """
 
     cleaned = _MEMORY_CONTEXT_RE.sub(" ", transcript or "")
@@ -277,7 +269,7 @@ def compose_system_prompt(base: str = DEFAULT_TEXT_SYSTEM, *, voice_context_cach
         return base
     return (
         f"{base}\n\n"
-        "Cached in-RAM Žofka/Elkim context loaded once at voice-loop startup. "
+        "Cached deployment-local context loaded once at voice-loop startup. "
         "Use it as background, but answer the latest spoken transcript, not the cache itself.\n"
         f"{voice_context_cache}"
     )
@@ -292,15 +284,15 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
         user = (item.get("user") or "").strip()
         assistant = (item.get("assistant") or "").strip()
         if user:
-            history_lines.append(f"Elkim: {user}")
+            history_lines.append(f"the user: {user}")
         if assistant:
-            history_lines.append(f"Žofka: {assistant}")
+            history_lines.append(f"the assistant: {assistant}")
     history_text = "\n".join(history_lines) or "(none)"
     return (
         f"{system}\n\n"
         f"Recent voice-chat history:\n{history_text}\n\n"
-        f"Latest STT transcript from Elkim: {transcript!r}\n\n"
-        "Speak Žofka's next reply now. Use the latest transcript, relevant voice history, and the implementation context above. "
+        f"Latest STT transcript from the user: {transcript!r}\n\n"
+        "Speak the assistant's next reply now. Use the latest transcript, relevant voice history, and the implementation context above. "
         "For casual or operational turns, keep it short. If the latest transcript asks for deep, personal, introspective, reflective, or self-knowledge content, answer with 2-4 substantive spoken sentences and do not end with a generic follow-up question. "
         "If the latest transcript is a stop/leave request, acknowledge briefly and stop without asking another question."
     )
@@ -445,7 +437,7 @@ def collect_voice_session_recall(
 def build_full_brain_transcript(transcript: str, *, args: argparse.Namespace) -> tuple[str, str]:
     recall = collect_voice_session_recall(
         transcript,
-        db_path=getattr(args, "voice_session_db", "/home/elkim/.hermes/state.db"),
+        db_path=getattr(args, "voice_session_db", "~/.hermes/state.db"),
     )
     if not recall:
         return transcript, ""
@@ -625,7 +617,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     result["turns"].append(turn)
                     append_jsonl(args.turn_log_jsonl, turn)
                     continue
-                wav_path = Path(tempfile.gettempdir()) / f"zofka_stt_loop_input_{turn_no}.wav"
+                wav_path = Path(tempfile.gettempdir()) / f"fluxer_stt_loop_input_{turn_no}.wav"
                 write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
                 stt_started = time.monotonic()
                 stt_result = transcribe_with_provider(
@@ -687,14 +679,14 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 voice = XAIRealtimeVoiceClient(
                     sample_rate=args.sample_rate,
                     voice=args.voice,
-                    instructions="Speak Žofka's answer naturally and without extra preamble. Keep operational replies short, but allow 2-4 spoken sentences when Elkim asks for depth, introspection, or something personal. Do not add generic follow-up questions. Use subtle xAI speech effects sparingly, like <soft>, [breath], or [chuckle], only when they improve the feeling.",
+                    instructions="Speak the assistant's answer naturally and without extra preamble. Keep operational replies short, but allow 2-4 spoken sentences when the user asks for depth, introspection, or something personal. Do not add generic follow-up questions. Use subtle xAI speech effects sparingly, like <soft>, [breath], or [chuckle], only when they improve the feeling.",
                 )
                 xai_started = time.monotonic()
                 first_audio_seconds: float | None = None
                 publisher = bridge.pcm16_publisher(
                     sample_rate=args.sample_rate,
                     frame_ms=args.frame_ms,
-                    track_name=f"zofka-stt-loop-reply-{turn_no}",
+                    track_name=f"fluxer-stt-loop-reply-{turn_no}",
                 )
                 await publisher.__aenter__()
 
@@ -805,48 +797,48 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, default=3)
     parser.add_argument("--capture-mode", choices=("vad", "fixed"), default="vad")
     parser.add_argument("--capture-window-seconds", type=float, default=3.0)
-    parser.add_argument("--capture-timeout", type=float, default=25.0)
-    parser.add_argument("--initial-settle-seconds", type=float, default=0.8)
-    parser.add_argument("--sample-rate", type=int, default=24_000)
-    parser.add_argument("--frame-ms", type=int, default=20)
-    parser.add_argument("--energy-threshold", type=int, default=300)
-    parser.add_argument("--silence-ms", type=int, default=1500)
-    parser.add_argument("--end-padding-ms", type=int, default=300)
-    parser.add_argument("--min-segment-ms", type=int, default=1600)
-    parser.add_argument("--max-segment-seconds", type=float, default=12.0)
-    parser.add_argument("--voice", default="eve")
-    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default="auto")
-    parser.add_argument("--hermes-url", default="http://127.0.0.1:8642")
-    parser.add_argument("--hermes-model", default=os.getenv("API_SERVER_MODEL_NAME") or "Žofka")
-    parser.add_argument("--hermes-timeout", type=float, default=90.0)
-    parser.add_argument("--hermes-max-tokens", type=int, default=90)
-    parser.add_argument("--hermes-temperature", type=float, default=0.4)
-    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default="elevenlabs")
-    parser.add_argument("--stt-model", default="medium.en", help="STT model; ElevenLabs default scribe_v2, local default medium.en for accuracy, Groq default whisper-large-v3-turbo")
+    parser.add_argument("--capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS", "25.0")))
+    parser.add_argument("--initial-settle-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_INITIAL_SETTLE_SECONDS", "0.8")))
+    parser.add_argument("--sample-rate", type=int, default=int(os.getenv("FLUXER_VOICE_SAMPLE_RATE", "24000")))
+    parser.add_argument("--frame-ms", type=int, default=int(os.getenv("FLUXER_VOICE_FRAME_MS", "20")))
+    parser.add_argument("--energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_ENERGY_THRESHOLD", "300")))
+    parser.add_argument("--silence-ms", type=int, default=int(os.getenv("FLUXER_VOICE_SILENCE_MS", "1500")))
+    parser.add_argument("--end-padding-ms", type=int, default=int(os.getenv("FLUXER_VOICE_END_PADDING_MS", "300")))
+    parser.add_argument("--min-segment-ms", type=int, default=int(os.getenv("FLUXER_VOICE_MIN_SEGMENT_MS", "1600")))
+    parser.add_argument("--max-segment-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_SEGMENT_SECONDS", "12.0")))
+    parser.add_argument("--voice", default=os.getenv("FLUXER_VOICE_TTS_VOICE", "eve"))
+    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default=os.getenv("FLUXER_VOICE_BRAIN_PROVIDER", "auto"))
+    parser.add_argument("--hermes-url", default=os.getenv("FLUXER_VOICE_HERMES_URL", "http://127.0.0.1:8642"))
+    parser.add_argument("--hermes-model", default=os.getenv("FLUXER_VOICE_HERMES_MODEL") or os.getenv("API_SERVER_MODEL_NAME") or "Hermes")
+    parser.add_argument("--hermes-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_HERMES_TIMEOUT_SECONDS", "90.0")))
+    parser.add_argument("--hermes-max-tokens", type=int, default=int(os.getenv("FLUXER_VOICE_HERMES_MAX_TOKENS", "90")))
+    parser.add_argument("--hermes-temperature", type=float, default=float(os.getenv("FLUXER_VOICE_HERMES_TEMPERATURE", "0.4")))
+    parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default=os.getenv("FLUXER_VOICE_STT_PROVIDER", "elevenlabs"))
+    parser.add_argument("--stt-model", default=os.getenv("FLUXER_VOICE_STT_MODEL", "medium.en"), help="STT model; ElevenLabs commonly uses scribe_v2, local commonly uses medium.en, Groq commonly uses whisper-large-v3-turbo")
     parser.add_argument(
         "--elevenlabs-language-code",
-        default="eng",
-        help="Per-run ElevenLabs Scribe language_code override; use empty string for autodetect",
+        default=os.getenv("FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE", ""),
+        help="Per-run ElevenLabs Scribe language_code override; empty string allows autodetect",
     )
-    parser.add_argument("--xai-timeout", type=float, default=45.0)
-    parser.add_argument("--xai-first-audio-timeout", type=float, default=12.0)
-    parser.add_argument("--connect-timeout", type=float, default=30.0)
-    parser.add_argument("--max-runtime-seconds", type=float, default=180.0)
-    parser.add_argument("--env-file", default="/home/elkim/.hermes/.env")
+    parser.add_argument("--xai-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_XAI_TIMEOUT_SECONDS", "45.0")))
+    parser.add_argument("--xai-first-audio-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS", "12.0")))
+    parser.add_argument("--connect-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS", "30.0")))
+    parser.add_argument("--max-runtime-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_RUNTIME_SECONDS", "180.0")))
+    parser.add_argument("--env-file", default=os.getenv("HERMES_ENV_FILE", str(Path.home() / ".hermes" / ".env")))
     parser.add_argument(
         "--voice-context-file",
-        default=str(ROOT / "VOICE_CONTEXT_CACHE.md"),
-        help="Compact Žofka/Elkim context loaded once into RAM at startup for fast voice mode",
+        default=os.getenv("FLUXER_VOICE_CONTEXT_FILE", ""),
+        help="Optional deployment-local context file loaded once into RAM at startup for fast voice mode",
     )
     parser.add_argument(
         "--voice-session-db",
-        default="/home/elkim/.hermes/state.db",
+        default=os.getenv("FLUXER_VOICE_SESSION_DB", str(Path.home() / ".hermes" / "state.db")),
         help="Read-only Hermes session DB used to augment full-brain temporal recall questions",
     )
     parser.add_argument("--stop-on-empty-stt", action="store_true")
     parser.add_argument(
         "--turn-log-jsonl",
-        default="/tmp/zofka_fluxer_voice_loop_turns.jsonl",
+        default=os.getenv("FLUXER_VOICE_TURN_LOG_JSONL", "/tmp/hermes_fluxer_voice_loop_turns.jsonl"),
         help="Append each turn as JSONL so long-running sessions keep transcripts/timing even when stopped",
     )
     parser.add_argument("--verbose", action="store_true")

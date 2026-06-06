@@ -329,6 +329,72 @@ Fluxer voice messages are treated differently from generic audio files:
 
 If no STT provider is configured, Hermes will still receive the voice attachment but will send the user the normal voice setup notice instead of pretending it understood the audio.
 
+### Realtime voice rooms
+
+Realtime voice is **disabled by default**. The plugin will not join voice rooms unless the operator explicitly enables it and scopes the rooms/users it may listen to.
+
+Minimum env-var setup:
+
+```bash
+FLUXER_VOICE_ENABLED=true
+FLUXER_VOICE_AUTO_JOIN=true
+FLUXER_VOICE_TARGET_USER_IDS=your_fluxer_user_id
+FLUXER_VOICE_CHANNEL_IDS=your_voice_channel_id
+```
+
+Optional tuning:
+
+```bash
+FLUXER_VOICE_GUILD_IDS=your_guild_id
+FLUXER_VOICE_BRAIN_PROVIDER=auto        # auto | xai-fast | xai | hermes
+FLUXER_VOICE_STT_PROVIDER=elevenlabs    # auto | local | groq | xai | elevenlabs
+FLUXER_VOICE_STT_MODEL=scribe_v2
+FLUXER_VOICE_TTS_VOICE=eve
+FLUXER_VOICE_SILENCE_MS=850
+FLUXER_VOICE_END_PADDING_MS=180
+FLUXER_VOICE_MIN_SEGMENT_MS=1200
+FLUXER_VOICE_MAX_SEGMENT_SECONDS=9
+FLUXER_VOICE_CONTEXT_FILE=/path/to/local/context.md
+FLUXER_VOICE_SESSION_DB=~/.hermes/state.db
+```
+
+`FLUXER_VOICE_CONTEXT_FILE` is intentionally deployment-local. Do not commit personal context files, private IDs, or local machine paths into the plugin repository.
+
+Equivalent `config.yaml` shape:
+
+```yaml
+fluxer:
+  voice:
+    enabled: true
+    auto_join: true
+    target_user_ids:
+      - your_fluxer_user_id
+    channel_ids:
+      - your_voice_channel_id
+    guild_ids:
+      - your_guild_id
+    brain_provider: auto
+    stt_provider: elevenlabs
+    stt_model: scribe_v2
+    elevenlabs_language_code: ""
+    tts_voice: eve
+    vad:
+      silence_ms: 850
+      end_padding_ms: 180
+      min_segment_ms: 1200
+      max_segment_seconds: 9
+    timeouts:
+      capture_seconds: 90
+      connect_seconds: 30
+      xai_seconds: 45
+      xai_first_audio_seconds: 12
+      max_runtime_seconds: 3600
+    context_file: /path/to/local/context.md
+    session_db: ~/.hermes/state.db
+```
+
+Environment variables win over `config.yaml`, matching Hermes platform-plugin conventions.
+
 ### Native command registration
 
 If your Fluxer deployment supports application/slash-command registration:

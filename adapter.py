@@ -2395,6 +2395,112 @@ def is_connected(config) -> bool:
     return validate_config(config)
 
 
+def _coerce_env_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(item) for item in value if str(item).strip())
+    return str(value)
+
+
+def _set_env_default(name: str, value: Any) -> None:
+    if value is None or os.getenv(name):
+        return
+    if isinstance(value, str) and not value.strip():
+        return
+    os.environ[name] = _coerce_env_value(value)
+
+
+def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
+    """Bridge ``fluxer:`` config.yaml keys into env/default extras.
+
+    Hermes calls this during gateway config loading. Environment variables keep
+    precedence over YAML, so operators can override container/deployment values
+    without editing config.yaml.
+    """
+
+    cfg = platform_cfg if isinstance(platform_cfg, dict) else {}
+
+    scalar_env = {
+        "base_url": "FLUXER_BASE_URL",
+        "gateway_url": "FLUXER_GATEWAY_URL",
+        "allowed_users": "FLUXER_ALLOWED_USERS",
+        "allow_all_users": "FLUXER_ALLOW_ALL_USERS",
+        "home_channel": "FLUXER_HOME_CHANNEL",
+        "home_channel_name": "FLUXER_HOME_CHANNEL_NAME",
+        "backlog_recovery": "FLUXER_BACKLOG_RECOVERY",
+        "backlog_limit": "FLUXER_BACKLOG_LIMIT",
+        "backlog_bootstrap_seconds": "FLUXER_BACKLOG_BOOTSTRAP_SECONDS",
+        "require_mention": "FLUXER_REQUIRE_MENTION",
+        "strict_mention": "FLUXER_STRICT_MENTION",
+        "free_response_channels": "FLUXER_FREE_RESPONSE_CHANNELS",
+        "home_guild_id": "FLUXER_HOME_GUILD_ID",
+        "home_guilds": "FLUXER_HOME_GUILDS",
+        "auto_free_response_home_guild": "FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD",
+        "mention_gated_channels": "FLUXER_MENTION_GATED_CHANNELS",
+        "allowed_channels": "FLUXER_ALLOWED_CHANNELS",
+        "mention_patterns": "FLUXER_MENTION_PATTERNS",
+        "allow_mention_everyone": "FLUXER_ALLOW_MENTION_EVERYONE",
+        "allow_mention_roles": "FLUXER_ALLOW_MENTION_ROLES",
+        "allow_mention_users": "FLUXER_ALLOW_MENTION_USERS",
+        "allow_mention_replied_user": "FLUXER_ALLOW_MENTION_REPLIED_USER",
+        "delivery_verification": "FLUXER_DELIVERY_VERIFICATION",
+        "register_native_commands": "FLUXER_REGISTER_NATIVE_COMMANDS",
+        "application_id": "FLUXER_APPLICATION_ID",
+        "native_command_guilds": "FLUXER_NATIVE_COMMAND_GUILDS",
+    }
+    for key, env_name in scalar_env.items():
+        if key in cfg:
+            _set_env_default(env_name, cfg.get(key))
+
+    voice_raw = cfg.get("voice")
+    voice: dict = voice_raw if isinstance(voice_raw, dict) else {}
+    voice_scalar_env = {
+        "enabled": "FLUXER_VOICE_ENABLED",
+        "auto_join": "FLUXER_VOICE_AUTO_JOIN",
+        "target_user_ids": "FLUXER_VOICE_TARGET_USER_IDS",
+        "channel_ids": "FLUXER_VOICE_CHANNEL_IDS",
+        "guild_ids": "FLUXER_VOICE_GUILD_IDS",
+        "participant_prefix": "FLUXER_VOICE_PARTICIPANT_PREFIX",
+        "brain_provider": "FLUXER_VOICE_BRAIN_PROVIDER",
+        "stt_provider": "FLUXER_VOICE_STT_PROVIDER",
+        "stt_model": "FLUXER_VOICE_STT_MODEL",
+        "elevenlabs_language_code": "FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE",
+        "tts_voice": "FLUXER_VOICE_TTS_VOICE",
+        "context_file": "FLUXER_VOICE_CONTEXT_FILE",
+        "session_db": "FLUXER_VOICE_SESSION_DB",
+        "turn_log_jsonl": "FLUXER_VOICE_TURN_LOG_JSONL",
+    }
+    for key, env_name in voice_scalar_env.items():
+        if key in voice:
+            _set_env_default(env_name, voice.get(key))
+
+    vad_raw = voice.get("vad")
+    vad: dict = vad_raw if isinstance(vad_raw, dict) else {}
+    for key, env_name in {
+        "silence_ms": "FLUXER_VOICE_SILENCE_MS",
+        "end_padding_ms": "FLUXER_VOICE_END_PADDING_MS",
+        "min_segment_ms": "FLUXER_VOICE_MIN_SEGMENT_MS",
+        "max_segment_seconds": "FLUXER_VOICE_MAX_SEGMENT_SECONDS",
+    }.items():
+        if key in vad:
+            _set_env_default(env_name, vad.get(key))
+
+    timeouts_raw = voice.get("timeouts")
+    timeouts: dict = timeouts_raw if isinstance(timeouts_raw, dict) else {}
+    for key, env_name in {
+        "capture_seconds": "FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS",
+        "connect_seconds": "FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS",
+        "xai_seconds": "FLUXER_VOICE_XAI_TIMEOUT_SECONDS",
+        "xai_first_audio_seconds": "FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS",
+        "max_runtime_seconds": "FLUXER_VOICE_MAX_RUNTIME_SECONDS",
+    }.items():
+        if key in timeouts:
+            _set_env_default(env_name, timeouts.get(key))
+
+    return None
+
+
 def _env_enablement() -> dict | None:
     base_url = os.getenv("FLUXER_BASE_URL", "").strip()
     token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
@@ -2475,6 +2581,7 @@ def register(ctx) -> None:
         install_hint="pip install httpx websockets   # Fluxer adapter dependencies",
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
+        apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="FLUXER_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
         allowed_users_env="FLUXER_ALLOWED_USERS",

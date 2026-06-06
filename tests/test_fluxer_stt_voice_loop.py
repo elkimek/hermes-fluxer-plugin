@@ -37,17 +37,16 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
         history=[{"user": "hello", "assistant": "Hi."}],
     )
 
-    assert "Latest STT transcript from Elkim: 'Shevka, what is two past two?'" in prompt
-    assert "Elkim: hello" in prompt
-    assert "Žofka: Hi." in prompt
+    assert "Latest STT transcript from the user: 'Shevka, what is two past two?'" in prompt
+    assert "the user: hello" in prompt
+    assert "the assistant: Hi." in prompt
     assert "past" in prompt and "plus" in prompt
     assert "plast" in prompt and "plus" in prompt
     assert "participant-targeted capture" in prompt
-    assert "ElevenLabs Scribe STT" in prompt
-    assert "xAI Eve TTS" in prompt
-    assert "Fluxer implementation" in prompt
-    assert "Speak English by default" in prompt
-    assert "Do not switch to Czech" in prompt
+    assert "realtime TTS" in prompt
+    assert "configured Hermes assistant" in prompt
+    assert "Speak English by default" not in prompt
+    assert "explicitly asks for another language" in prompt
     assert "deep, personal" in prompt
     assert "2-4 substantive spoken sentences" in prompt
     assert "do not end with a generic follow-up question" in prompt
@@ -70,11 +69,11 @@ def test_build_hermes_messages_preserves_history_and_latest_transcript():
 
 
 def test_compose_system_prompt_appends_cached_context():
-    prompt = compose_system_prompt("base", voice_context_cache="Elkim likes direct answers")
+    prompt = compose_system_prompt("base", voice_context_cache="the user likes direct answers")
 
     assert "base" in prompt
-    assert "Cached in-RAM" in prompt
-    assert "Elkim likes direct answers" in prompt
+    assert "Cached deployment-local context" in prompt
+    assert "the user likes direct answers" in prompt
 
 
 def test_load_voice_context_cache_reads_file_once(tmp_path):
@@ -244,12 +243,12 @@ def test_parse_args_defaults_to_realtime_voice_stack():
 
     assert args.stt_provider == "elevenlabs"
     assert args.stt_model == "medium.en"
-    assert args.elevenlabs_language_code == "eng"
+    assert args.elevenlabs_language_code == ""
     assert args.capture_mode == "vad"
     assert args.capture_window_seconds == 3.0
     assert args.brain_provider == "auto"
     assert args.hermes_url == "http://127.0.0.1:8642"
-    assert args.voice_context_file.endswith("VOICE_CONTEXT_CACHE.md")
+    assert args.voice_context_file == ""
     assert args.energy_threshold == 300
     assert args.silence_ms == 1500
     assert args.min_segment_ms == 1600

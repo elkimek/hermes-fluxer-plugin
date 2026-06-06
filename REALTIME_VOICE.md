@@ -1,6 +1,6 @@
 # Fluxer realtime voice spike
 
-This is the first design note for making the standalone plugin do more than Discord-style text, files, and voice-message STT. The target is a real-time “talk with Žofka in a Fluxer voice room” path.
+This is the first design note for making the standalone plugin do more than Discord-style text, files, and voice-message STT. The target is a real-time “talk with the assistant in a Fluxer voice room” path.
 
 ## What Fluxer exposes
 
@@ -38,7 +38,7 @@ Fluxer realtime voice bridge
   ├─ subscribes to allowed user audio
   ├─ streams audio into xAI Realtime / other realtime STT+LLM backend
   ├─ receives assistant audio chunks
-  └─ publishes Žofka audio back into the LiveKit room
+  └─ publishes the assistant audio back into the LiveKit room
 ```
 
 Keep this as a separate bridge/service at first, with the standalone plugin exposing tested gateway seams. That avoids turning the platform adapter into a full media engine too early and lets Hermes reuse the pattern later for other voice-capable platforms.
@@ -81,7 +81,7 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Added `scripts/fluxer_livekit_smoke.py` to run real probes against a configured Fluxer voice channel; it joins muted/deaf by default, can publish a short low-amplitude sine tone, prints only safe metadata, then leaves.
 - Verified the smoke probe against hosted Fluxer: the bot received a sanitized `VOICE_SERVER_UPDATE`, connected to `wss://*.fluxer.media`, entered `guild_..._channel_...` with a LiveKit participant identity, then left cleanly. Token presence was reported only as `has_token: true`.
 - Verified audible publishing against hosted Fluxer: the probe joined unmuted/deaf, published a short low-amplitude test tone with `tone_published: true`, then disconnected.
-- Added mono 16-bit PCM WAV publishing and verified a generated Žofka TTS clip against hosted Fluxer with `wav_published: true`.
+- Added mono 16-bit PCM WAV publishing and verified a generated the assistant TTS clip against hosted Fluxer with `wav_published: true`.
 - Added a minimal xAI Realtime websocket client that can request `grok-voice-latest` PCM16 audio from either a text prompt or xAI `force_message`, write it as WAV, and hand it to the Fluxer LiveKit publisher.
 - Verified xAI Realtime end-to-end into Fluxer: `grok-voice-latest` produced PCM16 audio over `wss://api.x.ai/v1/realtime`, the smoke probe joined Fluxer LiveKit, and published it with `xai_realtime_published: true`.
 - Added the first one-turn duplex probe: subscribe to remote LiveKit audio, collect PCM16, send `input_audio_buffer.append`/`commit` into xAI Realtime, stream Grok Voice output deltas directly into Fluxer LiveKit, and drain final playout.
@@ -92,9 +92,9 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Added first barge-in support: while assistant audio is streaming, a fresh sustained user speech detector clears the LiveKit `AudioSource` queue, aborts further xAI audio deltas, marks the turn as interrupted, and reopens listening. Live smoke verified `interrupted_turn_count: 1` followed by a newly captured response turn.
 - Optimized barge-in carryover: the interrupting utterance is now retained as PCM, reported as `barge_in_carryover_pcm_bytes`, and used immediately as the next xAI prompt instead of forcing a fresh post-interrupt capture/repeat.
 - Next: live-test carryover timing in the hosted room, then tune echo/noise thresholds if Fluxer speaker playback leaks into the interruption detector.
-- Hardened the interrupt path after live testing showed Žofka could keep speaking: interruption now checks between 20ms frames inside large xAI audio deltas and stops/unpublishes the LiveKit local track instead of only clearing the `AudioSource` queue.
+- Hardened the interrupt path after live testing showed the assistant could keep speaking: interruption now checks between 20ms frames inside large xAI audio deltas and stops/unpublishes the LiveKit local track instead of only clearing the `AudioSource` queue.
 
-### Phase 4 — real-time Žofka loop
+### Phase 4 — real-time the assistant loop
 
 - Subscribe to allowed user audio tracks.
 - Stream audio to **xAI Realtime** or a selected realtime backend.

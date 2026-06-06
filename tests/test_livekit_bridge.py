@@ -190,7 +190,7 @@ async def test_publish_test_tone_publishes_pcm_audio_frames(monkeypatch):
     await bridge.publish_test_tone(duration_seconds=0.04, sample_rate=1000, frequency_hz=100, frame_ms=20)
 
     source = FakeAudioSource.instances[0]
-    assert room.local_participant.published[0][0].name == "zofka-test-tone"
+    assert room.local_participant.published[0][0].name == "fluxer-test-tone"
     assert room.local_participant.published[0][0].source is source
     assert room.local_participant.published[0][1].source == FakeTrackSource.SOURCE_MICROPHONE
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
@@ -215,7 +215,7 @@ async def test_publish_wav_file_publishes_pcm_audio_frames(monkeypatch, tmp_path
     room = FakeRoom()
     bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
     await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
-    wav_path = tmp_path / "zofka.wav"
+    wav_path = tmp_path / "fluxer.wav"
     with wave.open(str(wav_path), "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
@@ -225,7 +225,7 @@ async def test_publish_wav_file_publishes_pcm_audio_frames(monkeypatch, tmp_path
     await bridge.publish_wav_file(wav_path, frame_ms=20)
 
     source = FakeAudioSource.instances[0]
-    assert room.local_participant.published[0][0].name == "zofka-tts-smoke"
+    assert room.local_participant.published[0][0].name == "fluxer-tts-smoke"
     assert room.local_participant.published[0][0].source is source
     assert [frame.samples_per_channel for frame in source.frames] == [20, 20]
     assert source.waited is True
@@ -258,14 +258,14 @@ async def test_pcm16_publisher_streams_chunks_and_flushes_remainder(monkeypatch)
     bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
     await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
 
-    async with bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="zofka-stream") as publisher:
+    async with bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="fluxer-stream") as publisher:
         await publisher.write(b"\x01\x00" * 15)
         assert publisher.frames_published == 0
         await publisher.write(b"\x02\x00" * 30)
         assert publisher.frames_published == 2
 
     source = FakeAudioSource.instances[0]
-    assert room.local_participant.published[0][0].name == "zofka-stream"
+    assert room.local_participant.published[0][0].name == "fluxer-stream"
     assert room.local_participant.published[0][0].source is source
     assert room.local_participant.published[0][1].source == FakeTrackSource.SOURCE_MICROPHONE
     assert source.queue_size_ms == 120
@@ -283,7 +283,7 @@ async def test_pcm16_publisher_interrupt_clears_queue_without_playout(monkeypatc
     bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
     await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
 
-    publisher = bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="zofka-stream")
+    publisher = bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="fluxer-stream")
     await publisher.__aenter__()
     await publisher.write(b"\x01\x00" * 40)
     await publisher.write(b"\x02\x00" * 5)
@@ -312,7 +312,7 @@ async def test_pcm16_publisher_interruptible_write_stops_mid_chunk(monkeypatch):
     bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
     await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
 
-    publisher = bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="zofka-stream")
+    publisher = bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="fluxer-stream")
     await publisher.__aenter__()
     calls = 0
 

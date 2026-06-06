@@ -10,7 +10,7 @@ description: >
   deployment-dependent and approval prompts include visible slash-command
   fallback text; native slash commands and Discord-style threads are also
   deployment-dependent.
-author: Elkim
+author: Hermes Fluxer Plugin Contributors
 requires_env:
   - name: FLUXER_BOT_TOKEN
     description: "Fluxer bot token (<applicationId>.<secret>)"
@@ -120,4 +120,84 @@ optional_env:
   - name: FLUXER_NATIVE_COMMAND_GUILDS
     description: "Comma-separated guild IDs for guild-scoped command registration; empty means global"
     prompt: "Native command guild IDs"
+    password: false
+  - name: FLUXER_VOICE_ENABLED
+    description: "Enable the realtime Fluxer voice bridge (true/false); disabled by default"
+    prompt: "Enable realtime Fluxer voice?"
+    password: false
+  - name: FLUXER_VOICE_AUTO_JOIN
+    description: "Automatically join configured voice rooms when a target user joins (true/false)"
+    prompt: "Auto-join voice rooms?"
+    password: false
+  - name: FLUXER_VOICE_TARGET_USER_IDS
+    description: "Comma-separated Fluxer user IDs whose LiveKit audio may be captured; empty means no targeted capture"
+    prompt: "Realtime voice target user IDs"
+    password: false
+  - name: FLUXER_VOICE_CHANNEL_IDS
+    description: "Comma-separated Fluxer voice channel IDs the bridge may join; empty disables auto-join"
+    prompt: "Allowed realtime voice channel IDs"
+    password: false
+  - name: FLUXER_VOICE_GUILD_IDS
+    description: "Optional comma-separated Fluxer guild/community IDs allowed for realtime voice"
+    prompt: "Allowed realtime voice guild IDs"
+    password: false
+  - name: FLUXER_VOICE_PARTICIPANT_PREFIX
+    description: "Optional LiveKit participant identity prefix to capture; defaults to user_<targetUserId>_ when one target user is configured"
+    prompt: "LiveKit participant identity prefix"
+    password: false
+  - name: FLUXER_VOICE_BRAIN_PROVIDER
+    description: "Voice brain mode: auto, xai-fast, xai, or hermes"
+    prompt: "Voice brain provider"
+    password: false
+  - name: FLUXER_VOICE_STT_PROVIDER
+    description: "Realtime voice STT provider: auto, local, groq, xai, or elevenlabs"
+    prompt: "Voice STT provider"
+    password: false
+  - name: FLUXER_VOICE_STT_MODEL
+    description: "Realtime voice STT model name"
+    prompt: "Voice STT model"
+    password: false
+  - name: FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE
+    description: "Optional ElevenLabs Scribe language code; empty allows autodetect"
+    prompt: "ElevenLabs STT language code"
+    password: false
+  - name: FLUXER_VOICE_TTS_VOICE
+    description: "Realtime TTS voice name used by the configured realtime voice provider"
+    prompt: "Realtime TTS voice"
+    password: false
+  - name: FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS
+    description: "Maximum seconds to wait for a user's voice segment before timing out"
+    prompt: "Voice capture timeout seconds"
+    password: false
+  - name: FLUXER_VOICE_SILENCE_MS
+    description: "VAD silence duration, in milliseconds, that ends a spoken turn"
+    prompt: "Voice VAD silence ms"
+    password: false
+  - name: FLUXER_VOICE_END_PADDING_MS
+    description: "Milliseconds of final silence retained in captured audio"
+    prompt: "Voice end padding ms"
+    password: false
+  - name: FLUXER_VOICE_MIN_SEGMENT_MS
+    description: "Minimum captured voice segment duration in milliseconds"
+    prompt: "Voice minimum segment ms"
+    password: false
+  - name: FLUXER_VOICE_MAX_SEGMENT_SECONDS
+    description: "Maximum captured voice segment duration in seconds"
+    prompt: "Voice maximum segment seconds"
+    password: false
+  - name: FLUXER_VOICE_MAX_RUNTIME_SECONDS
+    description: "Maximum runtime for one voice loop process in seconds"
+    prompt: "Voice loop max runtime seconds"
+    password: false
+  - name: FLUXER_VOICE_CONTEXT_FILE
+    description: "Optional local context file loaded into fast voice mode; not required and never bundled with private user data"
+    prompt: "Voice context file path"
+    password: false
+  - name: FLUXER_VOICE_SESSION_DB
+    description: "Optional Hermes session database path for full-brain temporal recall"
+    prompt: "Voice session DB path"
+    password: false
+  - name: FLUXER_VOICE_TURN_LOG_JSONL
+    description: "Optional JSONL path for realtime voice turn diagnostics"
+    prompt: "Voice turn log path"
     password: false

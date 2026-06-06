@@ -60,16 +60,15 @@ class BargeInCapture:
     detected_seconds: float | None = None
 
 
-DEFAULT_INSTRUCTIONS = """You are Žofka speaking with Elkim in a Fluxer voice room.
-Always answer in English unless Elkim explicitly asks for Czech. Do not answer in Spanish.
-Treat Žofka, Zofka, Jefka, and occasional voice-ASR name confusions like Jessica as your name; do not correct the name out loud.
-Ignore background music, lyrics, radio, TV, and room noise. Respond only to speech that sounds directed at Žofka or clearly part of the conversation.
+DEFAULT_INSTRUCTIONS = """You are the configured assistant speaking with a user in a Fluxer voice room.
+Answer in the user's language when it is clear; otherwise default to English.
+Ignore background music, lyrics, radio, TV, and room noise. Respond only to speech that sounds directed at the assistant or clearly part of the conversation.
 Be warm, direct, concise, and natural for realtime voice. Default to one short sentence. Do not ask multiple follow-up questions.
 """.strip()
 
-WAKE_GATE_INSTRUCTIONS = """You are a strict realtime voice gate for Žofka in a noisy room.
-Listen to the user's audio. If the speech does not clearly address Žofka/Zofka/Jefka or an obvious ASR confusion of that name, or if it sounds like music, lyrics, radio, TV, or background noise, reply with exactly: IGNORE
-If the user clearly addresses Žofka/Zofka/Jefka or an obvious ASR confusion of that name, reply with exactly: RESPOND
+WAKE_GATE_INSTRUCTIONS = """You are a strict realtime voice gate for a Fluxer voice room.
+Listen to the user's audio. If the speech is not clearly directed at the assistant or clearly part of the conversation, or if it sounds like music, lyrics, radio, TV, or background noise, reply with exactly: IGNORE
+If the user clearly addresses the assistant or continues the conversation, reply with exactly: RESPOND
 Use English only.
 """.strip()
 
@@ -343,7 +342,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         gate_transcript = ""
         gate_seconds = 0.0
         if not args.disable_wake_gate:
-            gate_wav = str(Path(tempfile.gettempdir()) / f"zofka_xai_room_loop_gate_{turn_no}.wav")
+            gate_wav = str(Path(tempfile.gettempdir()) / f"fluxer_xai_room_loop_gate_{turn_no}.wav")
             try:
                 gate_started = time.monotonic()
                 gate_result = await gate_xai.audio_response_from_pcm16(pcm, gate_wav, timeout=args.xai_timeout)
@@ -385,7 +384,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
             publisher = bridge.pcm16_publisher(
                 sample_rate=args.sample_rate,
                 frame_ms=args.frame_ms,
-                track_name=f"zofka-xai-room-loop-{turn_no}",
+                track_name=f"fluxer-xai-room-loop-{turn_no}",
             )
             await publisher.__aenter__()
             arm_barge_after_first_audio = bool(getattr(args, "barge_in_after_first_audio_only", False))
@@ -619,7 +618,7 @@ async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmok
     publisher = bridge.pcm16_publisher(
         sample_rate=args.sample_rate,
         frame_ms=args.frame_ms,
-        track_name="zofka-barge-diagnostic-tone",
+        track_name="fluxer-barge-diagnostic-tone",
     )
     frame_samples = max(1, args.sample_rate * args.frame_ms // 1000)
     tone_phase = 0.0

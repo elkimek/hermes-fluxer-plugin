@@ -1,6 +1,6 @@
 # Agent instructions for hermes-fluxer-plugin
 
-This is Elkim's standalone Fluxer platform plugin for Hermes. Treat it as a public repo: no private IDs, no local paths, no real tokens in commits, issues, logs, or summaries.
+This is the standalone Fluxer platform plugin for Hermes. Treat it as a public repo: no private IDs, no local paths, no real tokens in commits, issues, logs, or summaries.
 
 ## Read first
 

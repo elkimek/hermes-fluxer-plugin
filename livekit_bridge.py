@@ -342,7 +342,7 @@ class FluxerLiveKitSmokeBridge:
         sample_rate: int = 48_000,
         amplitude: float = 0.18,
         frame_ms: int = 20,
-        track_name: str = "zofka-test-tone",
+        track_name: str = "fluxer-test-tone",
     ) -> None:
         """Publish a short mono PCM sine tone into the connected LiveKit room.
 
@@ -404,7 +404,7 @@ class FluxerLiveKitSmokeBridge:
         wav_path: str | Path,
         *,
         frame_ms: int = 20,
-        track_name: str = "zofka-tts-smoke",
+        track_name: str = "fluxer-tts-smoke",
     ) -> None:
         """Publish a mono 16-bit PCM WAV file into the connected LiveKit room."""
 
@@ -455,7 +455,7 @@ class FluxerLiveKitSmokeBridge:
         *,
         sample_rate: int = 24_000,
         frame_ms: int = 20,
-        track_name: str = "zofka-realtime-response",
+        track_name: str = "fluxer-realtime-response",
     ) -> None:
         """Publish mono PCM16 audio bytes into the connected LiveKit room."""
 
@@ -504,7 +504,7 @@ class FluxerLiveKitSmokeBridge:
         *,
         sample_rate: int = 24_000,
         frame_ms: int = 20,
-        track_name: str = "zofka-realtime-response",
+        track_name: str = "fluxer-realtime-response",
     ) -> _LiveKitPcm16Publisher:
         """Open a LiveKit PCM16 sink for realtime chunk-by-chunk publishing."""
 

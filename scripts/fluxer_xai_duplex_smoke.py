@@ -98,7 +98,7 @@ async def run(args: argparse.Namespace) -> int:
                 participant_identity=args.participant_identity,
                 timeout=args.listen_timeout,
             )
-            output_wav = str(Path(tempfile.gettempdir()) / "zofka_xai_duplex_response.wav")
+            output_wav = str(Path(tempfile.gettempdir()) / "fluxer_xai_duplex_response.wav")
             xai = XAIRealtimeVoiceClient(
                 model=args.xai_model,
                 voice=args.xai_voice,
@@ -106,7 +106,7 @@ async def run(args: argparse.Namespace) -> int:
                 instructions=args.xai_instructions,
             )
             xai_result = await xai.audio_response_from_pcm16(pcm, output_wav, timeout=args.xai_timeout)
-            await bridge.publish_wav_file(output_wav, track_name="zofka-xai-duplex-response")
+            await bridge.publish_wav_file(output_wav, track_name="fluxer-xai-duplex-response")
             result["safe_update"] = safe_update
             result["connection"] = {
                 "endpoint": info.endpoint,
@@ -171,7 +171,7 @@ def main() -> int:
     parser.add_argument("--xai-model", default="grok-voice-latest")
     parser.add_argument("--xai-voice", default="eve")
     parser.add_argument("--xai-timeout", type=float, default=45.0)
-    parser.add_argument("--xai-instructions", default="You are Žofka. Reply warmly and directly in one short sentence.")
+    parser.add_argument("--xai-instructions", default="You are the assistant. Reply warmly and directly in one short sentence.")
     parser.add_argument("--verbose", action="store_true")
     return asyncio.run(run(parser.parse_args()))
 
