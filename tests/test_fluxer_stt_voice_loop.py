@@ -357,6 +357,10 @@ def test_parse_args_defaults_to_realtime_voice_stack(monkeypatch):
     assert args.silence_ms == 1500
     assert args.min_segment_ms == 1600
     assert args.max_segment_seconds == 12.0
+    assert args.disable_barge_in is False
+    assert args.barge_in_energy_threshold == 700
+    assert args.barge_in_min_ms == 180
+    assert args.barge_in_after_first_audio_only is True
 
 
 def test_transcribe_with_provider_uses_groq_default_for_local_model_name(monkeypatch, tmp_path):

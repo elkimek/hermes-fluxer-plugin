@@ -43,7 +43,12 @@ for candidate in (ROOT, HERMES_ROOT):
 from adapter import FluxerAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
-from scripts.fluxer_xai_room_loop import _capture_one_speech_segment  # noqa: E402
+from scripts.fluxer_xai_room_loop import (  # noqa: E402
+    BargeInCapture,
+    BargeInInterrupt,
+    _capture_one_speech_segment,
+    _wait_for_barge_in,
+)
 from tools.transcription_tools import (  # noqa: E402
     ELEVENLABS_STT_BASE_URL,
     _extract_transcript_text,
@@ -818,32 +823,146 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 xai_started = time.monotonic()
                 first_audio_seconds: float | None = None
+                barge_in_seconds: float | None = None
+                barge_in_capture = BargeInCapture()
+                barge_in_task: asyncio.Task[Any] | None = None
                 publisher = bridge.pcm16_publisher(
                     sample_rate=args.sample_rate,
                     frame_ms=args.frame_ms,
                     track_name=f"fluxer-stt-loop-reply-{turn_no}",
                 )
-                async with publisher:
-                    async def publish_delta(chunk: bytes) -> None:
-                        nonlocal first_audio_seconds
-                        if first_audio_seconds is None:
-                            first_audio_seconds = time.monotonic() - xai_started
+                await publisher.__aenter__()
+                arm_barge_after_first_audio = bool(getattr(args, "barge_in_after_first_audio_only", True))
+                if not args.disable_barge_in and not arm_barge_after_first_audio:
+                    barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
+
+                async def publish_delta(chunk: bytes) -> None:
+                    nonlocal first_audio_seconds, barge_in_seconds, barge_in_task
+
+                    async def should_interrupt() -> bool:
+                        nonlocal barge_in_seconds
+                        if barge_in_capture.event.is_set():
+                            barge_in_seconds = time.monotonic() - xai_started
+                            return True
+                        return False
+
+                    if await should_interrupt():
+                        await publisher.interrupt()
+                        raise BargeInInterrupt("user interrupted assistant speech")
+                    if first_audio_seconds is None:
+                        first_audio_seconds = time.monotonic() - xai_started
+                        if arm_barge_after_first_audio and not args.disable_barge_in and barge_in_task is None:
+                            barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
+                    write_interruptible = getattr(publisher, "write_interruptible", None)
+                    if write_interruptible is not None:
+                        interrupted = await write_interruptible(chunk, should_interrupt)
+                        if interrupted:
+                            raise BargeInInterrupt("user interrupted assistant speech")
+                    else:
                         await publisher.write(chunk)
 
-                    if reply_text:
-                        xai_result = await voice.force_message_to_sink(
+                try:
+                    xai_task = asyncio.create_task(
+                        voice.force_message_to_sink(
                             prompt,
                             publish_delta,
                             timeout=args.xai_timeout,
                             first_audio_timeout=args.xai_first_audio_timeout,
                         )
-                    else:
-                        xai_result = await voice.text_response_to_sink(
+                        if reply_text
+                        else voice.text_response_to_sink(
                             prompt,
                             publish_delta,
                             timeout=args.xai_timeout,
                             first_audio_timeout=args.xai_first_audio_timeout,
                         )
+                    )
+                    barge_event_task: asyncio.Task[Any] | None = None
+                    if not args.disable_barge_in and not arm_barge_after_first_audio:
+                        barge_event_task = asyncio.create_task(barge_in_capture.event.wait())
+                    try:
+                        if barge_event_task is None:
+                            xai_result = await xai_task
+                        else:
+                            done, _pending = await asyncio.wait({xai_task, barge_event_task}, return_when=asyncio.FIRST_COMPLETED)
+                            if barge_event_task in done and barge_in_capture.event.is_set() and not xai_task.done():
+                                barge_in_seconds = time.monotonic() - xai_started
+                                await publisher.interrupt()
+                                xai_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await xai_task
+                                raise BargeInInterrupt("user interrupted assistant speech before xAI audio")
+                            xai_result = await xai_task
+                    finally:
+                        if barge_event_task is not None:
+                            barge_event_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await barge_event_task
+                    xai_seconds = time.monotonic() - xai_started
+                    if barge_in_capture.event.is_set():
+                        barge_in_seconds = time.monotonic() - xai_started
+                        await publisher.interrupt()
+                        raise BargeInInterrupt("user interrupted assistant speech")
+                except BargeInInterrupt:
+                    logger.info("Barge-in interrupted STT-backed voice turn %s", turn_no)
+                    if barge_in_capture.event.is_set():
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                barge_in_capture.ready.wait(),
+                                timeout=getattr(args, "barge_in_capture_timeout", 2.0),
+                            )
+                    await publisher.close(wait_for_playout=False, flush_remainder=False)
+                    turn.update(
+                        {
+                            "published": False,
+                            "interrupted": True,
+                            "partial_response_bytes": getattr(publisher, "bytes_published", 0),
+                            "brain_provider": selected_brain_provider,
+                            "brain_provider_config": args.brain_provider,
+                            "brain_route_reason": brain_route_reason,
+                            "hermes_session_id": hermes_session_id if selected_brain_provider == "hermes" else None,
+                            "hermes_session_key": hermes_session_key if selected_brain_provider == "hermes" else None,
+                            "reply_transcript": reply_text,
+                            "barge_in_diagnostic": {
+                                "chunks_seen": barge_in_capture.chunks_seen,
+                                "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
+                                if barge_in_capture.first_chunk_seconds is not None
+                                else None,
+                                "max_rms": barge_in_capture.max_rms,
+                                "voiced_ms": barge_in_capture.voiced_ms,
+                                "detected_seconds": round(barge_in_capture.detected_seconds, 3)
+                                if barge_in_capture.detected_seconds is not None
+                                else None,
+                                "captured_audio_seconds": round(barge_in_capture.captured_audio_seconds, 3),
+                            },
+                            "publisher_queue_before_interrupt_seconds": round(
+                                getattr(publisher, "last_queue_duration_before_interrupt", 0.0) or 0.0,
+                                3,
+                            ),
+                            "publisher_queue_after_clear_seconds": round(
+                                getattr(publisher, "last_queue_duration_after_clear", 0.0) or 0.0,
+                                3,
+                            ),
+                            "timing": {
+                                "turn_seconds": round(time.monotonic() - turn_started, 3),
+                                "stt_seconds": round(stt_seconds, 3),
+                                "brain_seconds": round(brain_seconds, 3),
+                                "xai_first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
+                                "barge_in_seconds": round(barge_in_seconds, 3) if barge_in_seconds is not None else None,
+                            },
+                        }
+                    )
+                    result["turns"].append(turn)
+                    append_jsonl(args.turn_log_jsonl, turn)
+                    continue
+                finally:
+                    if barge_in_task is not None:
+                        barge_in_capture.stop_event.set()
+                        barge_in_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await barge_in_task
+                    if not getattr(publisher, "interrupted", False):
+                        await publisher.close()
                 xai_seconds = time.monotonic() - xai_started
                 spoken_reply = reply_text or xai_result.transcript
                 history.append({"user": transcript, "assistant": spoken_reply})
@@ -987,6 +1106,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--xai-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_XAI_TIMEOUT_SECONDS", "45.0")))
     parser.add_argument("--xai-first-audio-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS", "12.0")))
+    parser.add_argument("--disable-barge-in", action="store_true", default=env_truthy("FLUXER_VOICE_DISABLE_BARGE_IN"))
+    parser.add_argument("--barge-in-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", "700")))
+    parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "180")))
+    parser.add_argument("--barge-in-capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS", "2.0")))
+    parser.add_argument(
+        "--barge-in-after-first-audio-only",
+        action=argparse.BooleanOptionalAction,
+        default=env_truthy("FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY") if os.getenv("FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY") is not None else True,
+    )
     parser.add_argument("--connect-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS", "30.0")))
     parser.add_argument("--max-runtime-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_RUNTIME_SECONDS", "180.0")))
     parser.add_argument("--env-file", default=os.getenv("HERMES_ENV_FILE", str(Path.home() / ".hermes" / ".env")))

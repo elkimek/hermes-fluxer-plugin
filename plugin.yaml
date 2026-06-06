@@ -217,6 +217,26 @@ optional_env:
     description: "Maximum seconds to wait for the first realtime audio delta"
     prompt: "Voice first-audio timeout seconds"
     password: false
+  - name: FLUXER_VOICE_DISABLE_BARGE_IN
+    description: "Disable live barge-in interruption while assistant audio is speaking"
+    prompt: "Disable voice barge-in"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD
+    description: "RMS threshold for detecting user speech that interrupts assistant audio"
+    prompt: "Voice barge-in energy threshold"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_MIN_MS
+    description: "Minimum sustained speech duration in milliseconds required to interrupt assistant audio"
+    prompt: "Voice barge-in minimum ms"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS
+    description: "Maximum seconds to retain interrupted user speech as carryover diagnostics"
+    prompt: "Voice barge-in capture timeout seconds"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY
+    description: "Arm barge-in only after first assistant audio is published to avoid false triggers from the user's prompt tail"
+    prompt: "Voice barge-in after first audio only"
+    password: false
   - name: FLUXER_VOICE_HERMES_URL
     description: "Hermes API base URL for full-brain voice mode"
     prompt: "Voice Hermes API URL"

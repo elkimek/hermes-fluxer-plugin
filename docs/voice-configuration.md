@@ -118,6 +118,11 @@ These only matter when the voice loop calls the Hermes API for responses.
 | `timeouts.connect_seconds` | `FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS` | `30` | Max wait for gateway/LiveKit setup. | Raise on slow self-hosted deployments. |
 | `timeouts.xai_seconds` | `FLUXER_VOICE_XAI_TIMEOUT_SECONDS` | `45` | Max wait for one realtime audio response. | Lower to fail fast when provider hangs; raise for slow networks. |
 | `timeouts.xai_first_audio_seconds` | `FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS` | `12` | Max wait for first audio delta. | Lower if you prefer quick recovery over waiting. |
+| `barge_in.disable` | `FLUXER_VOICE_DISABLE_BARGE_IN` | `false` | Disable user interruption while assistant audio is speaking. | Use only for diagnosis; normal voice should leave barge-in enabled. |
+| `barge_in.energy_threshold` | `FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD` | `700` | RMS threshold for speech that interrupts assistant playback. | Raise if echo/noise stops the assistant; lower if quiet interruptions are missed. |
+| `barge_in.min_ms` | `FLUXER_VOICE_BARGE_IN_MIN_MS` | `180` | Sustained voiced duration required before interrupting. | Lower for faster stop; raise to avoid false triggers. |
+| `barge_in.capture_timeout_seconds` | `FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS` | `2` | Wait to retain the interrupt utterance diagnostics after stop. | Raise only if you want richer diagnostics/carryover. |
+| `barge_in.after_first_audio_only` | `FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY` | `true` | Arms barge-in only after assistant audio starts, avoiding the tail of the user's prompt. | Set false only when testing pre-audio interruption. |
 | `timeouts.max_runtime_seconds` | `FLUXER_VOICE_MAX_RUNTIME_SECONDS` | `3600` | Max lifetime for one loop process. | Lower for watchdog-style cycling; raise for long sessions. |
 | `timeouts.start_cooldown_seconds` | `FLUXER_VOICE_START_COOLDOWN_SECONDS` | `5` | Cooldown between supervisor starts. | Raise if reconnect loops are too aggressive. |
 | `timeouts.stop_timeout_seconds` | `FLUXER_VOICE_STOP_TIMEOUT_SECONDS` | `8` | Wait for graceful child shutdown before force-kill. | Raise only if clean disconnect routinely needs longer. |
