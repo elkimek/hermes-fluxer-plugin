@@ -483,6 +483,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    # Avoid leaking Authorization/Cookie headers from websocket/http debug logs.
+    # Keep our script/adapter diagnostics verbose, but force dependency transport
+    # loggers back down to INFO where they do not dump handshake headers.
+    for noisy_secret_logger in ("websockets", "websockets.client", "httpcore", "httpx", "urllib3"):
+        logging.getLogger(noisy_secret_logger).setLevel(logging.INFO)
     result = asyncio.run(run_stt_voice_loop(args))
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if not result.get("error") else 1
