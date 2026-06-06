@@ -65,6 +65,7 @@ Current implementation context you know:
 - The wake-name “Žofka” poisons STT; in room mode, speech from Elkim's targeted track counts as addressed to you.
 - xAI speech tags available include [pause], [long-pause], [breath], [sigh], [chuckle], <soft>, <whisper>, <slow>, and <emphasis>; use them lightly, not theatrically.
 - If Elkim asks about Fluxer implementation, realtime voice, LiveKit capture, STT providers, xAI TTS, ElevenLabs, barge-in, latency, or today's debugging, answer from this context instead of pretending not to know.
+- If Elkim asks about a specific past day, date, previous session, transcript, or memory and this is not full Hermes brain with retrieved evidence, do not guess from cached context. Say you need full brain/session recall for that.
 
 Conversation rules:
 - Answer the transcript directly. Be brief for operational chatter; be meaningfully longer when Elkim asks for depth, introspection, personal observations, or self-reflection.
@@ -153,11 +154,18 @@ def requested_brain_mode_switch(transcript: str) -> str | None:
     fast_phrases = (
         "switch back to fast",
         "go back to fast",
+        "go back to the fast",
         "use fast mode",
+        "use the fast mode",
         "use the fast brain",
         "switch to fast brain",
+        "switch to the fast brain",
         "back to xai fast",
+        "back to xai fest",
         "back to fast mode",
+        "back to the fast mode",
+        "switch back to xai fast",
+        "switch back to xai fest",
         "casual mode",
     )
     hermes_phrases = (
@@ -186,6 +194,8 @@ def transcript_needs_full_brain(transcript: str) -> bool:
     lower = " ".join((transcript or "").lower().split()).strip(" .!?…")
     if not lower:
         return False
+    if re.search(r"\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower):
+        return True
     temporal_memory_terms = (
         "last monday",
         "yesterday",
@@ -309,7 +319,11 @@ def build_hermes_messages(
         messages.append(
             {
                 "role": "system",
-                "content": "Relevant read-only session/memory context retrieved for this voice turn:\n" + recall_context,
+                "content": (
+                    "Relevant read-only session/memory context retrieved for this voice turn:\n"
+                    + recall_context
+                    + "\n\nUse these excerpts as evidence. If the recall says no local messages were found, say that directly and do not infer an answer from unrelated cached context."
+                ),
             }
         )
     for item in history[-8:]:
@@ -323,20 +337,37 @@ def build_hermes_messages(
     return messages
 
 
-def _last_monday_window(now: datetime | None = None) -> tuple[datetime, datetime]:
+def _last_weekday_window(weekday: int, now: datetime | None = None) -> tuple[datetime, datetime]:
     now = now or datetime.now().astimezone()
-    days_since_monday = now.weekday()
-    last_monday = now - timedelta(days=days_since_monday + (7 if days_since_monday == 0 else 0))
-    start = last_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_since = (now.weekday() - weekday) % 7
+    if days_since == 0:
+        days_since = 7
+    target = now - timedelta(days=days_since)
+    start = target.replace(hour=0, minute=0, second=0, microsecond=0)
     return start, start + timedelta(days=1)
+
+
+def _last_monday_window(now: datetime | None = None) -> tuple[datetime, datetime]:
+    return _last_weekday_window(0, now)
 
 
 def voice_recall_time_window(transcript: str, *, now: datetime | None = None) -> tuple[datetime, datetime, str] | None:
     lower = " ".join((transcript or "").lower().split())
     now = now or datetime.now().astimezone()
-    if "last monday" in lower:
-        start, end = _last_monday_window(now)
-        return start, end, "last Monday"
+    weekday_match = re.search(r"\blast\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", lower)
+    if weekday_match:
+        weekdays = {
+            "monday": 0,
+            "tuesday": 1,
+            "wednesday": 2,
+            "thursday": 3,
+            "friday": 4,
+            "saturday": 5,
+            "sunday": 6,
+        }
+        day_name = weekday_match.group(1)
+        start, end = _last_weekday_window(weekdays[day_name], now)
+        return start, end, f"last {day_name.title()}"
     if "yesterday" in lower:
         start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return start, start + timedelta(days=1), "yesterday"

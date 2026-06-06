@@ -51,6 +51,7 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
     assert "deep, personal" in prompt
     assert "2-4 substantive spoken sentences" in prompt
     assert "do not end with a generic follow-up question" in prompt
+    assert "do not guess from cached context" in prompt
 
 
 def test_build_hermes_messages_preserves_history_and_latest_transcript():
@@ -110,11 +111,20 @@ def test_is_voice_stop_request_detects_clear_stop_phrases():
 def test_voice_brain_router_auto_escalates_and_supports_spoken_switches():
     assert requested_brain_mode_switch("Okay, switch to full Hermes mode") == "hermes"
     assert requested_brain_mode_switch("Go back to fast mode now") == "xai-fast"
+    assert requested_brain_mode_switch("Okay, go back to the fast mode") == "xai-fast"
+    assert requested_brain_mode_switch("Switch back to XAI Fest") == "xai-fast"
 
     provider, sticky, reason = resolve_voice_brain_provider(
         "auto",
         "xai-fast",
         "What were we doing last Monday?",
+    )
+    assert (provider, sticky, reason) == ("hermes", "xai-fast", "auto_escalate_memory_context")
+
+    provider, sticky, reason = resolve_voice_brain_provider(
+        "auto",
+        "xai-fast",
+        "What were we doing last Friday?",
     )
     assert (provider, sticky, reason) == ("hermes", "xai-fast", "auto_escalate_memory_context")
 
@@ -136,7 +146,7 @@ def test_voice_brain_router_auto_escalates_and_supports_spoken_switches():
     assert "fast voice mode" in voice_mode_ack("xai-fast")
 
 
-def test_voice_recall_time_window_for_last_monday():
+def test_voice_recall_time_window_for_last_weekday():
     now = datetime(2026, 6, 6, 12, 0, 0)
     window = voice_recall_time_window("What were we doing last Monday?", now=now)
     assert window is not None
@@ -144,6 +154,13 @@ def test_voice_recall_time_window_for_last_monday():
     assert label == "last Monday"
     assert start.isoformat() == "2026-06-01T00:00:00"
     assert end.isoformat() == "2026-06-02T00:00:00"
+
+    window = voice_recall_time_window("What were we doing last Friday?", now=now)
+    assert window is not None
+    start, end, label = window
+    assert label == "last Friday"
+    assert start.isoformat() == "2026-06-05T00:00:00"
+    assert end.isoformat() == "2026-06-06T00:00:00"
 
 
 def test_collect_voice_session_recall_reads_local_state_db(tmp_path):
