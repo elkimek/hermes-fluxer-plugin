@@ -35,6 +35,21 @@ def test_plugin_manifest_is_platform_plugin():
     }.issubset(optional)
 
 
+def test_voice_env_surface_is_declared_and_documented():
+    code_text = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in ("adapter.py", "scripts/fluxer_voice_auto_join.py", "scripts/fluxer_stt_voice_loop.py")
+    )
+    used = set(__import__("re").findall(r"FLUXER_VOICE_[A-Z0-9_]+", code_text))
+    manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
+    manifest_vars = {item["name"] for item in manifest["optional_env"]}
+    docs_text = (ROOT / "README.md").read_text(encoding="utf-8") + (ROOT / "after-install.md").read_text(encoding="utf-8")
+    documented = set(__import__("re").findall(r"FLUXER_VOICE_[A-Z0-9_]+", docs_text))
+
+    assert used - manifest_vars == set()
+    assert used - documented == set()
+
+
 def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     for key in (
         "FLUXER_VOICE_ENABLED",
@@ -45,6 +60,11 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
         "FLUXER_VOICE_STT_PROVIDER",
         "FLUXER_VOICE_SILENCE_MS",
         "FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS",
+        "FLUXER_VOICE_HERMES_URL",
+        "FLUXER_VOICE_HERMES_MAX_TOKENS",
+        "FLUXER_VOICE_FRAME_MS",
+        "FLUXER_VOICE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_START_COOLDOWN_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -58,8 +78,10 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
                 "channel_ids": ["voice-1"],
                 "brain_provider": "auto",
                 "stt_provider": "elevenlabs",
-                "vad": {"silence_ms": 850},
-                "timeouts": {"capture_seconds": 90},
+                "hermes_url": "http://127.0.0.1:8642",
+                "hermes_max_tokens": 123,
+                "vad": {"silence_ms": 850, "frame_ms": 20, "energy_threshold": 300},
+                "timeouts": {"capture_seconds": 90, "start_cooldown_seconds": 5},
             }
         },
     )
@@ -70,8 +92,13 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     assert os.environ["FLUXER_VOICE_CHANNEL_IDS"] == "voice-1"
     assert os.environ["FLUXER_VOICE_BRAIN_PROVIDER"] == "auto"
     assert os.environ["FLUXER_VOICE_STT_PROVIDER"] == "elevenlabs"
+    assert os.environ["FLUXER_VOICE_HERMES_URL"] == "http://127.0.0.1:8642"
+    assert os.environ["FLUXER_VOICE_HERMES_MAX_TOKENS"] == "123"
     assert os.environ["FLUXER_VOICE_SILENCE_MS"] == "850"
+    assert os.environ["FLUXER_VOICE_FRAME_MS"] == "20"
+    assert os.environ["FLUXER_VOICE_ENERGY_THRESHOLD"] == "300"
     assert os.environ["FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS"] == "90"
+    assert os.environ["FLUXER_VOICE_START_COOLDOWN_SECONDS"] == "5"
 
 
 class _FakeVoiceProcess:

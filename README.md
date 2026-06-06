@@ -347,17 +347,47 @@ FLUXER_VOICE_CHANNEL_IDS=your_voice_channel_id
 Optional tuning:
 
 ```bash
+# Scope / routing
 FLUXER_VOICE_GUILD_IDS=your_guild_id
+FLUXER_VOICE_PARTICIPANT_PREFIX=user_<id>_
 FLUXER_VOICE_BRAIN_PROVIDER=auto        # auto | xai-fast | xai | hermes
+
+# STT / TTS
 FLUXER_VOICE_STT_PROVIDER=elevenlabs    # auto | local | groq | xai | elevenlabs
 FLUXER_VOICE_STT_MODEL=scribe_v2
+FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE=  # empty allows autodetect
 FLUXER_VOICE_TTS_VOICE=eve
+
+# Capture / VAD / loop timing
+FLUXER_VOICE_MAX_TURNS=50
+FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS=90
+FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS=30
+FLUXER_VOICE_XAI_TIMEOUT_SECONDS=45
+FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS=12
+FLUXER_VOICE_MAX_RUNTIME_SECONDS=3600
+FLUXER_VOICE_INITIAL_SETTLE_SECONDS=0.8
+FLUXER_VOICE_SAMPLE_RATE=24000
+FLUXER_VOICE_FRAME_MS=20
+FLUXER_VOICE_ENERGY_THRESHOLD=300
 FLUXER_VOICE_SILENCE_MS=850
 FLUXER_VOICE_END_PADDING_MS=180
 FLUXER_VOICE_MIN_SEGMENT_MS=1200
 FLUXER_VOICE_MAX_SEGMENT_SECONDS=9
-FLUXER_VOICE_CONTEXT_FILE=/path/to/local/context.md
+FLUXER_VOICE_START_COOLDOWN_SECONDS=5
+FLUXER_VOICE_STOP_TIMEOUT_SECONDS=8
+
+# Full Hermes brain mode
+FLUXER_VOICE_HERMES_URL=http://127.0.0.1:8642
+FLUXER_VOICE_HERMES_MODEL=Hermes
+FLUXER_VOICE_HERMES_TIMEOUT_SECONDS=90
+FLUXER_VOICE_HERMES_MAX_TOKENS=90
+FLUXER_VOICE_HERMES_TEMPERATURE=0.4
 FLUXER_VOICE_SESSION_DB=~/.hermes/state.db
+
+# Local/debug paths
+FLUXER_VOICE_CONTEXT_FILE=/path/to/local/context.md
+FLUXER_VOICE_TURN_LOG_JSONL=/tmp/hermes_fluxer_voice_turns.jsonl
+FLUXER_VOICE_PYTHON=/path/to/python
 ```
 
 `FLUXER_VOICE_CONTEXT_FILE` is intentionally deployment-local. Do not commit personal context files, private IDs, or local machine paths into the plugin repository.
@@ -375,12 +405,27 @@ fluxer:
       - your_voice_channel_id
     guild_ids:
       - your_guild_id
+    participant_prefix: user_<id>_
     brain_provider: auto
     stt_provider: elevenlabs
     stt_model: scribe_v2
     elevenlabs_language_code: ""
     tts_voice: eve
+    max_turns: 50
+    initial_settle_seconds: 0.8
+    sample_rate: 24000
+    context_file: /path/to/local/context.md
+    session_db: ~/.hermes/state.db
+    turn_log_jsonl: /tmp/hermes_fluxer_voice_turns.jsonl
+    hermes_url: http://127.0.0.1:8642
+    hermes_model: Hermes
+    hermes_timeout_seconds: 90
+    hermes_max_tokens: 90
+    hermes_temperature: 0.4
+    python: /path/to/python
     vad:
+      frame_ms: 20
+      energy_threshold: 300
       silence_ms: 850
       end_padding_ms: 180
       min_segment_ms: 1200
@@ -391,8 +436,8 @@ fluxer:
       xai_seconds: 45
       xai_first_audio_seconds: 12
       max_runtime_seconds: 3600
-    context_file: /path/to/local/context.md
-    session_db: ~/.hermes/state.db
+      start_cooldown_seconds: 5
+      stop_timeout_seconds: 8
 ```
 
 Environment variables win over `config.yaml`, matching Hermes platform-plugin conventions.

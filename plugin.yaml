@@ -201,3 +201,67 @@ optional_env:
     description: "Optional JSONL path for realtime voice turn diagnostics"
     prompt: "Voice turn log path"
     password: false
+  - name: FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS
+    description: "Maximum seconds to wait for LiveKit/gateway voice connection setup"
+    prompt: "Voice connect timeout seconds"
+    password: false
+  - name: FLUXER_VOICE_XAI_TIMEOUT_SECONDS
+    description: "Maximum seconds to wait for one realtime TTS/audio response"
+    prompt: "Voice xAI timeout seconds"
+    password: false
+  - name: FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS
+    description: "Maximum seconds to wait for the first realtime audio delta"
+    prompt: "Voice first-audio timeout seconds"
+    password: false
+  - name: FLUXER_VOICE_HERMES_URL
+    description: "Hermes API base URL for full-brain voice mode"
+    prompt: "Voice Hermes API URL"
+    password: false
+  - name: FLUXER_VOICE_HERMES_MODEL
+    description: "Hermes API model name used for full-brain voice mode"
+    prompt: "Voice Hermes model"
+    password: false
+  - name: FLUXER_VOICE_HERMES_TIMEOUT_SECONDS
+    description: "Maximum seconds to wait for full-brain Hermes voice responses"
+    prompt: "Voice Hermes timeout seconds"
+    password: false
+  - name: FLUXER_VOICE_HERMES_MAX_TOKENS
+    description: "Maximum tokens for full-brain Hermes voice responses"
+    prompt: "Voice Hermes max tokens"
+    password: false
+  - name: FLUXER_VOICE_HERMES_TEMPERATURE
+    description: "Sampling temperature for full-brain Hermes voice responses"
+    prompt: "Voice Hermes temperature"
+    password: false
+  - name: FLUXER_VOICE_MAX_TURNS
+    description: "Maximum turns handled by one voice loop process"
+    prompt: "Voice max turns"
+    password: false
+  - name: FLUXER_VOICE_INITIAL_SETTLE_SECONDS
+    description: "Seconds to wait after joining before capturing the first voice turn"
+    prompt: "Voice initial settle seconds"
+    password: false
+  - name: FLUXER_VOICE_SAMPLE_RATE
+    description: "PCM sample rate used for capture and publish"
+    prompt: "Voice sample rate"
+    password: false
+  - name: FLUXER_VOICE_FRAME_MS
+    description: "Audio frame duration in milliseconds"
+    prompt: "Voice frame ms"
+    password: false
+  - name: FLUXER_VOICE_ENERGY_THRESHOLD
+    description: "RMS threshold used by simple VAD"
+    prompt: "Voice VAD energy threshold"
+    password: false
+  - name: FLUXER_VOICE_START_COOLDOWN_SECONDS
+    description: "Cooldown before starting another auto-join voice loop"
+    prompt: "Voice auto-join start cooldown seconds"
+    password: false
+  - name: FLUXER_VOICE_STOP_TIMEOUT_SECONDS
+    description: "Seconds to wait for a voice child process to stop gracefully"
+    prompt: "Voice stop timeout seconds"
+    password: false
+  - name: FLUXER_VOICE_PYTHON
+    description: "Optional Python executable used to launch the voice supervisor/loop"
+    prompt: "Voice Python executable"
+    password: false

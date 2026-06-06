@@ -443,6 +443,19 @@ class FluxerVoiceSupervisorProcess:
             "context_file": "FLUXER_VOICE_CONTEXT_FILE",
             "session_db": "FLUXER_VOICE_SESSION_DB",
             "turn_log_jsonl": "FLUXER_VOICE_TURN_LOG_JSONL",
+            "python": "FLUXER_VOICE_PYTHON",
+            "hermes_url": "FLUXER_VOICE_HERMES_URL",
+            "hermes_model": "FLUXER_VOICE_HERMES_MODEL",
+            "hermes_timeout_seconds": "FLUXER_VOICE_HERMES_TIMEOUT_SECONDS",
+            "hermes_max_tokens": "FLUXER_VOICE_HERMES_MAX_TOKENS",
+            "hermes_temperature": "FLUXER_VOICE_HERMES_TEMPERATURE",
+            "max_turns": "FLUXER_VOICE_MAX_TURNS",
+            "initial_settle_seconds": "FLUXER_VOICE_INITIAL_SETTLE_SECONDS",
+            "sample_rate": "FLUXER_VOICE_SAMPLE_RATE",
+            "frame_ms": "FLUXER_VOICE_FRAME_MS",
+            "energy_threshold": "FLUXER_VOICE_ENERGY_THRESHOLD",
+            "start_cooldown_seconds": "FLUXER_VOICE_START_COOLDOWN_SECONDS",
+            "stop_timeout_seconds": "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
         }
         for key, env_name in mappings.items():
             if env_name not in env and key in voice:
@@ -454,6 +467,8 @@ class FluxerVoiceSupervisorProcess:
                 "end_padding_ms": "FLUXER_VOICE_END_PADDING_MS",
                 "min_segment_ms": "FLUXER_VOICE_MIN_SEGMENT_MS",
                 "max_segment_seconds": "FLUXER_VOICE_MAX_SEGMENT_SECONDS",
+                "energy_threshold": "FLUXER_VOICE_ENERGY_THRESHOLD",
+                "frame_ms": "FLUXER_VOICE_FRAME_MS",
             },
             "timeouts": {
                 "capture_seconds": "FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS",
@@ -461,6 +476,8 @@ class FluxerVoiceSupervisorProcess:
                 "xai_seconds": "FLUXER_VOICE_XAI_TIMEOUT_SECONDS",
                 "xai_first_audio_seconds": "FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS",
                 "max_runtime_seconds": "FLUXER_VOICE_MAX_RUNTIME_SECONDS",
+                "start_cooldown_seconds": "FLUXER_VOICE_START_COOLDOWN_SECONDS",
+                "stop_timeout_seconds": "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
             },
         }.items():
             values = voice.get(section_name)
@@ -2617,6 +2634,19 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "context_file": "FLUXER_VOICE_CONTEXT_FILE",
         "session_db": "FLUXER_VOICE_SESSION_DB",
         "turn_log_jsonl": "FLUXER_VOICE_TURN_LOG_JSONL",
+        "python": "FLUXER_VOICE_PYTHON",
+        "hermes_url": "FLUXER_VOICE_HERMES_URL",
+        "hermes_model": "FLUXER_VOICE_HERMES_MODEL",
+        "hermes_timeout_seconds": "FLUXER_VOICE_HERMES_TIMEOUT_SECONDS",
+        "hermes_max_tokens": "FLUXER_VOICE_HERMES_MAX_TOKENS",
+        "hermes_temperature": "FLUXER_VOICE_HERMES_TEMPERATURE",
+        "max_turns": "FLUXER_VOICE_MAX_TURNS",
+        "initial_settle_seconds": "FLUXER_VOICE_INITIAL_SETTLE_SECONDS",
+        "sample_rate": "FLUXER_VOICE_SAMPLE_RATE",
+        "frame_ms": "FLUXER_VOICE_FRAME_MS",
+        "energy_threshold": "FLUXER_VOICE_ENERGY_THRESHOLD",
+        "start_cooldown_seconds": "FLUXER_VOICE_START_COOLDOWN_SECONDS",
+        "stop_timeout_seconds": "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
     }
     for key, env_name in voice_scalar_env.items():
         if key in voice:
@@ -2629,6 +2659,8 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "end_padding_ms": "FLUXER_VOICE_END_PADDING_MS",
         "min_segment_ms": "FLUXER_VOICE_MIN_SEGMENT_MS",
         "max_segment_seconds": "FLUXER_VOICE_MAX_SEGMENT_SECONDS",
+        "energy_threshold": "FLUXER_VOICE_ENERGY_THRESHOLD",
+        "frame_ms": "FLUXER_VOICE_FRAME_MS",
     }.items():
         if key in vad:
             _set_env_default(env_name, vad.get(key))
@@ -2641,6 +2673,8 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "xai_seconds": "FLUXER_VOICE_XAI_TIMEOUT_SECONDS",
         "xai_first_audio_seconds": "FLUXER_VOICE_XAI_FIRST_AUDIO_TIMEOUT_SECONDS",
         "max_runtime_seconds": "FLUXER_VOICE_MAX_RUNTIME_SECONDS",
+        "start_cooldown_seconds": "FLUXER_VOICE_START_COOLDOWN_SECONDS",
+        "stop_timeout_seconds": "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
     }.items():
         if key in timeouts:
             _set_env_default(env_name, timeouts.get(key))
