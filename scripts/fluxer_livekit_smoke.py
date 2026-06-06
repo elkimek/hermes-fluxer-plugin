@@ -34,6 +34,10 @@ from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 
+def env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 async def run(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(message)s")
     token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
@@ -48,7 +52,7 @@ async def run(args: argparse.Namespace) -> int:
                 "bot_token": token,
                 "base_url": os.getenv("FLUXER_BASE_URL", ""),
                 "gateway_url": os.getenv("FLUXER_GATEWAY_URL", ""),
-                "allow_all_users": True,
+                "allow_all_users": env_truthy("FLUXER_ALLOW_ALL_USERS"),
             },
         )
     )

@@ -78,6 +78,13 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+async def _wait_for_source_playout(source: Any, *, label: str, timeout: float = 5.0) -> None:
+    try:
+        await asyncio.wait_for(_maybe_await(source.wait_for_playout()), timeout=timeout)
+    except TimeoutError:
+        logger.warning("Fluxer LiveKit %s playout wait timed out; closing anyway", label)
+
+
 async def _wait_for_livekit_subscription(publication: Any, *, timeout: float = 5.0) -> bool:
     """Wait briefly until at least one remote participant subscribes to a local track."""
 
@@ -219,10 +226,7 @@ class _LiveKitPcm16Publisher:
         self._buffer.clear()
         self._source = None
         if wait_for_playout:
-            try:
-                await asyncio.wait_for(_maybe_await(source.wait_for_playout()), timeout=5.0)
-            except TimeoutError:
-                logger.warning("Fluxer LiveKit PCM publisher playout wait timed out; closing anyway")
+            await _wait_for_source_playout(source, label="PCM publisher")
         await self._stop_track()
         close = getattr(source, "aclose", None)
         if close is not None:
@@ -397,7 +401,7 @@ class FluxerLiveKitSmokeBridge:
             )
             await _maybe_await(source.capture_frame(frame))
             emitted += samples
-        await _maybe_await(source.wait_for_playout())
+        await _wait_for_source_playout(source, label="test-tone")
         close = getattr(source, "aclose", None)
         if close is not None:
             await _maybe_await(close())
@@ -447,7 +451,7 @@ class FluxerLiveKitSmokeBridge:
                 samples = len(pcm) // 2
                 frame = rtc.AudioFrame(pcm, sample_rate, 1, samples)
                 await _maybe_await(source.capture_frame(frame))
-            await _maybe_await(source.wait_for_playout())
+            await _wait_for_source_playout(source, label="WAV-file")
             close = getattr(source, "aclose", None)
             if close is not None:
                 await _maybe_await(close())
@@ -497,7 +501,7 @@ class FluxerLiveKitSmokeBridge:
             samples = len(chunk) // 2
             frame = rtc.AudioFrame(chunk, sample_rate, 1, samples)
             await _maybe_await(source.capture_frame(frame))
-        await _maybe_await(source.wait_for_playout())
+        await _wait_for_source_playout(source, label="PCM16")
         close = getattr(source, "aclose", None)
         if close is not None:
             await _maybe_await(close())

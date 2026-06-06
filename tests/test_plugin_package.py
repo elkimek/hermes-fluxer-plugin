@@ -277,12 +277,17 @@ def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
     auto_join_source = (ROOT / "scripts" / "fluxer_voice_auto_join.py").read_text(encoding="utf-8")
     stt_loop_source = (ROOT / "scripts" / "fluxer_stt_voice_loop.py").read_text(encoding="utf-8")
     xai_room_loop_source = (ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text(encoding="utf-8")
+    livekit_smoke_source = (ROOT / "scripts" / "fluxer_livekit_smoke.py").read_text(encoding="utf-8")
+    duplex_smoke_source = (ROOT / "scripts" / "fluxer_xai_duplex_smoke.py").read_text(encoding="utf-8")
     adapter_source = (ROOT / "adapter.py").read_text(encoding="utf-8")
 
     assert "asyncio.timeout" not in livekit_source
+    assert "await _maybe_await(source.wait_for_playout())" not in livekit_source
     assert '"allow_all_users": True' not in auto_join_source
     assert '"allow_all_users": True' not in stt_loop_source
     assert '"allow_all_users": True' not in xai_room_loop_source
+    assert '"allow_all_users": True' not in livekit_smoke_source
+    assert '"allow_all_users": True' not in duplex_smoke_source
     assert "await asyncio.to_thread(_post_completion)" in stt_loop_source
     assert "stt_result = await asyncio.to_thread(" in stt_loop_source
     assert "__globals__" not in stt_loop_source
