@@ -164,6 +164,14 @@ async def _speech_segments(
             in_segment = False
             if len(pcm) >= min_bytes:
                 yield pcm
+    if in_segment and segment:
+        if trailing_silence > end_padding_bytes:
+            trim_bytes = trailing_silence - end_padding_bytes
+            if trim_bytes > 0:
+                del segment[-trim_bytes:]
+        pcm = bytes(segment)
+        if len(pcm) >= min_bytes:
+            yield pcm
 
 
 async def _capture_one_speech_segment(
@@ -339,7 +347,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 pcm = await _capture_one_speech_segment(args, bridge, timeout=max(1.0, remaining))
                 capture_seconds = time.monotonic() - capture_started
                 captured_audio_seconds = _pcm16_duration_seconds(pcm, sample_rate=args.sample_rate)
-            except TimeoutError:
+            except (TimeoutError, StopAsyncIteration):
                 break
         turn_no = len(turns) + 1
         logger.info("Captured speech turn %s bytes=%s rms=%s", turn_no, len(pcm), _pcm16_rms(pcm))
