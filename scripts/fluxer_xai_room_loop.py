@@ -491,7 +491,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                             )
                     barge_in_capture.stop_event.set()
                     barge_in_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
+                    with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                         await barge_in_task
                 publish_started = time.monotonic()
                 if publisher is not None and publisher.interrupted:

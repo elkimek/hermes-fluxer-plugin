@@ -912,7 +912,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                                 barge_in_seconds = time.monotonic() - xai_started
                                 await publisher.interrupt()
                                 xai_task.cancel()
-                                with contextlib.suppress(asyncio.CancelledError):
+                                with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                                     await xai_task
                                 raise BargeInInterrupt("user interrupted assistant speech before xAI audio")
                             try:
@@ -924,7 +924,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     finally:
                         if barge_event_task is not None:
                             barge_event_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
+                            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                                 await barge_event_task
                     xai_seconds = time.monotonic() - xai_started
                     if barge_in_capture.event.is_set():
@@ -987,11 +987,11 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     if barge_in_task is not None:
                         barge_in_capture.stop_event.set()
                         barge_in_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
+                        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                             await barge_in_task
                     if interrupt_watcher_task is not None:
                         interrupt_watcher_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
+                        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                             await interrupt_watcher_task
                     if not getattr(publisher, "interrupted", False):
                         await publisher.close()

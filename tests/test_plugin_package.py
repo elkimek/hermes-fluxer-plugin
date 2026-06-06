@@ -68,6 +68,13 @@ def test_asyncio_wait_for_timeout_handlers_are_python310_safe():
         assert "contextlib.suppress(TimeoutError, asyncio.TimeoutError)" in source
 
 
+def test_user_agent_version_matches_release_manifest():
+    source = (ROOT / "adapter.py").read_text(encoding="utf-8")
+
+    assert "Hermes-Fluxer/0.1" not in source
+    assert "Hermes-Fluxer/0.2" in source
+
+
 def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     for key in (
         "FLUXER_VOICE_ENABLED",

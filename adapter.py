@@ -159,7 +159,7 @@ def _headers(bot_token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bot {bot_token}",
         "Content-Type": "application/json",
-        "User-Agent": "Hermes-Fluxer/0.1",
+        "User-Agent": "Hermes-Fluxer/0.2",
     }
 
 
@@ -167,7 +167,7 @@ def _auth_headers(bot_token: str) -> Dict[str, str]:
     """Headers for requests where httpx must set Content-Type itself."""
     return {
         "Authorization": f"Bot {bot_token}",
-        "User-Agent": "Hermes-Fluxer/0.1",
+        "User-Agent": "Hermes-Fluxer/0.2",
     }
 
 
@@ -1842,7 +1842,7 @@ class FluxerAdapter(BasePlatformAdapter):
 
         if not is_safe_url(url):
             raise ValueError(f"Blocked unsafe Fluxer attachment URL: {safe_url_for_log(url)}")
-        headers = {"User-Agent": "Hermes-Fluxer/0.1", "Accept": "*/*"}
+        headers = {"User-Agent": "Hermes-Fluxer/0.2", "Accept": "*/*"}
         attachment_host = urlparse(url).netloc.lower()
         api_host = urlparse(self.api_base_url).netloc.lower()
         if attachment_host and api_host and attachment_host == api_host:
