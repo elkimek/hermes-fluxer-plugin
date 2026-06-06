@@ -254,7 +254,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--participant-identity-prefix", default=os.getenv("FLUXER_VOICE_PARTICIPANT_PREFIX") or os.getenv("FLUXER_AUTO_JOIN_PARTICIPANT_PREFIX", ""))
     parser.add_argument("--python", default=os.getenv("FLUXER_VOICE_PYTHON", sys.executable))
     parser.add_argument("--env-file", default=os.getenv("HERMES_ENV_FILE", str(Path.home() / ".hermes" / ".env")))
-    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default=os.getenv("FLUXER_VOICE_BRAIN_PROVIDER", "auto"))
+    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default=os.getenv("FLUXER_VOICE_BRAIN_PROVIDER", "hermes"))
     parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default=os.getenv("FLUXER_VOICE_STT_PROVIDER", "elevenlabs"))
     parser.add_argument("--stt-model", default=os.getenv("FLUXER_VOICE_STT_MODEL", "scribe_v2"))
     parser.add_argument("--elevenlabs-language-code", default=os.getenv("FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE", ""))

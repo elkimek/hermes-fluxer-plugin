@@ -46,7 +46,7 @@ def test_supervisor_builds_voice_loop_command_with_target_prefix():
     assert cmd[0] == "/py"
     assert "scripts/fluxer_stt_voice_loop.py" in cmd[1]
     assert ["--channel-id", "voice-1"] == cmd[cmd.index("--channel-id") : cmd.index("--channel-id") + 2]
-    assert ["--brain-provider", "auto"] == cmd[cmd.index("--brain-provider") : cmd.index("--brain-provider") + 2]
+    assert ["--brain-provider", "hermes"] == cmd[cmd.index("--brain-provider") : cmd.index("--brain-provider") + 2]
     assert ["--guild-id", "guild-1"] == cmd[cmd.index("--guild-id") : cmd.index("--guild-id") + 2]
     assert ["--participant-identity-prefix", "user_user-1_"] == cmd[
         cmd.index("--participant-identity-prefix") : cmd.index("--participant-identity-prefix") + 2

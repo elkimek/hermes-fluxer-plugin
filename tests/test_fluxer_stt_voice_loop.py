@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sqlite3
@@ -15,6 +16,8 @@ from scripts.fluxer_stt_voice_loop import (
     build_hermes_messages,
     collect_voice_session_recall,
     compose_system_prompt,
+    hermes_voice_session_identity,
+    hermes_chat_completion,
     is_voice_stop_request,
     load_env_file,
     load_voice_context_cache,
@@ -76,6 +79,69 @@ def test_compose_system_prompt_appends_cached_context():
     assert "base" in prompt
     assert "Cached deployment-local context" in prompt
     assert "the user likes direct answers" in prompt
+
+
+def test_hermes_voice_session_identity_derives_room_scoped_headers():
+    args = argparse.Namespace(
+        guild_id="guild/one",
+        channel_id="voice channel",
+        participant_identity_prefix="user_123_",
+        hermes_session_id="",
+        hermes_session_key="",
+    )
+
+    session_id, session_key = hermes_voice_session_identity(args)
+
+    assert session_id == "fluxer-voice-guild-one-voice-channel-user_123"
+    assert session_key == "fluxer:voice:guild:guild-one:channel:voice-channel:participant:user_123"
+    assert len(session_id) <= 256
+    assert len(session_key) <= 256
+
+
+@pytest.mark.asyncio
+async def test_hermes_chat_completion_sends_session_headers(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"persisted answer"}}]}'
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["headers"] = dict(req.header_items())
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setenv("API_SERVER_KEY", "test-key")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.urllib.request.urlopen", fake_urlopen)
+    args = argparse.Namespace(
+        hermes_url="http://127.0.0.1:8642",
+        hermes_model="Hermes",
+        hermes_timeout=12,
+        hermes_max_tokens=80,
+        hermes_temperature=0.4,
+        voice_session_db="/missing/state.db",
+        voice_system_prompt="system",
+        guild_id="guild1",
+        channel_id="channel1",
+        participant_identity_prefix="user_42_",
+        hermes_session_id="",
+        hermes_session_key="",
+    )
+
+    reply = await hermes_chat_completion("What mode is this?", history=[], args=args)
+
+    assert reply == "persisted answer"
+    assert captured["url"] == "http://127.0.0.1:8642/v1/chat/completions"
+    assert captured["timeout"] == 12
+    assert captured["headers"]["X-hermes-session-id"] == "fluxer-voice-guild1-channel1-user_42"
+    assert captured["headers"]["X-hermes-session-key"] == "fluxer:voice:guild:guild1:channel:channel1:participant:user_42"
 
 
 def test_load_voice_context_cache_reads_file_once(tmp_path):
@@ -263,7 +329,7 @@ def test_parse_args_defaults_to_realtime_voice_stack(monkeypatch):
     assert args.elevenlabs_language_code == ""
     assert args.capture_mode == "vad"
     assert args.capture_window_seconds == 3.0
-    assert args.brain_provider == "auto"
+    assert args.brain_provider == "hermes"
     assert args.hermes_url == "http://127.0.0.1:8642"
     assert args.voice_context_file == ""
     assert args.energy_threshold == 300

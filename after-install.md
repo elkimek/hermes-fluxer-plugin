@@ -50,11 +50,14 @@ Realtime voice is disabled by default. To let the plugin-managed supervisor auto
 ```bash
 FLUXER_VOICE_ENABLED=true
 FLUXER_VOICE_AUTO_JOIN=true
+FLUXER_VOICE_BRAIN_PROVIDER=hermes
 FLUXER_VOICE_TARGET_USER_IDS=your_fluxer_user_id
 FLUXER_VOICE_CHANNEL_IDS=your_voice_channel_id
 ```
 
-Or configure the equivalent `fluxer.voice` block in `~/.hermes/config.yaml`. Auto-join refuses to arm unless both `FLUXER_VOICE_TARGET_USER_IDS` and `FLUXER_VOICE_CHANNEL_IDS` are set, so an enabled plugin cannot silently listen to arbitrary users. Keep any deployment-local assistant/personality context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed. `FLUXER_VOICE_SUPERVISOR_DISABLED` is an internal child-process recursion guard and should normally be left empty/false.
+Or configure the equivalent `platforms.fluxer.extra.voice` block in `~/.hermes/config.yaml`, or use **Hermes Dashboard → Config → Fluxer**. `brain_provider: hermes` is the default/recommended mode for full Hermes session persistence and Honcho ingestion; `auto` and `xai-fast` are explicit latency trade-offs. Auto-join refuses to arm unless both target user IDs and channel IDs are set, so an enabled plugin cannot silently listen to arbitrary users. Keep any deployment-local assistant/personality context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed. `FLUXER_VOICE_SUPERVISOR_DISABLED` is an internal child-process recursion guard and should normally be left empty/false.
+
+For the full 43-field voice config reference, hardware/provider tuning notes, VAD guidance, and troubleshooting, read `docs/voice-configuration.md`.
 
 ## 6. Restart and test
 

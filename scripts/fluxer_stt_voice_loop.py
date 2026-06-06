@@ -466,6 +466,41 @@ def build_full_brain_transcript(transcript: str, *, args: argparse.Namespace) ->
     return transcript, recall
 
 
+def _safe_session_fragment(value: str | None, *, fallback: str) -> str:
+    """Return a header-safe session-id fragment for Hermes API calls."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        raw = fallback
+    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "-", raw).strip("-._:")
+    return cleaned[:80] or fallback
+
+
+def hermes_voice_session_identity(args: argparse.Namespace) -> tuple[str, str]:
+    """Stable Hermes session id/key for a Fluxer voice room.
+
+    ``/v1/chat/completions`` is stateless unless callers provide
+    ``X-Hermes-Session-Id`` and ``X-Hermes-Session-Key``. Voice mode uses
+    stable room-scoped values so full-brain turns become normal persisted
+    Hermes sessions and Honcho can scope long-term memory to the same room.
+    """
+
+    configured_id = str(getattr(args, "hermes_session_id", "") or "").strip()
+    configured_key = str(getattr(args, "hermes_session_key", "") or "").strip()
+    guild = _safe_session_fragment(getattr(args, "guild_id", None), fallback="noguild")
+    channel = _safe_session_fragment(getattr(args, "channel_id", None), fallback="nochannel")
+    participant = _safe_session_fragment(
+        getattr(args, "participant_identity_prefix", None) or getattr(args, "participant_identity", None),
+        fallback="room",
+    )
+    default_id = f"fluxer-voice-{guild}-{channel}-{participant}"
+    default_key = f"fluxer:voice:guild:{guild}:channel:{channel}:participant:{participant}"
+    session_id = _safe_session_fragment(configured_id, fallback=default_id)
+    session_key = configured_key or default_key
+    # The API server caps both session headers at 256 chars.
+    return session_id[:256], session_key[:256]
+
+
 async def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], args: argparse.Namespace) -> str:
     api_key = os.getenv("API_SERVER_KEY", "").strip()
     if not api_key:
@@ -484,6 +519,7 @@ async def hermes_chat_completion(transcript: str, *, history: list[dict[str, str
             "temperature": args.hermes_temperature,
         }
     ).encode("utf-8")
+    session_id, session_key = hermes_voice_session_identity(args)
     req = urllib.request.Request(
         args.hermes_url.rstrip("/") + "/v1/chat/completions",
         data=payload,
@@ -491,6 +527,8 @@ async def hermes_chat_completion(transcript: str, *, history: list[dict[str, str
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "X-Hermes-Session-Id": session_id,
+            "X-Hermes-Session-Key": session_key,
         },
     )
     def _post_completion() -> dict[str, Any]:
@@ -739,6 +777,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     sticky_brain_provider,
                     transcript,
                 )
+                hermes_session_id, hermes_session_key = hermes_voice_session_identity(args)
                 brain_started = time.monotonic()
                 if should_stop_after_reply:
                     reply_text = "Got it, stopping here."
@@ -796,6 +835,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         "brain_provider": selected_brain_provider,
                         "brain_provider_config": args.brain_provider,
                         "brain_route_reason": brain_route_reason,
+                        "hermes_session_id": hermes_session_id if selected_brain_provider == "hermes" else None,
+                        "hermes_session_key": hermes_session_key if selected_brain_provider == "hermes" else None,
                         "sticky_brain_provider": sticky_brain_provider,
                         "brain_seconds": round(brain_seconds, 3),
                         "reply_transcript": spoken_reply,
@@ -903,12 +944,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-segment-ms", type=int, default=int(os.getenv("FLUXER_VOICE_MIN_SEGMENT_MS", "1600")))
     parser.add_argument("--max-segment-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_SEGMENT_SECONDS", "12.0")))
     parser.add_argument("--voice", default=os.getenv("FLUXER_VOICE_TTS_VOICE", "eve"))
-    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default=os.getenv("FLUXER_VOICE_BRAIN_PROVIDER", "auto"))
+    parser.add_argument("--brain-provider", choices=("auto", "xai-fast", "xai", "hermes"), default=os.getenv("FLUXER_VOICE_BRAIN_PROVIDER", "hermes"))
     parser.add_argument("--hermes-url", default=os.getenv("FLUXER_VOICE_HERMES_URL", "http://127.0.0.1:8642"))
     parser.add_argument("--hermes-model", default=os.getenv("FLUXER_VOICE_HERMES_MODEL") or os.getenv("API_SERVER_MODEL_NAME") or "Hermes")
     parser.add_argument("--hermes-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_HERMES_TIMEOUT_SECONDS", "90.0")))
     parser.add_argument("--hermes-max-tokens", type=int, default=int(os.getenv("FLUXER_VOICE_HERMES_MAX_TOKENS", "90")))
     parser.add_argument("--hermes-temperature", type=float, default=float(os.getenv("FLUXER_VOICE_HERMES_TEMPERATURE", "0.4")))
+    parser.add_argument(
+        "--hermes-session-id",
+        default=os.getenv("FLUXER_VOICE_HERMES_SESSION_ID", ""),
+        help="Optional stable Hermes session id for persisted full-brain voice turns; defaults to the Fluxer voice room identity",
+    )
+    parser.add_argument(
+        "--hermes-session-key",
+        default=os.getenv("FLUXER_VOICE_HERMES_SESSION_KEY", ""),
+        help="Optional stable Hermes long-term memory key for persisted full-brain voice turns; defaults to the Fluxer voice room identity",
+    )
     parser.add_argument("--stt-provider", choices=("auto", "local", "groq", "xai", "elevenlabs"), default=os.getenv("FLUXER_VOICE_STT_PROVIDER", "elevenlabs"))
     parser.add_argument("--stt-model", default=os.getenv("FLUXER_VOICE_STT_MODEL", "medium.en"), help="STT model; ElevenLabs commonly uses scribe_v2, local commonly uses medium.en, Groq commonly uses whisper-large-v3-turbo")
     parser.add_argument(

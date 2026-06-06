@@ -70,11 +70,12 @@ Minimum auto-join env:
 ```bash
 FLUXER_VOICE_ENABLED=true
 FLUXER_VOICE_AUTO_JOIN=true
+FLUXER_VOICE_BRAIN_PROVIDER=hermes
 FLUXER_VOICE_TARGET_USER_IDS=your_fluxer_user_id
 FLUXER_VOICE_CHANNEL_IDS=your_voice_channel_id
 ```
 
-Equivalent YAML can be placed under `platforms.fluxer.extra.voice` / `fluxer.voice` depending on the user's config shape; see `README.md` for the complete voice matrix. Auto-join must have both target user IDs and channel IDs; empty target users intentionally means it will not watch anyone. Keep deployment-local assistant context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed. `FLUXER_VOICE_SUPERVISOR_DISABLED` is an internal child-process recursion guard and should not be used as a normal setup toggle.
+Equivalent YAML lives under `platforms.fluxer.extra.voice`; the dashboard exposes it at **Config → Fluxer**. `brain_provider: hermes` is the default/recommended mode because it gives full Hermes session persistence and Honcho ingestion; use `auto` or `xai-fast` only when the user explicitly accepts the speed-vs-memory trade-off. Read `docs/voice-configuration.md` before changing non-obvious provider, VAD, timeout, or local-path settings. Auto-join must have both target user IDs and channel IDs; empty target users intentionally means it will not watch anyone. Keep deployment-local assistant context outside the repo and point to it with `FLUXER_VOICE_CONTEXT_FILE` only if needed. `FLUXER_VOICE_SUPERVISOR_DISABLED` is an internal child-process recursion guard and should not be used as a normal setup toggle.
 
 ## Restart
 

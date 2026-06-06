@@ -150,7 +150,7 @@ optional_env:
     prompt: "LiveKit participant identity prefix"
     password: false
   - name: FLUXER_VOICE_BRAIN_PROVIDER
-    description: "Voice brain mode: auto, xai-fast, xai, or hermes"
+    description: "Voice brain mode: hermes (recommended full-session default), auto, xai-fast, or xai"
     prompt: "Voice brain provider"
     password: false
   - name: FLUXER_VOICE_STT_PROVIDER
@@ -236,6 +236,14 @@ optional_env:
   - name: FLUXER_VOICE_HERMES_TEMPERATURE
     description: "Sampling temperature for full-brain Hermes voice responses"
     prompt: "Voice Hermes temperature"
+    password: false
+  - name: FLUXER_VOICE_HERMES_SESSION_ID
+    description: "Optional stable Hermes session id for persisted full-brain voice turns; defaults to the Fluxer voice room identity"
+    prompt: "Voice Hermes session ID"
+    password: false
+  - name: FLUXER_VOICE_HERMES_SESSION_KEY
+    description: "Optional stable Hermes long-term memory key for persisted full-brain voice turns; defaults to the Fluxer voice room identity"
+    prompt: "Voice Hermes session key"
     password: false
   - name: FLUXER_VOICE_MAX_TURNS
     description: "Maximum turns handled by one voice loop process"

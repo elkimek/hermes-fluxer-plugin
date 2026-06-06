@@ -43,7 +43,10 @@ def test_voice_env_surface_is_declared_and_documented():
     used = set(__import__("re").findall(r"FLUXER_VOICE_[A-Z0-9_]+", code_text))
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
     manifest_vars = {item["name"] for item in manifest["optional_env"]}
-    docs_text = (ROOT / "README.md").read_text(encoding="utf-8") + (ROOT / "after-install.md").read_text(encoding="utf-8")
+    docs_text = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in ("README.md", "after-install.md", "docs/voice-configuration.md")
+    )
     documented = set(__import__("re").findall(r"FLUXER_VOICE_[A-Z0-9_]+", docs_text))
 
     assert used - manifest_vars == set()
@@ -62,6 +65,8 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
         "FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS",
         "FLUXER_VOICE_HERMES_URL",
         "FLUXER_VOICE_HERMES_MAX_TOKENS",
+        "FLUXER_VOICE_HERMES_SESSION_ID",
+        "FLUXER_VOICE_HERMES_SESSION_KEY",
         "FLUXER_VOICE_FRAME_MS",
         "FLUXER_VOICE_ENERGY_THRESHOLD",
         "FLUXER_VOICE_START_COOLDOWN_SECONDS",
@@ -80,6 +85,8 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
                 "stt_provider": "elevenlabs",
                 "hermes_url": "http://127.0.0.1:8642",
                 "hermes_max_tokens": 123,
+                "hermes_session_id": "voice-session-test",
+                "hermes_session_key": "fluxer:voice:test",
                 "vad": {"silence_ms": 850, "frame_ms": 20, "energy_threshold": 300},
                 "timeouts": {"capture_seconds": 90, "start_cooldown_seconds": 5},
             }
@@ -94,6 +101,8 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     assert os.environ["FLUXER_VOICE_STT_PROVIDER"] == "elevenlabs"
     assert os.environ["FLUXER_VOICE_HERMES_URL"] == "http://127.0.0.1:8642"
     assert os.environ["FLUXER_VOICE_HERMES_MAX_TOKENS"] == "123"
+    assert os.environ["FLUXER_VOICE_HERMES_SESSION_ID"] == "voice-session-test"
+    assert os.environ["FLUXER_VOICE_HERMES_SESSION_KEY"] == "fluxer:voice:test"
     assert os.environ["FLUXER_VOICE_SILENCE_MS"] == "850"
     assert os.environ["FLUXER_VOICE_FRAME_MS"] == "20"
     assert os.environ["FLUXER_VOICE_ENERGY_THRESHOLD"] == "300"
