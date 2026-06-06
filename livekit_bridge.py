@@ -219,7 +219,10 @@ class _LiveKitPcm16Publisher:
         self._buffer.clear()
         self._source = None
         if wait_for_playout:
-            await _maybe_await(source.wait_for_playout())
+            try:
+                await asyncio.wait_for(_maybe_await(source.wait_for_playout()), timeout=5.0)
+            except TimeoutError:
+                logger.warning("Fluxer LiveKit PCM publisher playout wait timed out; closing anyway")
         await self._stop_track()
         close = getattr(source, "aclose", None)
         if close is not None:

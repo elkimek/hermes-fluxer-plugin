@@ -84,15 +84,15 @@ async def test_xai_realtime_public_sink_methods_timeout_session_setup(monkeypatc
     async def sink(chunk: bytes):
         raise AssertionError("sink should not receive audio when setup stalls")
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="did not finish within 0.001s"):
         await client.force_message_to_sink("hello", sink, timeout=0.001)
     assert opened[-1].closed is True
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="did not finish within 0.001s"):
         await client.text_response_to_sink("hello", sink, timeout=0.001)
     assert opened[-1].closed is True
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="did not finish within 0.001s"):
         await client.audio_response_from_pcm16_to_sink(b"\x01\x00", sink, timeout=0.001)
     assert opened[-1].closed is True
 

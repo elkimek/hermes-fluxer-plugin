@@ -766,15 +766,13 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     frame_ms=args.frame_ms,
                     track_name=f"fluxer-stt-loop-reply-{turn_no}",
                 )
-                await publisher.__aenter__()
+                async with publisher:
+                    async def publish_delta(chunk: bytes) -> None:
+                        nonlocal first_audio_seconds
+                        if first_audio_seconds is None:
+                            first_audio_seconds = time.monotonic() - xai_started
+                        await publisher.write(chunk)
 
-                async def publish_delta(chunk: bytes) -> None:
-                    nonlocal first_audio_seconds
-                    if first_audio_seconds is None:
-                        first_audio_seconds = time.monotonic() - xai_started
-                    await publisher.write(chunk)
-
-                try:
                     if reply_text:
                         xai_result = await voice.force_message_to_sink(
                             prompt,
@@ -789,8 +787,6 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                             timeout=args.xai_timeout,
                             first_audio_timeout=args.xai_first_audio_timeout,
                         )
-                finally:
-                    await publisher.__aexit__(None, None, None)
                 xai_seconds = time.monotonic() - xai_started
                 spoken_reply = reply_text or xai_result.transcript
                 history.append({"user": transcript, "assistant": spoken_reply})

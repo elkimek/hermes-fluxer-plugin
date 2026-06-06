@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 import livekit_bridge
@@ -277,6 +279,36 @@ async def test_pcm16_publisher_streams_chunks_and_flushes_remainder(monkeypatch)
     assert publisher.bytes_published == 90
     assert source.waited is True
     assert source.closed is True
+
+
+@pytest.mark.asyncio
+async def test_pcm16_publisher_close_times_out_hung_playout(monkeypatch):
+    FakeAudioSource.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FakeRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+    wait_for_calls = []
+
+    async def hung_wait_for_playout(self):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(FakeAudioSource, "wait_for_playout", hung_wait_for_playout)
+    original_wait_for = livekit_bridge.asyncio.wait_for
+
+    async def fast_wait_for(awaitable, timeout):
+        wait_for_calls.append(timeout)
+        return await original_wait_for(awaitable, timeout=0.001)
+
+    monkeypatch.setattr(livekit_bridge.asyncio, "wait_for", fast_wait_for)
+
+    async with bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="fluxer-stream") as publisher:
+        await publisher.write(b"\x01\x00" * 20)
+
+    source = FakeAudioSource.instances[0]
+    assert wait_for_calls == [5.0]
+    assert source.closed is True
+    assert room.local_participant.unpublished == ["track-sid"]
 
 
 @pytest.mark.asyncio
