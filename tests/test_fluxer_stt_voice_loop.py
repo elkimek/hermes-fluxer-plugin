@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import wave
+from types import SimpleNamespace
+
+import pytest
 
 from scripts.fluxer_stt_voice_loop import (
     append_jsonl,
@@ -14,6 +17,7 @@ from scripts.fluxer_stt_voice_loop import (
     looks_like_clipped_non_english_noise,
     normalize_voice_transcript,
     parse_args,
+    run_stt_voice_loop,
     safe_stt_summary,
     transcribe_with_provider,
     write_pcm16_wav,
@@ -224,3 +228,83 @@ def test_load_env_file_does_not_override_existing_or_shell_source(tmp_path, monk
 
     assert os.environ["KEEP"] == "existing"
     assert os.environ["NEW_VALUE"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_stt_voice_loop_leaves_with_fluxer_connection_id(monkeypatch, tmp_path):
+    sends = []
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            sends.append((channel_id, kwargs))
+            if channel_id is not None:
+                assert self.handler is not None
+                await self.handler(
+                    {
+                        "endpoint": "wss://voice.example",
+                        "token": "secret-token",
+                        "guild_id": kwargs.get("guild_id"),
+                        "channel_id": channel_id,
+                        "connection_id": "conn-123",
+                    },
+                    {"connection_id": "conn-123", "has_token": True},
+                )
+            return True
+
+        async def disconnect(self):
+            sends.append(("adapter_disconnect", {}))
+
+    class FakeBridge:
+        def __init__(self, auto_subscribe=True):
+            pass
+
+        async def connect_from_voice_server_update(self, raw_update):
+            return SimpleNamespace(
+                endpoint=raw_update["endpoint"],
+                guild_id=raw_update["guild_id"],
+                channel_id=raw_update["channel_id"],
+                connection_id=raw_update["connection_id"],
+                room_name="room",
+                participant_identity="bot_conn-123",
+            )
+
+        async def disconnect(self):
+            sends.append(("bridge_disconnect", {}))
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("XAI_API_KEY", "xai")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
+
+    args = parse_args(
+        [
+            "--channel-id",
+            "voice-1",
+            "--guild-id",
+            "guild-1",
+            "--max-turns",
+            "0",
+            "--initial-settle-seconds",
+            "0",
+            "--voice-context-file",
+            str(tmp_path / "missing-context.md"),
+        ]
+    )
+
+    result = await run_stt_voice_loop(args)
+
+    assert result["connection"]["connection_id"] == "conn-123"
+    assert sends[0] == ("voice-1", {"guild_id": "guild-1", "self_mute": True, "self_deaf": False})
+    assert (None, {"guild_id": "guild-1", "connection_id": "conn-123"}) in sends

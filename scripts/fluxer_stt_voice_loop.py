@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -319,6 +320,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     bridge = FluxerLiveKitSmokeBridge(auto_subscribe=True)
     connected = asyncio.Event()
     finished = asyncio.Event()
+    shutdown_requested = asyncio.Event()
+    leave_connection_id: str | None = None
     result: dict[str, Any] = {
         "mode": "stt_backed_voice_loop",
         "turn_count": 0,
@@ -330,8 +333,10 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     history: list[dict[str, str]] = []
 
     async def handler(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
+        nonlocal leave_connection_id
         try:
             info = await bridge.connect_from_voice_server_update(raw_update)
+            leave_connection_id = info.connection_id
             result["connection"] = {
                 "endpoint": info.endpoint,
                 "guild_id": info.guild_id,
@@ -347,6 +352,9 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             await asyncio.sleep(args.initial_settle_seconds)
 
             for turn_no in range(1, args.max_turns + 1):
+                if shutdown_requested.is_set():
+                    result["stop_requested"] = True
+                    break
                 turn_started = time.monotonic()
                 try:
                     if args.capture_mode == "vad":
@@ -492,6 +500,19 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             finished.set()
 
     adapter.set_voice_server_update_handler(handler)
+    loop = asyncio.get_running_loop()
+    previous_signal_handlers: dict[signal.Signals, Any] = {}
+
+    def request_shutdown_from_signal() -> None:
+        result["signal_stop_requested"] = True
+        shutdown_requested.set()
+        finished.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_signal_handlers[sig] = signal.getsignal(sig)
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, request_shutdown_from_signal)
+
     await adapter.connect()
     try:
         await adapter.wait_until_gateway_ready(timeout=args.connect_timeout)
@@ -499,10 +520,16 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         await asyncio.wait_for(connected.wait(), timeout=args.connect_timeout)
         await asyncio.wait_for(finished.wait(), timeout=args.max_runtime_seconds)
     finally:
+        shutdown_requested.set()
         with contextlib.suppress(Exception):
-            await adapter.send_voice_state_update(None, guild_id=args.guild_id)
+            await adapter.send_voice_state_update(None, guild_id=args.guild_id, connection_id=leave_connection_id)
         await bridge.disconnect()
         await adapter.disconnect()
+        for sig, old_handler in previous_signal_handlers.items():
+            with contextlib.suppress(NotImplementedError):
+                loop.remove_signal_handler(sig)
+            if old_handler not in (None, signal.SIG_DFL):
+                signal.signal(sig, old_handler)
     return result
 
 
