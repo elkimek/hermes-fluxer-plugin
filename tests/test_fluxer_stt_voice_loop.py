@@ -94,7 +94,28 @@ def test_hermes_voice_session_identity_derives_room_scoped_headers():
 
     assert session_id == "fluxer-voice-guild-one-voice-channel-user_123"
     assert session_key == "fluxer:voice:guild:guild-one:channel:voice-channel:participant:user_123"
-    assert len(session_id) <= 256
+    assert len(session_id) <= 64
+    assert len(session_key) <= 256
+
+
+def test_hermes_voice_session_identity_bounds_long_room_ids_for_provider_cache_key():
+    args = argparse.Namespace(
+        guild_id="1234567890123456789",
+        channel_id="2234567890123456789",
+        participant_identity_prefix="user_3234567890123456789_",
+        hermes_session_id="",
+        hermes_session_key="",
+    )
+
+    session_id, session_key = hermes_voice_session_identity(args)
+
+    assert session_id.startswith("fluxer-voice-")
+    assert len(session_id) <= 64
+    assert session_id != "fluxer-voice-1234567890123456789-2234567890123456789-user_3234567890123456789"
+    assert session_key == (
+        "fluxer:voice:guild:1234567890123456789:channel:2234567890123456789:"
+        "participant:user_3234567890123456789"
+    )
     assert len(session_key) <= 256
 
 

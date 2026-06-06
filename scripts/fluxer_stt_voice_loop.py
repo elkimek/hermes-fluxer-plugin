@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -476,6 +477,22 @@ def _safe_session_fragment(value: str | None, *, fallback: str) -> str:
     return cleaned[:80] or fallback
 
 
+def _bounded_session_id(value: str, *, max_len: int = 64) -> str:
+    """Keep session ids short enough for provider prompt-cache keys.
+
+    Hermes accepts longer session headers, but some providers derive a
+    ``prompt_cache_key`` from the session id and reject values over 64 chars.
+    Preserve readability for short ids; hash only when needed.
+    """
+
+    cleaned = _safe_session_fragment(value, fallback="fluxer-voice")
+    if len(cleaned) <= max_len:
+        return cleaned
+    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+    prefix = cleaned[: max_len - len(digest) - 1].rstrip("-._:") or "fluxer-voice"
+    return f"{prefix}-{digest}"[:max_len]
+
+
 def hermes_voice_session_identity(args: argparse.Namespace) -> tuple[str, str]:
     """Stable Hermes session id/key for a Fluxer voice room.
 
@@ -495,10 +512,11 @@ def hermes_voice_session_identity(args: argparse.Namespace) -> tuple[str, str]:
     )
     default_id = f"fluxer-voice-{guild}-{channel}-{participant}"
     default_key = f"fluxer:voice:guild:{guild}:channel:{channel}:participant:{participant}"
-    session_id = _safe_session_fragment(configured_id, fallback=default_id)
+    session_id = _bounded_session_id(configured_id or default_id, max_len=64)
     session_key = configured_key or default_key
-    # The API server caps both session headers at 256 chars.
-    return session_id[:256], session_key[:256]
+    # The API server caps session headers at 256 chars, while provider prompt
+    # cache keys may reject session ids over 64 chars.
+    return session_id, session_key[:256]
 
 
 async def hermes_chat_completion(transcript: str, *, history: list[dict[str, str]], args: argparse.Namespace) -> str:
