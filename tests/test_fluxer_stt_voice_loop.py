@@ -803,3 +803,153 @@ async def test_stt_voice_loop_fails_before_voice_state_when_gateway_ready_times_
         await run_stt_voice_loop(args)
 
     assert sends == [("ready", 0.01), (None, {"guild_id": "guild-1", "connection_id": None}), ("bridge_disconnect", {}), ("adapter_disconnect", {})]
+
+
+@pytest.mark.asyncio
+async def test_stt_voice_loop_barge_in_watcher_cancels_after_first_audio_when_xai_stalls(monkeypatch, tmp_path):
+    sends = []
+    first_audio_written = asyncio.Event()
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            sends.append((channel_id, kwargs))
+            if channel_id is not None:
+                assert self.handler is not None
+                await self.handler(
+                    {
+                        "endpoint": "wss://voice.example",
+                        "token": "secret-token",
+                        "guild_id": kwargs.get("guild_id"),
+                        "channel_id": channel_id,
+                        "connection_id": "conn-barge",
+                    },
+                    {"connection_id": "conn-barge", "has_token": True},
+                )
+            return True
+
+        async def disconnect(self):
+            sends.append(("adapter_disconnect", {}))
+
+    class FakePublisher:
+        def __init__(self):
+            self.bytes_published = 0
+            self.interrupted = False
+            self.last_queue_duration_before_interrupt = 0.25
+            self.last_queue_duration_after_clear = 0.0
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def write_interruptible(self, chunk, should_interrupt):
+            if await should_interrupt():
+                await self.interrupt()
+                return True
+            self.bytes_published += len(chunk)
+            first_audio_written.set()
+            return False
+
+        async def interrupt(self):
+            self.interrupted = True
+            self.last_queue_duration_after_clear = 0.0
+
+        async def close(self, **kwargs):
+            self.closed = True
+
+    publishers = []
+
+    class FakeBridge:
+        def __init__(self, auto_subscribe=True):
+            pass
+
+        async def connect_from_voice_server_update(self, raw_update):
+            return SimpleNamespace(
+                endpoint=raw_update["endpoint"],
+                guild_id=raw_update["guild_id"],
+                channel_id=raw_update["channel_id"],
+                connection_id=raw_update["connection_id"],
+                room_name="room",
+                participant_identity="bot_conn-barge",
+            )
+
+        def pcm16_publisher(self, **kwargs):
+            publisher = FakePublisher()
+            publishers.append(publisher)
+            return publisher
+
+        async def disconnect(self):
+            sends.append(("bridge_disconnect", {}))
+
+    class FakeVoiceClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def force_message_to_sink(self, prompt, sink, **kwargs):
+            await sink(b"\x01\x00" * 240)
+            await asyncio.Event().wait()
+
+    async def fake_barge_in(args, bridge, capture):
+        await first_audio_written.wait()
+        capture.detected_seconds = 0.05
+        capture.max_rms = 1234
+        capture.voiced_ms = args.barge_in_min_ms
+        capture.chunks_seen = 2
+        capture.captured_audio_seconds = 0.2
+        capture.event.set()
+        capture.ready.set()
+        await asyncio.Event().wait()
+
+    async def fake_capture(*args, **kwargs):
+        return b"\x01\x00" * 24_000
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("XAI_API_KEY", "xai")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.XAIRealtimeVoiceClient", FakeVoiceClient)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._wait_for_barge_in", fake_barge_in)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._capture_one_speech_segment", fake_capture)
+    monkeypatch.setattr(
+        "scripts.fluxer_stt_voice_loop.transcribe_with_provider",
+        lambda *args, **kwargs: {"success": True, "transcript": "give me a long answer", "provider": "fake", "model": "fake"},
+    )
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.hermes_chat_completion", lambda *args, **kwargs: asyncio.sleep(0, result="long reply"))
+
+    args = parse_args(
+        [
+            "--channel-id",
+            "voice-1",
+            "--guild-id",
+            "guild-1",
+            "--max-turns",
+            "1",
+            "--initial-settle-seconds",
+            "0",
+            "--brain-provider",
+            "hermes",
+            "--barge-in-after-first-audio-only",
+            "--turn-log-jsonl",
+            str(tmp_path / "turns.jsonl"),
+            "--voice-context-file",
+            str(tmp_path / "missing-context.md"),
+        ]
+    )
+
+    result = await asyncio.wait_for(run_stt_voice_loop(args), timeout=2.0)
+
+    assert result["turns"][0]["interrupted"] is True
+    assert result["turns"][0]["published"] is False
+    assert result["turns"][0]["publisher_queue_after_clear_seconds"] == 0.0
+    assert publishers[0].interrupted is True

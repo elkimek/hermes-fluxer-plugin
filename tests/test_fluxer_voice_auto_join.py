@@ -56,6 +56,10 @@ def test_supervisor_builds_voice_loop_command_with_target_prefix():
     assert ["--max-segment-seconds", "9.0"] == cmd[
         cmd.index("--max-segment-seconds") : cmd.index("--max-segment-seconds") + 2
     ]
+    assert ["--barge-in-energy-threshold", "300"] == cmd[
+        cmd.index("--barge-in-energy-threshold") : cmd.index("--barge-in-energy-threshold") + 2
+    ]
+    assert ["--barge-in-min-ms", "120"] == cmd[cmd.index("--barge-in-min-ms") : cmd.index("--barge-in-min-ms") + 2]
 
 
 def test_supervisor_with_empty_targets_watches_nobody(monkeypatch):

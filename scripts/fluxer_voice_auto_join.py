@@ -120,6 +120,12 @@ class FluxerVoiceAutoJoinSupervisor:
             str(self.args.min_segment_ms),
             "--max-segment-seconds",
             str(self.args.max_segment_seconds),
+            "--barge-in-energy-threshold",
+            str(self.args.barge_in_energy_threshold),
+            "--barge-in-min-ms",
+            str(self.args.barge_in_min_ms),
+            "--barge-in-capture-timeout",
+            str(self.args.barge_in_capture_timeout),
             "--max-runtime-seconds",
             str(self.args.max_runtime_seconds),
             "--turn-log-jsonl",
@@ -295,6 +301,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--end-padding-ms", type=int, default=int(os.getenv("FLUXER_VOICE_END_PADDING_MS", "180")))
     parser.add_argument("--min-segment-ms", type=int, default=int(os.getenv("FLUXER_VOICE_MIN_SEGMENT_MS", "1200")))
     parser.add_argument("--max-segment-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_SEGMENT_SECONDS", "9.0")))
+    parser.add_argument("--barge-in-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", os.getenv("FLUXER_VOICE_ENERGY_THRESHOLD", "300"))))
+    parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "120")))
+    parser.add_argument("--barge-in-capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS", "2.0")))
     parser.add_argument("--max-runtime-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_RUNTIME_SECONDS", "3600.0")))
     parser.add_argument("--connect-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS", "30.0")))
     parser.add_argument("--start-cooldown-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_START_COOLDOWN_SECONDS", "5.0")))
