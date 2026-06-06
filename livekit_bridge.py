@@ -540,8 +540,10 @@ class FluxerLiveKitSmokeBridge:
             raise ValueError("frame_size_ms must be positive")
 
         rtc = _load_livekit_audio_helpers()
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         stream_tasks: list[asyncio.Task[Any]] = []
+        active_streams = 0
+        saw_matching_stream = False
 
         def maybe_track_is_audio(track: Any) -> bool:
             kind = getattr(track, "kind", None)
@@ -556,9 +558,7 @@ class FluxerLiveKitSmokeBridge:
             return True
 
         async def consume_track(track: Any, participant: Any) -> None:
-            identity = getattr(participant, "identity", None)
-            if not participant_matches(identity):
-                return
+            nonlocal active_streams
             stream = rtc.AudioStream.from_track(
                 track=track,
                 sample_rate=sample_rate,
@@ -575,10 +575,22 @@ class FluxerLiveKitSmokeBridge:
                 close = getattr(stream, "aclose", None)
                 if close is not None:
                     await _maybe_await(close())
+                active_streams = max(0, active_streams - 1)
+                if saw_matching_stream and active_streams == 0:
+                    await queue.put(None)
+
+        def schedule_track(track: Any, participant: Any) -> None:
+            nonlocal active_streams, saw_matching_stream
+            identity = getattr(participant, "identity", None)
+            if not participant_matches(identity):
+                return
+            active_streams += 1
+            saw_matching_stream = True
+            stream_tasks.append(asyncio.create_task(consume_track(track, participant)))
 
         def on_track_subscribed(track: Any, publication: Any, participant: Any) -> None:
             if maybe_track_is_audio(track):
-                stream_tasks.append(asyncio.create_task(consume_track(track, participant)))
+                schedule_track(track, participant)
 
         room = self._room
         if room is None:
@@ -601,10 +613,13 @@ class FluxerLiveKitSmokeBridge:
                 for publication in getattr(participant, "track_publications", {}).values():
                     track = getattr(publication, "track", None)
                     if track is not None and maybe_track_is_audio(track):
-                        stream_tasks.append(asyncio.create_task(consume_track(track, participant)))
+                        schedule_track(track, participant)
             try:
                 while True:
-                    yield await queue.get()
+                    chunk = await queue.get()
+                    if chunk is None:
+                        return
+                    yield chunk
             finally:
                 remove_track_subscribed_handler()
                 for task in stream_tasks:

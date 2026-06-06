@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from scripts.fluxer_voice_auto_join import (
@@ -141,3 +143,35 @@ async def test_supervisor_restarts_when_target_moves_channels(monkeypatch):
     await sup.start_voice_loop(guild_id="guild-1", channel_id="voice-2")
 
     assert events == [("spawn", "voice-1"), ("terminate", "voice-1"), ("spawn", "voice-2")]
+
+
+@pytest.mark.asyncio
+async def test_stop_voice_loop_does_not_hang_when_killed_process_wait_times_out():
+    args = parse_args([
+        "--target-user-ids",
+        "user-1",
+        "--channel-ids",
+        "voice-1",
+        "--stop-timeout-seconds",
+        "0.01",
+    ])
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    events = []
+
+    class HungProcess:
+        returncode = None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+        async def wait(self):
+            await asyncio.sleep(60)
+
+    sup.process = HungProcess()  # type: ignore[assignment]
+
+    await sup.stop_voice_loop("test timeout")
+
+    assert events == ["terminate", "kill"]

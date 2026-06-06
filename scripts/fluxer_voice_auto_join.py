@@ -163,7 +163,10 @@ class FluxerVoiceAutoJoinSupervisor:
         except asyncio.TimeoutError:
             logger.warning("voice loop did not exit after terminate; killing")
             proc.kill()
-            await proc.wait()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=self.args.stop_timeout_seconds)
+            except asyncio.TimeoutError:
+                logger.warning("voice loop did not exit after kill")
 
     async def _watch_process(self, proc: asyncio.subprocess.Process) -> None:
         code = await proc.wait()

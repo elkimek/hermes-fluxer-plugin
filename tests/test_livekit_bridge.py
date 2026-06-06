@@ -386,3 +386,29 @@ async def test_collect_remote_audio_pcm16_from_existing_track(monkeypatch):
     assert len(pcm) == 480
     assert FakeAudioStream.tracks == [(track, 24000, 1, 20)]
     assert "track_subscribed" not in room.handlers
+
+
+@pytest.mark.asyncio
+async def test_collect_remote_audio_pcm16_returns_when_matching_track_ends(monkeypatch):
+    from types import SimpleNamespace
+
+    FakeAudioStream.tracks = []
+    room = FakeRoom()
+    track = type("RemoteAudioTrack", (), {"kind": "audio"})()
+    participant = SimpleNamespace(identity="user-a", track_publications={"pub": SimpleNamespace(track=track)})
+    room.remote_participants["user-a"] = participant
+
+    fake_rtc = type("FakeRtc", (), {"AudioStream": FakeAudioStream})()
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: fake_rtc)
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    bridge._room = room
+
+    pcm = await bridge.collect_remote_audio_pcm16(
+        duration_seconds=10.0,
+        sample_rate=24000,
+        participant_identity="user-a",
+        timeout=1.0,
+    )
+
+    assert len(pcm) == 800
+    assert "track_subscribed" not in room.handlers
