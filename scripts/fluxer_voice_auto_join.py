@@ -73,6 +73,7 @@ class FluxerVoiceAutoJoinSupervisor:
         self.allowed_guild_ids = split_csv(args.guild_ids)
         self.process: asyncio.subprocess.Process | None = None
         self.watch_task: asyncio.Task[Any] | None = None
+        self.operation_tasks: set[asyncio.Task[Any]] = set()
         self.active_channel_id: str | None = None
         self.active_guild_id: str | None = None
         self.desired_channel_id: str | None = None
@@ -90,6 +91,29 @@ class FluxerVoiceAutoJoinSupervisor:
         if self.allowed_guild_ids and (guild_id or "") not in self.allowed_guild_ids:
             return False
         return True
+
+    def schedule_operation(self, coro: Any, *, name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        self.operation_tasks.add(task)
+
+        def discard(done: asyncio.Task[Any]) -> None:
+            self.operation_tasks.discard(done)
+            with contextlib.suppress(asyncio.CancelledError):
+                exc = done.exception()
+                if exc is not None:
+                    logger.error("voice auto-join operation failed", exc_info=(type(exc), exc, exc.__traceback__))
+
+        task.add_done_callback(discard)
+
+    async def cancel_operations(self) -> None:
+        tasks = list(self.operation_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await task
+        self.operation_tasks.clear()
 
     def build_voice_loop_command(self, *, guild_id: str | None, channel_id: str) -> list[str]:
         python = self.args.python
@@ -136,7 +160,7 @@ class FluxerVoiceAutoJoinSupervisor:
             cmd.extend(["--guild-id", guild_id])
         if participant_prefix:
             cmd.extend(["--participant-identity-prefix", participant_prefix])
-        if self.args.elevenlabs_language_code is not None:
+        if self.args.elevenlabs_language_code:
             cmd.extend(["--elevenlabs-language-code", self.args.elevenlabs_language_code])
         return cmd
 
@@ -237,16 +261,25 @@ class FluxerVoiceAutoJoinSupervisor:
         if channel_id is None:
             self.desired_channel_id = None
             self.desired_guild_id = None
-            await self.stop_voice_loop(f"target user {user_id} left voice")
+            self.schedule_operation(
+                self.stop_voice_loop(f"target user {user_id} left voice"),
+                name="fluxer-auto-join-stop-left",
+            )
             return
         if not self.should_join_channel(guild_id=guild_id, channel_id=channel_id):
             self.desired_channel_id = None
             self.desired_guild_id = None
-            await self.stop_voice_loop(f"target user {user_id} moved to unconfigured voice channel {channel_id}")
+            self.schedule_operation(
+                self.stop_voice_loop(f"target user {user_id} moved to unconfigured voice channel {channel_id}"),
+                name="fluxer-auto-join-stop-unconfigured",
+            )
             return
         self.desired_channel_id = channel_id
         self.desired_guild_id = guild_id
-        await self.start_voice_loop(guild_id=guild_id, channel_id=channel_id)
+        self.schedule_operation(
+            self.start_voice_loop(guild_id=guild_id, channel_id=channel_id),
+            name="fluxer-auto-join-start",
+        )
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -295,6 +328,7 @@ async def run(args: argparse.Namespace) -> int:
     finally:
         supervisor.desired_channel_id = None
         supervisor.desired_guild_id = None
+        await supervisor.cancel_operations()
         await supervisor.stop_voice_loop("supervisor shutting down")
         await adapter.disconnect()
     return 0

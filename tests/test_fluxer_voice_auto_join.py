@@ -60,6 +60,7 @@ def test_supervisor_builds_voice_loop_command_with_target_prefix():
         cmd.index("--barge-in-energy-threshold") : cmd.index("--barge-in-energy-threshold") + 2
     ]
     assert ["--barge-in-min-ms", "120"] == cmd[cmd.index("--barge-in-min-ms") : cmd.index("--barge-in-min-ms") + 2]
+    assert "--elevenlabs-language-code" not in cmd
 
 
 def test_supervisor_with_empty_targets_watches_nobody(monkeypatch):
@@ -143,12 +144,42 @@ async def test_supervisor_starts_on_target_join_and_stops_on_leave(monkeypatch):
     await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-2", "channel_id": "voice-1"})
     await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": "voice-1"})
     await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": None})
+    for _ in range(3):
+        if not sup.operation_tasks:
+            break
+        await asyncio.gather(*list(sup.operation_tasks))
 
     assert events == [
         ("stop", "target user user-1 moved to unconfigured voice channel voice-1"),
         ("start", "guild-1", "voice-1"),
         ("stop", "target user user-1 left voice"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_leave_handler_does_not_wait_for_slow_stop(monkeypatch):
+    args = parse_args(["--target-user-ids", "user-1", "--channel-ids", "voice-1", "--guild-ids", "guild-1"])
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    async def slow_stop(reason):
+        stop_started.set()
+        await release_stop.wait()
+
+    monkeypatch.setattr(sup, "stop_voice_loop", slow_stop)
+
+    await asyncio.wait_for(
+        sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": None}),
+        timeout=0.01,
+    )
+    await asyncio.wait_for(stop_started.wait(), timeout=0.1)
+
+    assert len(sup.operation_tasks) == 1
+    release_stop.set()
+    await asyncio.gather(*list(sup.operation_tasks))
+    await asyncio.sleep(0)
+    assert sup.operation_tasks == set()
 
 
 @pytest.mark.asyncio
