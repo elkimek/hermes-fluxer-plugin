@@ -119,6 +119,7 @@ class BargeInCapture:
     first_chunk_seconds: float | None = None
     max_rms: int = 0
     voiced_ms: int = 0
+    detected_voiced_ms: int = 0
     detected_seconds: float | None = None
 
 
@@ -345,6 +346,7 @@ async def _wait_for_barge_in(
                 if voiced_ms >= args.barge_in_min_ms:
                     if not capture.event.is_set():
                         capture.detected_seconds = time.monotonic() - started
+                        capture.detected_voiced_ms = voiced_ms
                         logger.info(
                             "Barge-in detected after %.3fs chunks=%s max_rms=%s voiced_ms=%s",
                             capture.detected_seconds,

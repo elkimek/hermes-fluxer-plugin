@@ -1347,7 +1347,7 @@ def test_voice_auto_join_default_barge_in_is_not_hair_trigger():
     source = (ROOT / "scripts" / "fluxer_voice_auto_join.py").read_text()
 
     assert 'FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", "180"' in source
-    assert 'FLUXER_VOICE_BARGE_IN_MIN_MS", "600"' in source
+    assert 'FLUXER_VOICE_BARGE_IN_MIN_MS", "1200"' in source
 
 
 def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():

@@ -998,6 +998,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                                 else None,
                                 "max_rms": barge_in_capture.max_rms,
                                 "voiced_ms": barge_in_capture.voiced_ms,
+                                "detected_voiced_ms": barge_in_capture.detected_voiced_ms,
                                 "detected_seconds": round(barge_in_capture.detected_seconds, 3)
                                 if barge_in_capture.detected_seconds is not None
                                 else None,
