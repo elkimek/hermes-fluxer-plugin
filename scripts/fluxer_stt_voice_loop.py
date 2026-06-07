@@ -83,6 +83,17 @@ Conversation rules:
 """.strip()
 
 
+def _redact_exception_message(exc: Exception, *secrets: str | None) -> str:
+    message = str(exc) or repr(exc)
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[redacted-token]")
+    message = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted-token]", message)
+    message = re.sub(r"token=([A-Za-z0-9._~+/=-]+)", "token=[redacted-token]", message, flags=re.IGNORECASE)
+    message = re.sub(r'("token"\s*:\s*")([^"]+)(")', r"\1[redacted-token]\3", message, flags=re.IGNORECASE)
+    return message[:500]
+
+
 def env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -988,7 +999,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                             await xai_task
                     if not getattr(publisher, "interrupted", False):
-                        await publisher.close()
+                        await publisher.close(wait_for_playout=False, flush_remainder=False)
                 xai_seconds = time.monotonic() - xai_started
                 spoken_reply = reply_text or xai_result.transcript
                 history.append({"user": transcript, "assistant": spoken_reply})
@@ -1058,7 +1069,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as exc:
             logger.exception("STT-backed Fluxer voice loop failed to join LiveKit")
             result["error"] = type(exc).__name__
-            result["message"] = str(exc)
+            result["message"] = _redact_exception_message(exc, str(raw_update.get("token") or ""))
             connected.set()
             finished.set()
 

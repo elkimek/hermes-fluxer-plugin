@@ -783,7 +783,7 @@ def test_redact_exception_message_removes_livekit_tokens():
 def test_diagnose_barge_in_publish_task_cleanup_suppresses_closed_publisher_race():
     source = (room_loop.ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text(encoding="utf-8")
 
-    assert "contextlib.suppress(asyncio.CancelledError, RuntimeError)" in source
+    assert "contextlib.suppress(asyncio.CancelledError, RuntimeError, Exception)" in source
 
 
 def test_xai_room_loop_voice_server_handler_schedules_livekit_connect_task():
@@ -802,6 +802,16 @@ def test_xai_room_loop_diagnostic_suppresses_publish_task_exceptions():
     source = inspect.getsource(room_loop._diagnose_barge_in)
 
     assert "contextlib.suppress(asyncio.CancelledError, RuntimeError, Exception)" in source
+
+
+def test_xai_room_loop_diagnostic_publish_tone_uses_context_manager():
+    source = inspect.getsource(room_loop._diagnose_barge_in)
+
+    publish_start = source.index("async def publish_tone")
+    publish_source = source[publish_start : source.index("publish_task =", publish_start)]
+
+    assert "async with publisher:" in publish_source
+    assert "await publisher.__aenter__()" not in publish_source
 
 
 def test_xai_room_loop_cancels_xai_task_before_publisher_close():

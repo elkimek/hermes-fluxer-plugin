@@ -670,11 +670,11 @@ async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmok
     first_chunk_at: float | None = None
 
     async def publish_tone() -> None:
-        await publisher.__aenter__()
-        end_at = time.monotonic() + args.diagnose_seconds
-        while time.monotonic() < end_at and detected_at is None:
-            await publisher.write(tone_frame())
-            await asyncio.sleep(args.frame_ms / 1000)
+        async with publisher:
+            end_at = time.monotonic() + args.diagnose_seconds
+            while time.monotonic() < end_at and detected_at is None:
+                await publisher.write(tone_frame())
+                await asyncio.sleep(args.frame_ms / 1000)
 
     publish_task = asyncio.create_task(publish_tone())
     iterator = chunks.__aiter__()

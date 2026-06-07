@@ -15,6 +15,7 @@ from scripts.fluxer_stt_voice_loop import (
     append_jsonl,
     build_answer_prompt,
     build_hermes_messages,
+    _redact_exception_message,
     collect_voice_session_recall,
     compose_system_prompt,
     hermes_voice_session_identity,
@@ -1381,3 +1382,20 @@ def test_stt_voice_loop_cancels_xai_task_before_publisher_close():
     close_publisher = source.index("await publisher.close", cancel_xai)
 
     assert cancel_xai < close_publisher
+
+
+def test_stt_voice_loop_redacts_livekit_token_from_join_errors():
+    exc = RuntimeError('connect failed Bearer abc.def token=secret123 {"token":"json-secret"}')
+
+    message = _redact_exception_message(exc, "abc.def", "secret123", "json-secret")
+
+    assert "abc.def" not in message
+    assert "secret123" not in message
+    assert "json-secret" not in message
+    assert "[redacted-token]" in message
+
+
+def test_stt_voice_loop_closes_publisher_without_playout_wait_after_cancellation_cleanup():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    assert "await publisher.close(wait_for_playout=False, flush_remainder=False)" in source
