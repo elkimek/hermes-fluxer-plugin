@@ -1048,6 +1048,202 @@ async def test_stt_voice_loop_voice_server_handler_returns_before_session_finish
     assert (None, {"guild_id": "guild-1", "connection_id": "conn-nonblocking"}) in sends
 
 
+@pytest.mark.asyncio
+async def test_stt_voice_loop_voice_server_handler_returns_before_livekit_connect_finishes(monkeypatch, tmp_path):
+    handler_returned = asyncio.Event()
+    connect_started = asyncio.Event()
+    release_connect = asyncio.Event()
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            if channel_id is not None:
+                assert self.handler is not None
+                await self.handler(
+                    {
+                        "endpoint": "wss://voice.example",
+                        "token": "secret-token",
+                        "guild_id": kwargs.get("guild_id"),
+                        "channel_id": channel_id,
+                        "connection_id": "conn-slow-connect",
+                    },
+                    {"connection_id": "conn-slow-connect", "has_token": True},
+                )
+                handler_returned.set()
+            return True
+
+        async def disconnect(self):
+            pass
+
+    class FakeBridge:
+        def __init__(self, auto_subscribe=True):
+            pass
+
+        async def connect_from_voice_server_update(self, raw_update):
+            connect_started.set()
+            await release_connect.wait()
+            return SimpleNamespace(
+                endpoint=raw_update["endpoint"],
+                guild_id=raw_update["guild_id"],
+                channel_id=raw_update["channel_id"],
+                connection_id=raw_update["connection_id"],
+                room_name="room",
+                participant_identity="bot_conn-slow-connect",
+            )
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("XAI_API_KEY", "xai")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
+
+    args = parse_args(
+        [
+            "--channel-id",
+            "voice-1",
+            "--guild-id",
+            "guild-1",
+            "--connect-timeout",
+            "0.01",
+            "--voice-context-file",
+            str(tmp_path / "missing-context.md"),
+        ]
+    )
+
+    result = await asyncio.wait_for(run_stt_voice_loop(args), timeout=1.0)
+
+    assert handler_returned.is_set()
+    assert connect_started.is_set()
+    assert result["error"] == "TimeoutError"
+    assert "voice server update" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_stt_voice_loop_cancels_active_session_before_second_voice_server_update(monkeypatch, tmp_path):
+    first_capture_started = asyncio.Event()
+    first_capture_cancelled = asyncio.Event()
+    second_update_sent = asyncio.Event()
+    connect_ids = []
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            if channel_id is not None:
+                assert self.handler is not None
+                await self.handler(
+                    {
+                        "endpoint": "wss://voice.example",
+                        "token": "secret-token-1",
+                        "guild_id": kwargs.get("guild_id"),
+                        "channel_id": channel_id,
+                        "connection_id": "conn-1",
+                    },
+                    {"connection_id": "conn-1", "has_token": True},
+                )
+
+                async def send_second():
+                    await first_capture_started.wait()
+                    assert self.handler is not None
+                    await self.handler(
+                        {
+                            "endpoint": "wss://voice.example",
+                            "token": "secret-token-2",
+                            "guild_id": kwargs.get("guild_id"),
+                            "channel_id": channel_id,
+                            "connection_id": "conn-2",
+                        },
+                        {"connection_id": "conn-2", "has_token": True},
+                    )
+                    second_update_sent.set()
+
+                asyncio.create_task(send_second())
+            return True
+
+        async def disconnect(self):
+            pass
+
+    class FakeBridge:
+        def __init__(self, auto_subscribe=True):
+            pass
+
+        async def connect_from_voice_server_update(self, raw_update):
+            connect_ids.append(raw_update["connection_id"])
+            return SimpleNamespace(
+                endpoint=raw_update["endpoint"],
+                guild_id=raw_update["guild_id"],
+                channel_id=raw_update["channel_id"],
+                connection_id=raw_update["connection_id"],
+                room_name="room",
+                participant_identity=f"bot_{raw_update['connection_id']}",
+            )
+
+        async def disconnect(self):
+            pass
+
+    async def blocking_capture(*args, **kwargs):
+        if not first_capture_started.is_set():
+            first_capture_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                first_capture_cancelled.set()
+                raise
+        await asyncio.Event().wait()
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("XAI_API_KEY", "xai")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._capture_one_speech_segment", blocking_capture)
+
+    args = parse_args(
+        [
+            "--channel-id",
+            "voice-1",
+            "--guild-id",
+            "guild-1",
+            "--max-runtime-seconds",
+            "0.05",
+            "--initial-settle-seconds",
+            "0",
+            "--voice-context-file",
+            str(tmp_path / "missing-context.md"),
+        ]
+    )
+
+    result = await asyncio.wait_for(run_stt_voice_loop(args), timeout=1.0)
+
+    assert await asyncio.wait_for(second_update_sent.wait(), timeout=0.1) is True
+    assert first_capture_cancelled.is_set()
+    assert connect_ids[:2] == ["conn-1", "conn-2"]
+    assert result["connection"]["connection_id"] == "conn-2"
+    assert result["error"] == "TimeoutError"
+
+
 def test_stt_voice_loop_enters_publisher_before_starting_barge_in_tasks():
     source = inspect.getsource(run_stt_voice_loop)
 

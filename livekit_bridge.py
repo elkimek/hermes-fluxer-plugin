@@ -682,16 +682,22 @@ class FluxerLiveKitSmokeBridge:
         target_bytes = int(sample_rate * duration_seconds) * 2
         collected = bytearray()
         async def _collect() -> bytes:
-            async for chunk in self.iter_remote_audio_pcm16(
+            chunks = self.iter_remote_audio_pcm16(
                 sample_rate=sample_rate,
                 frame_size_ms=frame_size_ms,
                 participant_identity=participant_identity,
                 participant_identity_prefix=participant_identity_prefix,
-            ):
-                collected.extend(chunk)
-                if len(collected) >= target_bytes:
-                    return bytes(collected[:target_bytes])
-            return bytes(collected)
+            )
+            try:
+                async for chunk in chunks:
+                    collected.extend(chunk)
+                    if len(collected) >= target_bytes:
+                        return bytes(collected[:target_bytes])
+                return bytes(collected)
+            finally:
+                close = getattr(chunks, "aclose", None)
+                if close is not None:
+                    await close()
 
         return await asyncio.wait_for(_collect(), timeout=timeout)
 

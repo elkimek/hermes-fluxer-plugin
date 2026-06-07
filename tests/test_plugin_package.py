@@ -16,6 +16,16 @@ from gateway.config import PlatformConfig
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def restore_fluxer_env_after_test():
+    original = {key: value for key, value in os.environ.items() if key.startswith("FLUXER_")}
+    yield
+    for key in list(os.environ):
+        if key.startswith("FLUXER_"):
+            os.environ.pop(key, None)
+    os.environ.update(original)
+
+
 def test_plugin_manifest_is_platform_plugin():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
 
@@ -85,6 +95,7 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
         "FLUXER_VOICE_STT_PROVIDER",
         "FLUXER_VOICE_SILENCE_MS",
         "FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS",
+        "FLUXER_BOT_TOKEN",
         "FLUXER_VOICE_HERMES_URL",
         "FLUXER_VOICE_HERMES_MAX_TOKENS",
         "FLUXER_VOICE_HERMES_SESSION_ID",
@@ -103,6 +114,7 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     fluxer_adapter._apply_yaml_config(
         {},
         {
+            "bot_token": "yaml-token",
             "voice": {
                 "enabled": True,
                 "auto_join": True,
@@ -127,6 +139,7 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
         },
     )
 
+    assert os.environ["FLUXER_BOT_TOKEN"] == "yaml-token"
     assert os.environ["FLUXER_VOICE_ENABLED"] == "true"
     assert os.environ["FLUXER_VOICE_AUTO_JOIN"] == "true"
     assert os.environ["FLUXER_VOICE_TARGET_USER_IDS"] == "user-1,user-2"

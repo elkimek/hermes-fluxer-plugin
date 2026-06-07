@@ -2652,6 +2652,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
     cfg = platform_cfg if isinstance(platform_cfg, dict) else {}
 
     scalar_env = {
+        "bot_token": "FLUXER_BOT_TOKEN",
         "base_url": "FLUXER_BASE_URL",
         "gateway_url": "FLUXER_GATEWAY_URL",
         "allowed_users": "FLUXER_ALLOWED_USERS",

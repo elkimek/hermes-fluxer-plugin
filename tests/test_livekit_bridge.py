@@ -350,6 +350,34 @@ async def test_pcm16_publisher_streams_chunks_and_flushes_remainder(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_collect_remote_audio_closes_stream_generator_on_target_bytes(monkeypatch):
+    class ClosingChunks:
+        def __init__(self):
+            self.closed = False
+            self.items = [b"\x01\x00" * 30]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.items:
+                raise StopAsyncIteration
+            return self.items.pop(0)
+
+        async def aclose(self):
+            self.closed = True
+
+    chunks = ClosingChunks()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=FakeRoom)
+    monkeypatch.setattr(bridge, "iter_remote_audio_pcm16", lambda **kwargs: chunks)
+
+    pcm = await bridge.collect_remote_audio_pcm16(duration_seconds=0.01, sample_rate=1000, timeout=1.0)
+
+    assert len(pcm) == 20
+    assert chunks.closed is True
+
+
+@pytest.mark.asyncio
 async def test_pcm16_publisher_cleans_source_and_track_if_publish_fails(monkeypatch):
     FakeAudioSource.instances = []
     FakeLocalAudioTrack.instances = []

@@ -708,8 +708,10 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     history: list[dict[str, str]] = []
     sticky_brain_provider = "xai-fast"
     session_task: asyncio.Task[Any] | None = None
+    voice_update_task: asyncio.Task[Any] | None = None
+    session_generation = 0
 
-    async def run_voice_session(info: Any, safe_update: dict[str, Any]) -> None:
+    async def run_voice_session(info: Any, safe_update: dict[str, Any], generation: int) -> None:
         nonlocal sticky_brain_provider
         try:
             # Let Fluxer publish/subscription state settle before the first fixed window.
@@ -1022,11 +1024,17 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             result["message"] = str(exc)
             connected.set()
         finally:
-            finished.set()
+            if generation == session_generation:
+                finished.set()
 
-    async def handler(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
-        nonlocal leave_connection_id, session_task
+    async def process_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
+        nonlocal leave_connection_id, session_task, session_generation
         try:
+            if session_task is not None and not session_task.done():
+                session_generation += 1
+                session_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                    await session_task
             info = await bridge.connect_from_voice_server_update(raw_update)
             leave_connection_id = info.connection_id
             result["connection"] = {
@@ -1039,14 +1047,25 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             }
             result["safe_update"] = safe_update
             connected.set()
-            if session_task is None or session_task.done():
-                session_task = asyncio.create_task(run_voice_session(info, safe_update))
+            session_generation += 1
+            session_task = asyncio.create_task(run_voice_session(info, safe_update, session_generation), name="fluxer-stt-voice-session")
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.exception("STT-backed Fluxer voice loop failed to join LiveKit")
             result["error"] = type(exc).__name__
             result["message"] = str(exc)
             connected.set()
             finished.set()
+
+    async def handler(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
+        nonlocal voice_update_task
+        if voice_update_task is not None and not voice_update_task.done():
+            voice_update_task.cancel()
+        voice_update_task = asyncio.create_task(
+            process_voice_server_update(raw_update, safe_update),
+            name="fluxer-stt-voice-server-update",
+        )
 
     adapter.set_voice_server_update_handler(handler)
     loop = asyncio.get_running_loop()
@@ -1084,6 +1103,10 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             return result
     finally:
         shutdown_requested.set()
+        if voice_update_task is not None and not voice_update_task.done():
+            voice_update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await voice_update_task
         if session_task is not None and not session_task.done():
             session_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, RuntimeError):
