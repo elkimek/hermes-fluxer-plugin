@@ -56,10 +56,10 @@ def test_supervisor_builds_voice_loop_command_with_target_prefix():
     assert ["--max-segment-seconds", "9.0"] == cmd[
         cmd.index("--max-segment-seconds") : cmd.index("--max-segment-seconds") + 2
     ]
-    assert ["--barge-in-energy-threshold", "300"] == cmd[
+    assert ["--barge-in-energy-threshold", "1800"] == cmd[
         cmd.index("--barge-in-energy-threshold") : cmd.index("--barge-in-energy-threshold") + 2
     ]
-    assert ["--barge-in-min-ms", "120"] == cmd[cmd.index("--barge-in-min-ms") : cmd.index("--barge-in-min-ms") + 2]
+    assert ["--barge-in-min-ms", "220"] == cmd[cmd.index("--barge-in-min-ms") : cmd.index("--barge-in-min-ms") + 2]
     assert "--elevenlabs-language-code" not in cmd
 
 
@@ -71,6 +71,26 @@ def test_supervisor_with_empty_targets_watches_nobody(monkeypatch):
 
     assert sup.target_user_ids == set()
     assert sup.should_watch_user("user-1") is False
+
+
+def test_supervisor_barge_in_defaults_do_not_reuse_capture_energy_threshold(monkeypatch):
+    monkeypatch.setenv("FLUXER_VOICE_ENERGY_THRESHOLD", "300")
+    monkeypatch.delenv("FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", raising=False)
+    monkeypatch.delenv("FLUXER_VOICE_BARGE_IN_MIN_MS", raising=False)
+    args = parse_args([
+        "--target-user-ids",
+        "user-1",
+        "--channel-ids",
+        "voice-1",
+    ])
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+
+    cmd = sup.build_voice_loop_command(guild_id=None, channel_id="voice-1")
+
+    assert ["--barge-in-energy-threshold", "1800"] == cmd[
+        cmd.index("--barge-in-energy-threshold") : cmd.index("--barge-in-energy-threshold") + 2
+    ]
+    assert ["--barge-in-min-ms", "220"] == cmd[cmd.index("--barge-in-min-ms") : cmd.index("--barge-in-min-ms") + 2]
 
 
 @pytest.mark.asyncio
