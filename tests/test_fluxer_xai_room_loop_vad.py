@@ -790,6 +790,13 @@ def test_redact_exception_message_removes_livekit_tokens():
     assert "[redacted-token]" in message
 
 
+def test_xai_room_loop_redacts_turn_level_error_result():
+    source = inspect.getsource(room_loop._conversation_loop)
+
+    assert "error_text = str(exc)" not in source
+    assert "error_text = _redact_exception_message(exc)" in source
+
+
 def test_diagnose_barge_in_publish_task_cleanup_suppresses_closed_publisher_race():
     source = (room_loop.ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text(encoding="utf-8")
 

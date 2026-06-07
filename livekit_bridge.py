@@ -325,10 +325,15 @@ class FluxerLiveKitSmokeBridge:
             options = room_options_factory(auto_subscribe=self._auto_subscribe)
 
         room = room_factory()
-        if options is None:
-            await room.connect(endpoint, token)
-        else:
-            await room.connect(endpoint, token, options)
+        try:
+            if options is None:
+                await room.connect(endpoint, token)
+            else:
+                await room.connect(endpoint, token, options)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await _maybe_await(room.disconnect())
+            raise
 
         info = FluxerLiveKitConnectionInfo(
             endpoint=endpoint,

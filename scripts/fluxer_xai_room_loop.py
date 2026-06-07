@@ -566,7 +566,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                         await publisher.close(wait_for_playout=False, flush_remainder=False)
                     else:
                         await publisher.close()
-            error_text = str(exc) or repr(exc)
+            error_text = _redact_exception_message(exc)
             logger.warning("xAI response/publish failed for turn %s: %s: %s", turn_no, type(exc).__name__, error_text)
             turns.append(
                 {
