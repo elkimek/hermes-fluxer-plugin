@@ -1036,7 +1036,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as exc:
             logger.exception("STT-backed Fluxer voice loop failed")
             result["error"] = type(exc).__name__
-            result["message"] = str(exc)
+            result["message"] = _redact_exception_message(exc)
             connected.set()
         finally:
             if generation == session_generation:

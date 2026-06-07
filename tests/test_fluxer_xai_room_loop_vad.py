@@ -254,6 +254,9 @@ async def test_conversation_loop_reuses_barge_in_pcm_as_next_turn(monkeypatch):
         async def __aenter__(self):
             return self
 
+        async def __aexit__(self, exc_type, exc, tb):
+            await self.close()
+
         async def write(self, chunk):
             self.bytes_published += len(chunk)
 
@@ -371,6 +374,9 @@ async def test_conversation_loop_max_turns_counts_interrupted_turns(monkeypatch)
 
         async def __aenter__(self):
             return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            await self.close()
 
         async def write(self, chunk):
             self.bytes_published += len(chunk)
@@ -595,7 +601,11 @@ async def test_conversation_loop_closes_publisher_when_enter_fails(monkeypatch):
             self.closed = False
 
         async def __aenter__(self):
+            await self.close()
             raise RuntimeError("publish failed")
+
+        async def __aexit__(self, exc_type, exc, tb):
+            await self.close()
 
         async def close(self, **kwargs):
             self.closed = True
@@ -812,6 +822,13 @@ def test_xai_room_loop_diagnostic_publish_tone_uses_context_manager():
 
     assert "async with publisher:" in publish_source
     assert "await publisher.__aenter__()" not in publish_source
+
+
+def test_xai_room_loop_conversation_publisher_uses_context_manager():
+    source = inspect.getsource(room_loop._conversation_loop)
+
+    assert "async with publisher:" in source
+    assert "await publisher.__aenter__()" not in source
 
 
 def test_xai_room_loop_cancels_xai_task_before_publisher_close():

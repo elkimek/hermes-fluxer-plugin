@@ -1395,6 +1395,13 @@ def test_stt_voice_loop_redacts_livekit_token_from_join_errors():
     assert "[redacted-token]" in message
 
 
+def test_stt_voice_loop_redacts_session_level_error_result():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    assert 'result["message"] = str(exc)' not in source
+    assert 'result["message"] = _redact_exception_message(exc)' in source
+
+
 def test_stt_voice_loop_closes_publisher_without_playout_wait_after_cancellation_cleanup():
     source = inspect.getsource(run_stt_voice_loop)
 

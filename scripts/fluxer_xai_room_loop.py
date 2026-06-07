@@ -407,98 +407,98 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 frame_ms=args.frame_ms,
                 track_name=f"fluxer-xai-room-loop-{turn_no}",
             )
-            await publisher.__aenter__()
-            arm_barge_after_first_audio = bool(getattr(args, "barge_in_after_first_audio_only", False))
-            if not args.disable_barge_in and not arm_barge_after_first_audio:
-                barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
-
-            async def publish_delta(chunk: bytes) -> None:
-                nonlocal first_audio_seconds, barge_in_seconds, barge_in_task
-                assert publisher is not None
-
-                async def should_interrupt() -> bool:
-                    nonlocal barge_in_seconds
-                    if barge_in_capture.event.is_set():
-                        barge_in_seconds = time.monotonic() - xai_started
-                        return True
-                    return False
-
-                if await should_interrupt():
-                    await publisher.interrupt()
-                    raise BargeInInterrupt("user interrupted assistant speech")
-                if first_audio_seconds is None:
-                    first_audio_seconds = time.monotonic() - xai_started
-                    if arm_barge_after_first_audio and not args.disable_barge_in and barge_in_task is None:
-                        barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
-                write_interruptible = getattr(publisher, "write_interruptible", None)
-                if write_interruptible is not None:
-                    interrupted = await write_interruptible(chunk, should_interrupt)
-                    if interrupted:
-                        raise BargeInInterrupt("user interrupted assistant speech")
-                else:
-                    await publisher.write(chunk)
-
-            try:
-                xai_task = asyncio.create_task(
-                    xai.audio_response_from_pcm16_to_sink(
-                        pcm,
-                        publish_delta,
-                        timeout=args.xai_timeout,
-                        first_audio_timeout=args.xai_first_audio_timeout,
-                    )
-                )
-                barge_event_task: asyncio.Task[Any] | None = None
+            async with publisher:
+                arm_barge_after_first_audio = bool(getattr(args, "barge_in_after_first_audio_only", False))
                 if not args.disable_barge_in and not arm_barge_after_first_audio:
-                    barge_event_task = asyncio.create_task(barge_in_capture.event.wait())
-                try:
-                    if barge_event_task is None:
-                        xai_result = await xai_task
-                    else:
-                        done, _pending = await asyncio.wait(
-                            {xai_task, barge_event_task},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        if barge_event_task in done and barge_in_capture.event.is_set() and not xai_task.done():
-                            assert publisher is not None
-                            barge_in_seconds = time.monotonic() - xai_started
-                            await publisher.interrupt()
-                            xai_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await xai_task
-                            raise BargeInInterrupt("user interrupted assistant speech before xAI audio")
-                        xai_result = await xai_task
-                finally:
-                    if barge_event_task is not None:
-                        barge_event_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await barge_event_task
-                xai_seconds = time.monotonic() - xai_started
-                if barge_in_capture.event.is_set():
+                    barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
+
+                async def publish_delta(chunk: bytes) -> None:
+                    nonlocal first_audio_seconds, barge_in_seconds, barge_in_task
                     assert publisher is not None
-                    barge_in_seconds = time.monotonic() - xai_started
-                    await publisher.interrupt()
-                    raise BargeInInterrupt("user interrupted assistant speech")
-            finally:
-                if barge_in_task is not None:
-                    if barge_in_capture.event.is_set():
-                        with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
-                            await asyncio.wait_for(
-                                barge_in_capture.ready.wait(),
-                                timeout=getattr(args, "barge_in_capture_timeout", 2.0),
+
+                    async def should_interrupt() -> bool:
+                        nonlocal barge_in_seconds
+                        if barge_in_capture.event.is_set():
+                            barge_in_seconds = time.monotonic() - xai_started
+                            return True
+                        return False
+
+                    if await should_interrupt():
+                        await publisher.interrupt()
+                        raise BargeInInterrupt("user interrupted assistant speech")
+                    if first_audio_seconds is None:
+                        first_audio_seconds = time.monotonic() - xai_started
+                        if arm_barge_after_first_audio and not args.disable_barge_in and barge_in_task is None:
+                            barge_in_task = asyncio.create_task(_wait_for_barge_in(args, bridge, barge_in_capture))
+                    write_interruptible = getattr(publisher, "write_interruptible", None)
+                    if write_interruptible is not None:
+                        interrupted = await write_interruptible(chunk, should_interrupt)
+                        if interrupted:
+                            raise BargeInInterrupt("user interrupted assistant speech")
+                    else:
+                        await publisher.write(chunk)
+
+                try:
+                    xai_task = asyncio.create_task(
+                        xai.audio_response_from_pcm16_to_sink(
+                            pcm,
+                            publish_delta,
+                            timeout=args.xai_timeout,
+                            first_audio_timeout=args.xai_first_audio_timeout,
+                        )
+                    )
+                    barge_event_task: asyncio.Task[Any] | None = None
+                    if not args.disable_barge_in and not arm_barge_after_first_audio:
+                        barge_event_task = asyncio.create_task(barge_in_capture.event.wait())
+                    try:
+                        if barge_event_task is None:
+                            xai_result = await xai_task
+                        else:
+                            done, _pending = await asyncio.wait(
+                                {xai_task, barge_event_task},
+                                return_when=asyncio.FIRST_COMPLETED,
                             )
-                    barge_in_capture.stop_event.set()
-                    barge_in_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                        await barge_in_task
-                if xai_task is not None and not xai_task.done():
-                    xai_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                        await xai_task
-                publish_started = time.monotonic()
-                if publisher is not None and publisher.interrupted:
-                    await publisher.close(wait_for_playout=False, flush_remainder=False)
-                elif publisher is not None:
-                    await publisher.close()
+                            if barge_event_task in done and barge_in_capture.event.is_set() and not xai_task.done():
+                                assert publisher is not None
+                                barge_in_seconds = time.monotonic() - xai_started
+                                await publisher.interrupt()
+                                xai_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await xai_task
+                                raise BargeInInterrupt("user interrupted assistant speech before xAI audio")
+                            xai_result = await xai_task
+                    finally:
+                        if barge_event_task is not None:
+                            barge_event_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await barge_event_task
+                    xai_seconds = time.monotonic() - xai_started
+                    if barge_in_capture.event.is_set():
+                        assert publisher is not None
+                        barge_in_seconds = time.monotonic() - xai_started
+                        await publisher.interrupt()
+                        raise BargeInInterrupt("user interrupted assistant speech")
+                finally:
+                    if barge_in_task is not None:
+                        if barge_in_capture.event.is_set():
+                            with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+                                await asyncio.wait_for(
+                                    barge_in_capture.ready.wait(),
+                                    timeout=getattr(args, "barge_in_capture_timeout", 2.0),
+                                )
+                        barge_in_capture.stop_event.set()
+                        barge_in_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                            await barge_in_task
+                    if xai_task is not None and not xai_task.done():
+                        xai_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                            await xai_task
+                    publish_started = time.monotonic()
+                    if publisher is not None and publisher.interrupted:
+                        await publisher.close(wait_for_playout=False, flush_remainder=False)
+                    elif publisher is not None:
+                        await publisher.close()
             publish_seconds = time.monotonic() - publish_started
         except BargeInInterrupt:
             logger.info("Barge-in interrupted turn %s", turn_no)
