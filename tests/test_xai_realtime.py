@@ -1,4 +1,5 @@
 import base64
+import inspect
 import json
 import wave
 
@@ -337,6 +338,19 @@ async def test_xai_realtime_wav_timeout_preserves_event_tail(tmp_path):
 
     with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="events_tail=.*response.created"):
         await client._text_response_to_wav_on_ws(ws, "hello", tmp_path / "out.wav", timeout=0.001)
+
+
+def test_xai_realtime_sink_public_methods_use_outer_safety_timeout_only():
+    methods = (
+        xai_realtime.XAIRealtimeVoiceClient.text_response_to_sink,
+        xai_realtime.XAIRealtimeVoiceClient.force_message_to_sink,
+        xai_realtime.XAIRealtimeVoiceClient.audio_response_from_pcm16_to_sink,
+    )
+
+    for method in methods:
+        source = inspect.getsource(method)
+        assert "timeout=timeout + 1.0" in source
+        assert "timeout=timeout,\n" in source
 
 
 @pytest.mark.asyncio

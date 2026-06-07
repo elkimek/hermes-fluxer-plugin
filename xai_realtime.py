@@ -149,7 +149,7 @@ class XAIRealtimeVoiceClient:
                         timeout=timeout,
                         first_audio_timeout=first_audio_timeout,
                     ),
-                    timeout=timeout,
+                    timeout=timeout + 1.0,
                 )
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
@@ -217,7 +217,7 @@ class XAIRealtimeVoiceClient:
                         first_audio_timeout=first_audio_timeout,
                         interruptible=interruptible,
                     ),
-                    timeout=timeout,
+                    timeout=timeout + 1.0,
                 )
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
@@ -300,7 +300,7 @@ class XAIRealtimeVoiceClient:
                         timeout=timeout,
                         first_audio_timeout=first_audio_timeout,
                     ),
-                    timeout=timeout,
+                    timeout=timeout + 1.0,
                 )
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
@@ -339,8 +339,14 @@ class XAIRealtimeVoiceClient:
         timeout: float = 30.0,
         first_audio_timeout: Optional[float] = None,
     ) -> XAIRealtimeAudioResult:
-        await self._send_text_response_request(ws, text)
-        return await self._collect_audio_to_sink(ws, on_audio_delta, timeout=timeout, first_audio_timeout=first_audio_timeout)
+        started = asyncio.get_running_loop().time()
+        await self._wait_for_setup(self._send_text_response_request(ws, text), started=started, timeout=timeout)
+        return await self._collect_audio_to_sink(
+            ws,
+            on_audio_delta,
+            timeout=self._remaining_timeout(started, timeout),
+            first_audio_timeout=first_audio_timeout,
+        )
 
     async def _text_response_to_wav_on_ws(
         self,
@@ -391,8 +397,14 @@ class XAIRealtimeVoiceClient:
         timeout: float = 45.0,
         first_audio_timeout: Optional[float] = None,
     ) -> XAIRealtimeAudioResult:
-        await self._send_audio_response_request(ws, pcm_audio)
-        return await self._collect_audio_to_sink(ws, on_audio_delta, timeout=timeout, first_audio_timeout=first_audio_timeout)
+        started = asyncio.get_running_loop().time()
+        await self._wait_for_setup(self._send_audio_response_request(ws, pcm_audio), started=started, timeout=timeout)
+        return await self._collect_audio_to_sink(
+            ws,
+            on_audio_delta,
+            timeout=self._remaining_timeout(started, timeout),
+            first_audio_timeout=first_audio_timeout,
+        )
 
     async def _send_audio_response_request(self, ws: Any, pcm_audio: bytes) -> None:
         await self._configure_session(ws)
@@ -438,11 +450,12 @@ class XAIRealtimeVoiceClient:
         first_audio_timeout: Optional[float] = None,
         interruptible: bool,
     ) -> XAIRealtimeAudioResult:
-        await self._send_force_message_request(ws, text, interruptible=interruptible)
+        started = asyncio.get_running_loop().time()
+        await self._wait_for_setup(self._send_force_message_request(ws, text, interruptible=interruptible), started=started, timeout=timeout)
         return await self._collect_audio_to_sink(
             ws,
             on_audio_delta,
-            timeout=timeout,
+            timeout=self._remaining_timeout(started, timeout),
             first_audio_timeout=first_audio_timeout,
         )
 
