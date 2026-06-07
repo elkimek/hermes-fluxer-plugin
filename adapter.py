@@ -410,6 +410,7 @@ class FluxerVoiceSupervisorProcess:
         self.popen_factory = popen_factory
         self.process: Optional[subprocess.Popen] = None
         self._watch_task: Optional[asyncio.Task[Any]] = None
+        self._watch_process_ref: Optional[subprocess.Popen] = None
         self._restart_delay_seconds = 2.0
 
     @property
@@ -561,11 +562,14 @@ class FluxerVoiceSupervisorProcess:
 
     def _start_watch_task(self, proc: subprocess.Popen) -> None:
         if self._watch_task is not None and not self._watch_task.done():
-            return
+            if self._watch_process_ref is proc:
+                return
+            self._watch_task.cancel()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        self._watch_process_ref = proc
         self._watch_task = loop.create_task(self._watch_process(proc), name="fluxer-voice-supervisor-watch")
 
     async def _watch_process(self, proc: subprocess.Popen) -> None:
@@ -589,14 +593,17 @@ class FluxerVoiceSupervisorProcess:
             if self.process is None and self.should_start():
                 if self._watch_task is current_task:
                     self._watch_task = None
+                    self._watch_process_ref = None
                 self.start()
         finally:
             if self._watch_task is current_task:
                 self._watch_task = None
+                self._watch_process_ref = None
 
     async def stop(self) -> None:
         watch_task = self._watch_task
         self._watch_task = None
+        self._watch_process_ref = None
         if watch_task is not None and not watch_task.done():
             watch_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, RuntimeError):

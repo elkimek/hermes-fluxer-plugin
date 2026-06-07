@@ -495,6 +495,59 @@ async def test_voice_supervisor_stop_cancels_pending_restart(tmp_path, monkeypat
     assert supervisor._watch_task is None
 
 
+@pytest.mark.asyncio
+async def test_voice_supervisor_reconnect_start_replaces_sleeping_old_watcher(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLUXER_VOICE_ENABLED", "true")
+    monkeypatch.setenv("FLUXER_VOICE_AUTO_JOIN", "true")
+    monkeypatch.setenv("FLUXER_VOICE_CHANNEL_IDS", "voice-1")
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+    processes = []
+
+    class ExitingProcess(_FakeVoiceProcess):
+        def wait(self, timeout=None) -> int:
+            self.wait_calls.append(timeout)
+            self.terminated = True
+            return 17
+
+    class RunningProcess(_FakeVoiceProcess):
+        pass
+
+    def fake_popen(*args, **kwargs):
+        proc = ExitingProcess() if not processes else RunningProcess()
+        processes.append(proc)
+        return proc
+
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(extra={}, plugin_root=root, popen_factory=fake_popen)
+    supervisor._restart_delay_seconds = 0.2
+
+    assert supervisor.start() is True
+    deadline = time.monotonic() + 1.0
+    while supervisor.process is not None and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert len(processes) == 1
+    assert supervisor.process is None
+    old_watch = supervisor._watch_task
+    assert old_watch is not None and not old_watch.done()
+
+    assert supervisor.start() is True
+    new_proc = processes[1]
+    assert supervisor.process is new_proc
+    assert supervisor._watch_process_ref is new_proc
+    assert supervisor._watch_task is not old_watch
+    assert supervisor._watch_task is not None and not supervisor._watch_task.done()
+
+    new_proc.terminated = True
+    deadline = time.monotonic() + 1.0
+    while supervisor.process is new_proc and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert supervisor.process is None
+    await supervisor.stop()
+
+
 def test_voice_supervisor_signal_fallback_suppresses_missing_process(monkeypatch):
     class GoneProcess:
         pid = 999999
