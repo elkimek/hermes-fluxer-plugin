@@ -1053,6 +1053,18 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         "reply_transcript": spoken_reply,
                         "reply_bytes": xai_result.bytes_written,
                         "xai_events_tail": list(xai_result.events_seen[-5:]),
+                        "barge_in_diagnostic": {
+                            "chunks_seen": barge_in_capture.chunks_seen,
+                            "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
+                            if barge_in_capture.first_chunk_seconds is not None
+                            else None,
+                            "max_rms": barge_in_capture.max_rms,
+                            "voiced_ms": barge_in_capture.voiced_ms,
+                            "threshold": args.barge_in_energy_threshold,
+                            "min_ms": args.barge_in_min_ms,
+                        }
+                        if not args.disable_barge_in
+                        else None,
                         "timing": {
                             "turn_seconds": round(time.monotonic() - turn_started, 3),
                             "stt_seconds": round(stt_seconds, 3),
