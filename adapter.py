@@ -481,7 +481,8 @@ class FluxerVoiceSupervisorProcess:
         for key, env_name in mappings.items():
             if env_name not in env and key in voice:
                 value = voice.get(key)
-                env[env_name] = _coerce_env_value(value)
+                if value is not None:
+                    env[env_name] = _coerce_env_value(value)
         for section_name, nested in {
             "vad": {
                 "silence_ms": "FLUXER_VOICE_SILENCE_MS",
@@ -512,7 +513,9 @@ class FluxerVoiceSupervisorProcess:
             if isinstance(values, dict):
                 for key, env_name in nested.items():
                     if env_name not in env and key in values:
-                        env[env_name] = _coerce_env_value(values[key])
+                        value = values[key]
+                        if value is not None:
+                            env[env_name] = _coerce_env_value(value)
         return env
 
     def start(self) -> bool:

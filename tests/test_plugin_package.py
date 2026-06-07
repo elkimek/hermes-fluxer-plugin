@@ -157,6 +157,8 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
         "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
         "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
         "FLUXER_VOICE_BARGE_IN_MIN_MS",
+        "FLUXER_VOICE_BRAIN_PROVIDER",
+        "FLUXER_VOICE_MAX_SEGMENT_SECONDS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -166,9 +168,10 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
             "voice": {
                 "frame_ms": 99,
                 "energy_threshold": 999,
+                "brain_provider": None,
                 "start_cooldown_seconds": 99,
                 "stop_timeout_seconds": 99,
-                "vad": {"frame_ms": 20, "energy_threshold": 300},
+                "vad": {"frame_ms": 20, "energy_threshold": 300, "max_segment_seconds": None},
                 "timeouts": {"start_cooldown_seconds": 5, "stop_timeout_seconds": 2},
                 "barge_in": {"energy_threshold": 400, "min_ms": 120},
             }
@@ -183,6 +186,8 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
     assert env["FLUXER_VOICE_STOP_TIMEOUT_SECONDS"] == "2"
     assert env["FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD"] == "400"
     assert env["FLUXER_VOICE_BARGE_IN_MIN_MS"] == "120"
+    assert "FLUXER_VOICE_BRAIN_PROVIDER" not in env
+    assert "FLUXER_VOICE_MAX_SEGMENT_SECONDS" not in env
 
 
 def test_voice_supervisor_child_env_forwards_yaml_credentials_without_overriding_env(monkeypatch, tmp_path):

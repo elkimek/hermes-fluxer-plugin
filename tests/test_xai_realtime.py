@@ -65,6 +65,13 @@ class SequenceDelayRealtimeWebSocket(FakeRealtimeWebSocket):
         return await super().__anext__()
 
 
+class RawRealtimeWebSocket(FakeRealtimeWebSocket):
+    async def __anext__(self):
+        if not self.events:
+            raise StopAsyncIteration
+        return self.events.pop(0)
+
+
 def pcm_delta(data: bytes):
     return {"type": "response.output_audio.delta", "delta": base64.b64encode(data).decode("ascii")}
 
@@ -301,6 +308,30 @@ async def test_xai_realtime_raises_on_error_event(tmp_path):
     client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")
 
     with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="bad request.*events_tail=.*error"):
+        await client._text_response_to_wav_on_ws(ws, "hello", tmp_path / "out.wav")
+
+
+@pytest.mark.asyncio
+async def test_xai_realtime_wraps_malformed_json_event(tmp_path):
+    ws = RawRealtimeWebSocket(["{not-json"])
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")
+
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="malformed JSON event.*cause=JSONDecodeError"):
+        await client._text_response_to_wav_on_ws(ws, "hello", tmp_path / "out.wav")
+
+
+@pytest.mark.asyncio
+async def test_xai_realtime_wraps_malformed_audio_delta(tmp_path):
+    ws = FakeRealtimeWebSocket([
+        {"type": "response.created"},
+        {"type": "response.output_audio.delta", "delta": "not valid base64!"},
+    ])
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")
+
+    with pytest.raises(
+        xai_realtime.XAIRealtimeStreamError,
+        match="malformed audio delta.*events_tail=.*response.output_audio.delta.*cause=Error",
+    ):
         await client._text_response_to_wav_on_ws(ws, "hello", tmp_path / "out.wav")
 
 

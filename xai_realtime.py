@@ -51,7 +51,7 @@ def _decode_audio_delta(event: dict[str, Any]) -> bytes:
     delta = event.get("delta") or event.get("audio") or event.get("data")
     if not isinstance(delta, str) or not delta:
         return b""
-    return base64.b64decode(delta)
+    return base64.b64decode(delta, validate=True)
 
 
 def _write_pcm16_wav(path: str | Path, pcm: bytes, *, sample_rate: int) -> Path:
@@ -476,7 +476,14 @@ class XAIRealtimeVoiceClient:
                     events_seen=events,
                     cause=exc,
                 ) from exc
-            event = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            try:
+                event = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
+            except Exception as exc:
+                raise XAIRealtimeStreamError(
+                    "xAI Realtime returned malformed JSON event",
+                    events_seen=events,
+                    cause=exc,
+                ) from exc
             event_type = str(event.get("type") or "")
             if event_type:
                 events.append(event_type)
@@ -487,7 +494,14 @@ class XAIRealtimeVoiceClient:
                     events_seen=events,
                 )
             if event_type == "response.output_audio.delta":
-                chunk = _decode_audio_delta(event)
+                try:
+                    chunk = _decode_audio_delta(event)
+                except Exception as exc:
+                    raise XAIRealtimeStreamError(
+                        "xAI Realtime returned malformed audio delta",
+                        events_seen=events,
+                        cause=exc,
+                    ) from exc
                 if chunk:
                     try:
                         await on_audio_delta(chunk)
