@@ -834,6 +834,7 @@ class FluxerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("fluxer"))
         extra = getattr(config, "extra", {}) or {}
+        self._gateway_state_updates_enabled = _coerce_bool(extra.get("gateway_state_updates"), True)
         self.base_url = _strip_slash(
             os.getenv("FLUXER_BASE_URL") or extra.get("base_url") or _DEFAULT_BASE_URL
         )
@@ -957,6 +958,14 @@ class FluxerAdapter(BasePlatformAdapter):
         self._voice_state_update_handler: Optional[Callable[[Dict[str, Any]], Any]] = None
         self._voice_supervisor = FluxerVoiceSupervisorProcess(extra=extra)
         self._gateway_ready_event = asyncio.Event()
+
+    def _mark_connected(self) -> None:
+        if self._gateway_state_updates_enabled:
+            super()._mark_connected()
+
+    def _mark_disconnected(self) -> None:
+        if self._gateway_state_updates_enabled:
+            super()._mark_disconnected()
 
     async def connect(self) -> bool:
         if not self.bot_token:

@@ -565,6 +565,35 @@ def test_voice_supervisor_signal_fallback_suppresses_missing_process(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_sidecar_adapter_can_disable_gateway_state_updates(monkeypatch):
+    marks = []
+    monkeypatch.setattr(
+        fluxer_adapter.BasePlatformAdapter,
+        "_mark_connected",
+        lambda self: marks.append("connected"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fluxer_adapter.BasePlatformAdapter,
+        "_mark_disconnected",
+        lambda self: marks.append("disconnected"),
+        raising=False,
+    )
+
+    main_adapter = fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra={"bot_token": "app.secret"}))
+    main_adapter._mark_connected()
+    main_adapter._mark_disconnected()
+
+    sidecar_adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "gateway_state_updates": False})
+    )
+    sidecar_adapter._mark_connected()
+    sidecar_adapter._mark_disconnected()
+
+    assert marks == ["connected", "disconnected"]
+
+
+@pytest.mark.asyncio
 async def test_reconnect_restarts_voice_supervisor(monkeypatch):
     starts = []
 

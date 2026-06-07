@@ -692,6 +692,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             extra={
                 "bot_token": bot_token,
                 "allow_all_users": env_truthy("FLUXER_ALLOW_ALL_USERS"),
+                "gateway_state_updates": False,
                 "voice": {"supervisor_disabled": True},
             },
         )
