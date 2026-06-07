@@ -232,6 +232,19 @@ async def _speech_segments(
             yield pcm
 
 
+async def _close_async_generator_safely(generator: Any) -> None:
+    """Close an async generator without turning cancellation cleanup into a loop error."""
+
+    close_generator = getattr(generator, "aclose", None)
+    if close_generator is None:
+        return
+    try:
+        await close_generator()
+    except RuntimeError as exc:
+        if "asynchronous generator is already running" not in str(exc):
+            raise
+
+
 async def _capture_one_speech_segment(
     args: argparse.Namespace,
     bridge: FluxerLiveKitSmokeBridge,
@@ -258,12 +271,8 @@ async def _capture_one_speech_segment(
     try:
         return await asyncio.wait_for(anext(segments), timeout=timeout)
     finally:
-        close_segments = getattr(segments, "aclose", None)
-        if close_segments is not None:
-            await close_segments()
-        close_chunks = getattr(chunks, "aclose", None)
-        if close_chunks is not None:
-            await close_chunks()
+        await _close_async_generator_safely(segments)
+        await _close_async_generator_safely(chunks)
 
 
 async def _wait_for_barge_in(

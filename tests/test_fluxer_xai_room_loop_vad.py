@@ -43,6 +43,25 @@ class FakeBargeBridge:
 
 
 @pytest.mark.asyncio
+async def test_close_async_generator_safely_suppresses_already_running_cleanup_race():
+    class AlreadyRunningGenerator:
+        async def aclose(self):
+            raise RuntimeError("aclose(): asynchronous generator is already running")
+
+    await room_loop._close_async_generator_safely(AlreadyRunningGenerator())
+
+
+@pytest.mark.asyncio
+async def test_close_async_generator_safely_reraises_other_runtime_errors():
+    class BrokenGenerator:
+        async def aclose(self):
+            raise RuntimeError("different cleanup failure")
+
+    with pytest.raises(RuntimeError, match="different cleanup failure"):
+        await room_loop._close_async_generator_safely(BrokenGenerator())
+
+
+@pytest.mark.asyncio
 async def test_speech_segments_trim_final_silence_tail_but_keep_padding():
     # sample_rate=1000 means each 20-sample frame is 20ms and easy to reason about.
     frames = [pcm16(1200, 20) for _ in range(10)]  # 200ms speech
