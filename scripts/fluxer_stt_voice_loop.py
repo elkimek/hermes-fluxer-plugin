@@ -707,23 +707,11 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     }
     history: list[dict[str, str]] = []
     sticky_brain_provider = "xai-fast"
+    session_task: asyncio.Task[Any] | None = None
 
-    async def handler(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
-        nonlocal leave_connection_id, sticky_brain_provider
+    async def run_voice_session(info: Any, safe_update: dict[str, Any]) -> None:
+        nonlocal sticky_brain_provider
         try:
-            info = await bridge.connect_from_voice_server_update(raw_update)
-            leave_connection_id = info.connection_id
-            result["connection"] = {
-                "endpoint": info.endpoint,
-                "guild_id": info.guild_id,
-                "channel_id": info.channel_id,
-                "connection_id": info.connection_id,
-                "room_name": info.room_name,
-                "participant_identity": info.participant_identity,
-            }
-            result["safe_update"] = safe_update
-            connected.set()
-
             # Let Fluxer publish/subscription state settle before the first fixed window.
             await asyncio.sleep(args.initial_settle_seconds)
 
@@ -1036,6 +1024,30 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         finally:
             finished.set()
 
+    async def handler(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
+        nonlocal leave_connection_id, session_task
+        try:
+            info = await bridge.connect_from_voice_server_update(raw_update)
+            leave_connection_id = info.connection_id
+            result["connection"] = {
+                "endpoint": info.endpoint,
+                "guild_id": info.guild_id,
+                "channel_id": info.channel_id,
+                "connection_id": info.connection_id,
+                "room_name": info.room_name,
+                "participant_identity": info.participant_identity,
+            }
+            result["safe_update"] = safe_update
+            connected.set()
+            if session_task is None or session_task.done():
+                session_task = asyncio.create_task(run_voice_session(info, safe_update))
+        except Exception as exc:
+            logger.exception("STT-backed Fluxer voice loop failed to join LiveKit")
+            result["error"] = type(exc).__name__
+            result["message"] = str(exc)
+            connected.set()
+            finished.set()
+
     adapter.set_voice_server_update_handler(handler)
     loop = asyncio.get_running_loop()
     previous_signal_handlers: dict[signal.Signals, Any] = {}
@@ -1072,6 +1084,10 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             return result
     finally:
         shutdown_requested.set()
+        if session_task is not None and not session_task.done():
+            session_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await session_task
         with contextlib.suppress(Exception):
             await adapter.send_voice_state_update(None, guild_id=args.guild_id, connection_id=leave_connection_id)
         await bridge.disconnect()

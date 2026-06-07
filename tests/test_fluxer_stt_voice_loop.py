@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import os
 import sqlite3
 import wave
@@ -953,3 +954,106 @@ async def test_stt_voice_loop_barge_in_watcher_cancels_after_first_audio_when_xa
     assert result["turns"][0]["published"] is False
     assert result["turns"][0]["publisher_queue_after_clear_seconds"] == 0.0
     assert publishers[0].interrupted is True
+
+
+@pytest.mark.asyncio
+async def test_stt_voice_loop_voice_server_handler_returns_before_session_finishes(monkeypatch, tmp_path):
+    sends = []
+    handler_returned = asyncio.Event()
+    capture_started = asyncio.Event()
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            sends.append((channel_id, kwargs))
+            if channel_id is not None:
+                assert self.handler is not None
+                await self.handler(
+                    {
+                        "endpoint": "wss://voice.example",
+                        "token": "secret-token",
+                        "guild_id": kwargs.get("guild_id"),
+                        "channel_id": channel_id,
+                        "connection_id": "conn-nonblocking",
+                    },
+                    {"connection_id": "conn-nonblocking", "has_token": True},
+                )
+                handler_returned.set()
+            return True
+
+        async def disconnect(self):
+            sends.append(("adapter_disconnect", {}))
+
+    class FakeBridge:
+        def __init__(self, auto_subscribe=True):
+            pass
+
+        async def connect_from_voice_server_update(self, raw_update):
+            return SimpleNamespace(
+                endpoint=raw_update["endpoint"],
+                guild_id=raw_update["guild_id"],
+                channel_id=raw_update["channel_id"],
+                connection_id=raw_update["connection_id"],
+                room_name="room",
+                participant_identity="bot_conn-nonblocking",
+            )
+
+        async def disconnect(self):
+            sends.append(("bridge_disconnect", {}))
+
+    async def blocking_capture(*args, **kwargs):
+        capture_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
+    monkeypatch.setenv("XAI_API_KEY", "xai")
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop._capture_one_speech_segment", blocking_capture)
+
+    args = parse_args(
+        [
+            "--channel-id",
+            "voice-1",
+            "--guild-id",
+            "guild-1",
+            "--max-turns",
+            "1",
+            "--initial-settle-seconds",
+            "0",
+            "--max-runtime-seconds",
+            "0.01",
+            "--voice-context-file",
+            str(tmp_path / "missing-context.md"),
+        ]
+    )
+
+    result = await asyncio.wait_for(run_stt_voice_loop(args), timeout=1.0)
+
+    assert handler_returned.is_set()
+    assert capture_started.is_set()
+    assert result["error"] == "TimeoutError"
+    assert "max runtime" in result["message"]
+    assert (None, {"guild_id": "guild-1", "connection_id": "conn-nonblocking"}) in sends
+
+
+def test_stt_voice_loop_enters_publisher_before_starting_barge_in_tasks():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    publisher_enter = source.index("await publisher.__aenter__()")
+    first_barge_in_task = source.index("barge_in_task = asyncio.create_task")
+    first_interrupt_watcher = source.index("interrupt_watcher_task = asyncio.create_task")
+
+    assert publisher_enter < first_barge_in_task
+    assert publisher_enter < first_interrupt_watcher
