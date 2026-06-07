@@ -1,6 +1,8 @@
 from pathlib import Path
 import ast
+import asyncio
 import os
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -283,8 +285,12 @@ class _FakeVoiceProcess:
     def kill(self):
         self.killed = True
 
-    def wait(self, timeout=None):
+    def wait(self, timeout=None) -> int:
         self.wait_calls.append(timeout)
+        if timeout is None:
+            deadline = time.monotonic() + 1.0
+            while not (self.terminated or self.killed) and time.monotonic() < deadline:
+                time.sleep(0.001)
         return 0
 
 
@@ -343,7 +349,7 @@ def test_voice_supervisor_spawns_when_enabled_scoped_and_auto_join(tmp_path, mon
     assert supervisor.start() is True
     assert len(calls) == 1
     args, kwargs = calls[0]
-    assert args[0][1] == "scripts/fluxer_voice_auto_join.py"
+    assert args[0][1] == str(root / "scripts" / "fluxer_voice_auto_join.py")
     assert kwargs["cwd"] == str(root)
     assert kwargs["env"]["FLUXER_VOICE_ENABLED"] == "true"
     assert kwargs["env"]["FLUXER_VOICE_AUTO_JOIN"] == "true"
@@ -411,7 +417,59 @@ async def test_voice_supervisor_stop_terminates_child(tmp_path, monkeypatch):
     await supervisor.stop()
 
     assert fake_proc.terminated is True
-    assert fake_proc.wait_calls == [8]
+    assert 8 in fake_proc.wait_calls
+
+
+@pytest.mark.asyncio
+async def test_voice_supervisor_watcher_restarts_exited_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLUXER_VOICE_ENABLED", "true")
+    monkeypatch.setenv("FLUXER_VOICE_AUTO_JOIN", "true")
+    monkeypatch.setenv("FLUXER_VOICE_CHANNEL_IDS", "voice-1")
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+    processes = []
+
+    class ExitingProcess(_FakeVoiceProcess):
+        def wait(self, timeout=None) -> int:
+            self.wait_calls.append(timeout)
+            self.terminated = True
+            return 17
+
+    class RunningProcess(_FakeVoiceProcess):
+        pass
+
+    def fake_popen(*args, **kwargs):
+        proc = ExitingProcess() if not processes else RunningProcess()
+        processes.append(proc)
+        return proc
+
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(extra={}, plugin_root=root, popen_factory=fake_popen)
+    supervisor._restart_delay_seconds = 0
+
+    assert supervisor.start() is True
+    deadline = time.monotonic() + 1.0
+    while len(processes) < 2 and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert len(processes) == 2
+    await supervisor.stop()
+
+
+def test_voice_supervisor_signal_fallback_suppresses_missing_process(monkeypatch):
+    class GoneProcess:
+        pid = 999999
+
+        def terminate(self):
+            raise ProcessLookupError("gone")
+
+    monkeypatch.setattr(fluxer_adapter.os, "getpgid", lambda pid: (_ for _ in ()).throw(ProcessLookupError("gone")))
+
+    fluxer_adapter.FluxerVoiceSupervisorProcess._signal_process_group(
+        GoneProcess(),  # type: ignore[arg-type]
+        fluxer_adapter.signal.SIGTERM,
+        fallback=GoneProcess().terminate,
+    )
 
 
 @pytest.mark.asyncio
