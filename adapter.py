@@ -389,6 +389,8 @@ def _voice_bool_setting(extra: Dict[str, Any], key: str, env_name: str, default:
 
 def _voice_csv_setting(extra: Dict[str, Any], key: str, env_name: str) -> str:
     value = _voice_setting(extra, key, env_name, "")
+    if value is None:
+        return ""
     return ",".join(sorted(_split_ids(value)))
 
 
@@ -2136,6 +2138,14 @@ class FluxerAdapter(BasePlatformAdapter):
                 "channel_id": channel_id,
                 "connection_id": connection_id,
             }
+        elif sent and channel_id is None:
+            stale_join_keys = [
+                key
+                for key, pending in self._pending_voice_joins.items()
+                if guild_id is None or pending.get("guild_id") == guild_id
+            ]
+            for key in stale_join_keys:
+                self._pending_voice_joins.pop(key, None)
         return sent
 
     async def _heartbeat_loop(self, interval_ms: int) -> None:
@@ -2392,7 +2402,7 @@ class FluxerAdapter(BasePlatformAdapter):
             safe_update.get("guild_id") or "<dm>",
             safe_update.get("connection_id") or "<none>",
         )
-        if self._voice_server_update_handler is not None:
+        if matched and self._voice_server_update_handler is not None:
             try:
                 result = self._voice_server_update_handler(dict(data), dict(safe_update))
                 if asyncio.iscoroutine(result):

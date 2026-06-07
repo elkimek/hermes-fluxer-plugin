@@ -162,6 +162,16 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     assert os.environ["FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY"] == "false"
 
 
+def test_voice_supervisor_treats_null_yaml_channel_ids_as_unscoped(monkeypatch):
+    monkeypatch.delenv("FLUXER_VOICE_CHANNEL_IDS", raising=False)
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(
+        extra={"voice": {"enabled": True, "auto_join": True, "channel_ids": None}},
+    )
+
+    assert supervisor.configured_channel_ids == ""
+    assert supervisor.should_start() is False
+
+
 def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_level(monkeypatch, tmp_path):
     for key in (
         "FLUXER_VOICE_FRAME_MS",
@@ -1010,6 +1020,51 @@ async def test_voice_server_update_bridge_handler_receives_raw_token_safely(monk
     }
     assert adapter._last_voice_server_update == safe
     assert adapter._last_voice_server_update is not None
+    assert "token" not in adapter._last_voice_server_update
+
+
+@pytest.mark.asyncio
+async def test_voice_leave_clears_pending_join_before_delayed_voice_server_update(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    payloads = []
+
+    async def fake_send(payload):
+        payloads.append(payload)
+        return True
+
+    adapter._send_gateway_payload = fake_send  # type: ignore[method-assign]
+
+    assert await adapter.send_voice_state_update("voice-1", guild_id="guild-1", connection_id="conn-1") is True
+    assert adapter._pending_voice_joins == {
+        "guild-1:voice-1": {"guild_id": "guild-1", "channel_id": "voice-1", "connection_id": "conn-1"}
+    }
+
+    assert await adapter.send_voice_state_update(None, guild_id="guild-1", connection_id="conn-1") is True
+    assert adapter._pending_voice_joins == {}
+
+    received = []
+    adapter.set_voice_server_update_handler(lambda raw, safe: received.append((raw, safe)))
+    await adapter._handle_gateway_dispatch(
+        {
+            "op": 0,
+            "t": "VOICE_SERVER_UPDATE",
+            "d": {
+                "guild_id": "guild-1",
+                "channel_id": "voice-1",
+                "connection_id": "conn-1",
+                "endpoint": "wss://voice.example.test",
+                "token": "late-livekit-token",
+            },
+        }
+    )
+
+    assert received == []
+    assert adapter._last_voice_server_update is not None
+    assert adapter._last_voice_server_update["matched_pending_join"] is False
     assert "token" not in adapter._last_voice_server_update
 
 
