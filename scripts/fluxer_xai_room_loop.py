@@ -56,6 +56,56 @@ def _redact_exception_message(exc: Exception, *secrets: str | None) -> str:
     return message[:500]
 
 
+async def _cancel_task_safely(task: asyncio.Task[Any] | None, *, timeout: float = 2.0) -> None:
+    """Cancel a child task before closing resources while preserving caller cancellation."""
+
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        done, pending = await asyncio.wait({task}, timeout=timeout)
+    except asyncio.CancelledError:
+        raise
+    except RuntimeError:
+        return
+    for pending_task in pending:
+        pending_task.cancel()
+    for done_task in done:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            done_task.result()
+
+
+async def _cancel_previous_task_safely(task: asyncio.Task[Any] | None, *, timeout: float = 2.0) -> None:
+    """Cancel a previous chained task without swallowing this task's own cancellation."""
+
+    await _cancel_task_safely(task, timeout=timeout)
+
+
+async def _acquire_lock_with_timeout(lock: asyncio.Lock, *, timeout: float) -> None:
+    """Acquire an asyncio lock with a timeout without Python 3.10 wait_for races."""
+
+    acquire_task = asyncio.create_task(lock.acquire())
+    try:
+        done, pending = await asyncio.wait({acquire_task}, timeout=timeout)
+    except asyncio.CancelledError:
+        acquire_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            acquired = await acquire_task
+            if acquired:
+                lock.release()
+        raise
+    if pending:
+        acquire_task.cancel()
+        acquired_after_timeout = False
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            acquired_after_timeout = await acquire_task
+        if acquired_after_timeout:
+            lock.release()
+        raise TimeoutError(f"timed out waiting {timeout} seconds for voice update lock")
+    for done_task in done:
+        done_task.result()
+
+
 @dataclass
 class BargeInCapture:
     """State shared between assistant playback and the barge-in listener."""
@@ -462,9 +512,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                                 assert publisher is not None
                                 barge_in_seconds = time.monotonic() - xai_started
                                 await publisher.interrupt()
-                                xai_task.cancel()
-                                with contextlib.suppress(asyncio.CancelledError):
-                                    await xai_task
+                                await _cancel_task_safely(xai_task)
                                 raise BargeInInterrupt("user interrupted assistant speech before xAI audio")
                             xai_result = await xai_task
                     finally:
@@ -490,10 +538,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                         barge_in_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                             await barge_in_task
-                    if xai_task is not None and not xai_task.done():
-                        xai_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                            await xai_task
+                    await _cancel_task_safely(xai_task)
                     publish_started = time.monotonic()
                     if publisher is not None and publisher.interrupted:
                         await publisher.close(wait_for_playout=False, flush_remainder=False)
@@ -771,10 +816,15 @@ async def run(args: argparse.Namespace) -> int:
     result: dict[str, Any] = {"mode": "continuous_turn_loop"}
 
     voice_update_task: asyncio.Task[Any] | None = None
+    voice_update_lock = asyncio.Lock()
 
     async def process_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
         try:
-            info = await bridge.connect_from_voice_server_update(raw_update)
+            await _acquire_lock_with_timeout(voice_update_lock, timeout=args.connect_timeout)
+            try:
+                info = await bridge.connect_from_voice_server_update(raw_update)
+            finally:
+                voice_update_lock.release()
             result["safe_update"] = safe_update
             result["connection"] = {
                 "endpoint": info.endpoint,
@@ -797,10 +847,7 @@ async def run(args: argparse.Namespace) -> int:
         raw_update: dict[str, Any],
         safe_update: dict[str, Any],
     ) -> None:
-        if previous_task is not None and not previous_task.done():
-            previous_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                await previous_task
+        await _cancel_previous_task_safely(previous_task)
         await process_voice_server_update(raw_update, safe_update)
 
     async def on_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:

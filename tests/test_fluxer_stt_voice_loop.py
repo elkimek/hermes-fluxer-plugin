@@ -1251,6 +1251,14 @@ async def test_stt_voice_loop_awaits_cancelled_voice_server_connect_before_recon
     assert result["error"] == "TimeoutError"
 
 
+def test_stt_voice_loop_serializes_voice_server_update_connects():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    assert "voice_update_lock = asyncio.Lock()" in source
+    assert "_acquire_lock_with_timeout(voice_update_lock, timeout=args.connect_timeout)" in source
+    assert "voice_update_lock.release()" in source
+
+
 @pytest.mark.asyncio
 async def test_stt_voice_loop_cancels_active_session_before_second_voice_server_update(monkeypatch, tmp_path):
     first_capture_started = asyncio.Event()
@@ -1382,6 +1390,18 @@ def test_stt_voice_loop_cancels_xai_task_before_publisher_close():
     close_publisher = source.index("await publisher.close", cancel_xai)
 
     assert cancel_xai < close_publisher
+
+
+def test_stt_voice_loop_barge_in_path_cancels_xai_before_closing_publisher():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    barge_in_handler = source.index("except BargeInInterrupt:")
+    first_barge_close = source.index("await publisher.close", barge_in_handler)
+    final_cleanup = source.index("finally:", barge_in_handler)
+    cancel_xai = source.index("_cancel_task_safely(xai_task", barge_in_handler)
+
+    assert cancel_xai < first_barge_close
+    assert cancel_xai < final_cleanup
 
 
 def test_stt_voice_loop_redacts_livekit_token_from_join_errors():

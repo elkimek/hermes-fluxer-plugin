@@ -1028,7 +1028,6 @@ class FluxerAdapter(BasePlatformAdapter):
         self._awaiting_heartbeat_ack = False
         self._last_heartbeat_sent_at = None
         self._last_heartbeat_ack_at = None
-        self._pending_voice_joins.clear()
         self._gateway_ready_event.clear()
 
         sep = "&" if "?" in self.gateway_url else "?"
@@ -1056,8 +1055,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 await asyncio.sleep(delay)
                 await self._connect_gateway_once()
                 self._mark_connected()
-                if self._voice_supervisor:
-                    self._voice_supervisor.start()
+                self._voice_supervisor.start()
                 logger.info("Fluxer gateway reconnected after %s", reason)
                 return
             except asyncio.CancelledError:

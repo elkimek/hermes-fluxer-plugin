@@ -195,6 +195,9 @@ class _LiveKitPcm16Publisher:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if exc_type is not None and (not issubclass(exc_type, Exception) or getattr(exc_type, "_fluxer_fast_close", False)):
+            await self.close(wait_for_playout=False, flush_remainder=False)
+            return
         await self.close()
 
     async def write(self, pcm: bytes) -> None:
@@ -664,9 +667,11 @@ class FluxerLiveKitSmokeBridge:
                     task.cancel()
                 for task in stream_tasks:
                     try:
-                        await task
+                        await asyncio.wait_for(task, timeout=2.0)
                     except asyncio.CancelledError:
                         pass
+                    except (TimeoutError, asyncio.TimeoutError):
+                        logger.warning("Fluxer LiveKit remote audio stream task cleanup timed out")
                     except Exception as exc:
                         logger.warning("Fluxer LiveKit remote audio stream task ended during cleanup: %s", exc)
 

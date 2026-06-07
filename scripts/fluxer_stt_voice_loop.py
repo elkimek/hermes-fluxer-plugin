@@ -46,7 +46,11 @@ from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from scripts.fluxer_xai_room_loop import (  # noqa: E402
     BargeInCapture,
     BargeInInterrupt,
+    _acquire_lock_with_timeout,
     _capture_one_speech_segment,
+    _cancel_previous_task_safely,
+    _cancel_task_safely,
+    _redact_exception_message,
     _wait_for_barge_in,
 )
 from tools.transcription_tools import (  # noqa: E402
@@ -81,17 +85,6 @@ Conversation rules:
 - Correct obvious ASR homophones when context is clear, e.g. "past", "plast", or "plastic" can mean "plus" in arithmetic.
 - Default to English unless the user explicitly asks for another language or clearly speaks another language.
 """.strip()
-
-
-def _redact_exception_message(exc: Exception, *secrets: str | None) -> str:
-    message = str(exc) or repr(exc)
-    for secret in secrets:
-        if secret:
-            message = message.replace(secret, "[redacted-token]")
-    message = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted-token]", message)
-    message = re.sub(r"token=([A-Za-z0-9._~+/=-]+)", "token=[redacted-token]", message, flags=re.IGNORECASE)
-    message = re.sub(r'("token"\s*:\s*")([^"]+)(")', r"\1[redacted-token]\3", message, flags=re.IGNORECASE)
-    return message[:500]
 
 
 def env_truthy(name: str) -> bool:
@@ -720,6 +713,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     sticky_brain_provider = "xai-fast"
     session_task: asyncio.Task[Any] | None = None
     voice_update_task: asyncio.Task[Any] | None = None
+    voice_update_lock = asyncio.Lock()
     session_generation = 0
 
     async def run_voice_session(info: Any, safe_update: dict[str, Any], generation: int) -> None:
@@ -912,9 +906,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                             if barge_event_task in done and barge_in_capture.event.is_set() and not xai_task.done():
                                 barge_in_seconds = time.monotonic() - xai_started
                                 await publisher.interrupt()
-                                xai_task.cancel()
-                                with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                                    await xai_task
+                                await _cancel_task_safely(xai_task)
                                 raise BargeInInterrupt("user interrupted assistant speech before xAI audio")
                             try:
                                 xai_result = await xai_task
@@ -934,6 +926,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         raise BargeInInterrupt("user interrupted assistant speech")
                 except BargeInInterrupt:
                     logger.info("Barge-in interrupted STT-backed voice turn %s", turn_no)
+                    await _cancel_task_safely(xai_task)
                     if barge_in_capture.event.is_set():
                         with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
                             await asyncio.wait_for(
@@ -994,10 +987,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         interrupt_watcher_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                             await interrupt_watcher_task
-                    if xai_task is not None and not xai_task.done():
-                        xai_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                            await xai_task
+                    await _cancel_task_safely(xai_task)
                     if not getattr(publisher, "interrupted", False):
                         await publisher.close(wait_for_playout=False, flush_remainder=False)
                 xai_seconds = time.monotonic() - xai_started
@@ -1050,7 +1040,11 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 session_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                     await session_task
-            info = await bridge.connect_from_voice_server_update(raw_update)
+            await _acquire_lock_with_timeout(voice_update_lock, timeout=args.connect_timeout)
+            try:
+                info = await bridge.connect_from_voice_server_update(raw_update)
+            finally:
+                voice_update_lock.release()
             leave_connection_id = info.connection_id
             result["connection"] = {
                 "endpoint": info.endpoint,
@@ -1078,10 +1072,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         raw_update: dict[str, Any],
         safe_update: dict[str, Any],
     ) -> None:
-        if previous_task is not None and not previous_task.done():
-            previous_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                await previous_task
+        await _cancel_previous_task_safely(previous_task)
         await process_voice_server_update(raw_update, safe_update)
 
     async def handler(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:

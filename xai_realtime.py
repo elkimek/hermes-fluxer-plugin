@@ -31,6 +31,8 @@ class XAIRealtimeAudioResult:
 class BargeInInterrupt(Exception):
     """Raised when fresh user speech interrupts assistant playback."""
 
+    _fluxer_fast_close = True
+
 
 class XAIRealtimeStreamError(RuntimeError):
     """xAI realtime stream failure with sanitized event context."""
@@ -526,8 +528,7 @@ class XAIRealtimeVoiceClient:
                 break
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 if bytes_written == 0:
-                    limit = read_timeout if read_timeout is not None else (first_audio_timeout if first_audio_timeout is not None else timeout)
-                    message = f"xAI Realtime emitted no audio within {limit}s"
+                    message = f"xAI Realtime emitted no audio within {read_timeout}s"
                 else:
                     message = f"xAI Realtime response did not finish within {timeout}s"
                 raise XAIRealtimeStreamError(

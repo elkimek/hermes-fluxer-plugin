@@ -585,7 +585,7 @@ async def test_reconnect_restarts_voice_supervisor(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_connect_gateway_once_clears_stale_pending_voice_joins(monkeypatch):
+async def test_connect_gateway_once_preserves_pending_voice_joins(monkeypatch):
     import asyncio
     import contextlib
     import sys
@@ -606,7 +606,7 @@ async def test_connect_gateway_once_clears_stale_pending_voice_joins(monkeypatch
 
     await adapter._connect_gateway_once()
 
-    assert adapter._pending_voice_joins == {}
+    assert adapter._pending_voice_joins == {"guild-1:voice-1": {"guild_id": "guild-1", "channel_id": "voice-1"}}
     assert adapter._listener_task is not None
     adapter._listener_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -634,6 +634,16 @@ def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
     assert "__globals__" not in stt_loop_source
     assert "await _maybe_await(room.disconnect())" in livekit_source
     assert "logger.exception(\n                    \"Fluxer voice server update bridge handler failed" in adapter_source
+    assert "self._pending_voice_joins.clear()" not in adapter_source
+    assert "if self._voice_supervisor:" not in adapter_source
+    assert "await asyncio.wait_for(task, timeout=" in livekit_source
+    assert "await asyncio.wait({task}, timeout=timeout)" in xai_room_loop_source
+    assert 'getattr(current, "cancelling", None)' not in xai_room_loop_source
+    assert "contextlib.suppress(asyncio.CancelledError, Exception)" in xai_room_loop_source
+    assert "await asyncio.wait_for(task, timeout=timeout)" not in xai_room_loop_source
+    assert 'getattr(exc_type, "_fluxer_fast_close", False)' in livekit_source
+    assert 'exc_type.__name__ == "BargeInInterrupt"' not in livekit_source
+    assert "not issubclass(exc_type, Exception)" in livekit_source
 
 
 def test_public_tree_contains_no_private_voice_dogfood_defaults():
@@ -1277,6 +1287,7 @@ def test_xai_realtime_defaults_are_generic_and_concise():
 
 def test_continuous_room_loop_script_has_noise_and_language_guardrails():
     source = (ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text()
+    realtime_source = (ROOT / "xai_realtime.py").read_text()
 
     assert "default to English" in source
     assert "Ignore background music" in source
@@ -1291,6 +1302,7 @@ def test_continuous_room_loop_script_has_noise_and_language_guardrails():
     assert "pcm16_publisher" in source
     assert "first_audio_seconds" in source
     assert "BargeInInterrupt" in source
+    assert "_fluxer_fast_close = True" in realtime_source
     assert "--disable-barge-in" in source
     assert "barge_in_min_ms" in source
     assert "--diagnose-barge-in" in source

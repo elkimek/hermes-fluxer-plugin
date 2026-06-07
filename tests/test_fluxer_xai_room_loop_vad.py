@@ -569,6 +569,31 @@ async def test_conversation_loop_exits_cleanly_on_asyncio_capture_timeout(monkey
 
 
 @pytest.mark.asyncio
+async def test_cancel_previous_task_safely_propagates_own_cancellation():
+    previous_cleanup_started = asyncio.Event()
+
+    async def slow_previous_task():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            previous_cleanup_started.set()
+            await asyncio.sleep(10)
+            raise
+
+    previous_task = asyncio.create_task(slow_previous_task())
+    helper_task = asyncio.create_task(room_loop._cancel_previous_task_safely(previous_task))
+    await asyncio.wait_for(previous_cleanup_started.wait(), timeout=0.2)
+
+    helper_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await helper_task
+
+    previous_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await previous_task
+
+
+@pytest.mark.asyncio
 async def test_conversation_loop_closes_publisher_when_enter_fails(monkeypatch):
     args = argparse.Namespace(
         max_runtime_seconds=10.0,
@@ -811,6 +836,9 @@ def test_xai_room_loop_voice_server_handler_schedules_livekit_connect_task():
 
     assert "asyncio.create_task(" in handler_source
     assert "run_voice_update_after_previous(previous_task, raw_update, safe_update)" in handler_source
+    assert "voice_update_lock = asyncio.Lock()" in source
+    assert "_acquire_lock_with_timeout(voice_update_lock, timeout=args.connect_timeout)" in source
+    assert "voice_update_lock.release()" in source
     assert "await bridge.connect_from_voice_server_update" not in handler_source
     assert "await voice_update_task" not in handler_source
 
@@ -841,7 +869,7 @@ def test_xai_room_loop_conversation_publisher_uses_context_manager():
 def test_xai_room_loop_cancels_xai_task_before_publisher_close():
     source = inspect.getsource(room_loop._conversation_loop)
 
-    cancel_xai = source.index("if xai_task is not None and not xai_task.done():")
+    cancel_xai = source.index("await _cancel_task_safely(xai_task)")
     close_publisher = source.index("await publisher.close", cancel_xai)
 
     assert cancel_xai < close_publisher
