@@ -365,7 +365,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-segment-ms", type=int, default=int(os.getenv("FLUXER_VOICE_MIN_SEGMENT_MS", "1200")))
     parser.add_argument("--max-segment-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_SEGMENT_SECONDS", "9.0")))
     parser.add_argument("--barge-in-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", "180")))
-    parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "180")))
+    parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "600")))
     parser.add_argument("--barge-in-capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS", "2.0")))
     parser.add_argument("--max-runtime-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_RUNTIME_SECONDS", "3600.0")))
     parser.add_argument("--connect-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS", "30.0")))
