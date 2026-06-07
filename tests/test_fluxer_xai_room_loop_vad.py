@@ -793,8 +793,15 @@ def test_xai_room_loop_voice_server_handler_schedules_livekit_connect_task():
     handler_source = source[handler_start : source.index("adapter.set_voice_server_update_handler", handler_start)]
 
     assert "asyncio.create_task(" in handler_source
-    assert "process_voice_server_update(raw_update, safe_update)" in handler_source
+    assert "run_voice_update_after_previous(previous_task, raw_update, safe_update)" in handler_source
     assert "await bridge.connect_from_voice_server_update" not in handler_source
+    assert "await voice_update_task" not in handler_source
+
+
+def test_xai_room_loop_diagnostic_suppresses_publish_task_exceptions():
+    source = inspect.getsource(room_loop._diagnose_barge_in)
+
+    assert "contextlib.suppress(asyncio.CancelledError, RuntimeError, Exception)" in source
 
 
 def test_xai_room_loop_cancels_xai_task_before_publisher_close():

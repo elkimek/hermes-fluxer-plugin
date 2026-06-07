@@ -718,7 +718,7 @@ async def _diagnose_barge_in(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         if close_chunks is not None:
             await close_chunks()
         publish_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+        with contextlib.suppress(asyncio.CancelledError, RuntimeError, Exception):
             await publish_task
         if not getattr(publisher, "interrupted", False):
             await publisher.close(wait_for_playout=False, flush_remainder=False)
@@ -792,14 +792,22 @@ async def run(args: argparse.Namespace) -> int:
             result["message"] = _redact_exception_message(exc, str(raw_update.get("token") or ""))
             connected.set()
 
+    async def run_voice_update_after_previous(
+        previous_task: asyncio.Task[Any] | None,
+        raw_update: dict[str, Any],
+        safe_update: dict[str, Any],
+    ) -> None:
+        if previous_task is not None and not previous_task.done():
+            previous_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await previous_task
+        await process_voice_server_update(raw_update, safe_update)
+
     async def on_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
         nonlocal voice_update_task
-        if voice_update_task is not None and not voice_update_task.done():
-            voice_update_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                await voice_update_task
+        previous_task = voice_update_task
         voice_update_task = asyncio.create_task(
-            process_voice_server_update(raw_update, safe_update),
+            run_voice_update_after_previous(previous_task, raw_update, safe_update),
             name="fluxer-xai-room-voice-server-update",
         )
 
