@@ -20,6 +20,12 @@ class FakeParticipant:
         self.unpublished.append(track_sid)
 
 
+class FailingPublishParticipant(FakeParticipant):
+    async def publish_track(self, track, options):
+        self.published.append((track, options))
+        raise RuntimeError("publish failed")
+
+
 class FakeRoom:
     def __init__(self):
         self.connected = []
@@ -42,6 +48,12 @@ class FakeRoom:
 
     async def disconnect(self, **kwargs):
         self.disconnected = True
+
+
+class FailingPublishRoom(FakeRoom):
+    def __init__(self):
+        super().__init__()
+        self.local_participant = FailingPublishParticipant()
 
 
 @pytest.mark.asyncio
@@ -262,6 +274,39 @@ async def test_publish_pcm16_unpublishes_track_after_playout(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["publish_test_tone", "publish_wav_file", "publish_pcm16"])
+async def test_one_shot_publishers_cleanup_source_and_track_if_publish_fails(monkeypatch, tmp_path, method_name):
+    import wave
+
+    FakeAudioSource.instances = []
+    FakeLocalAudioTrack.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FailingPublishRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+
+    if method_name == "publish_test_tone":
+        call = bridge.publish_test_tone(duration_seconds=0.04, sample_rate=1000, frequency_hz=100, frame_ms=20)
+    elif method_name == "publish_pcm16":
+        call = bridge.publish_pcm16(b"\x01\x00" * 40, sample_rate=1000, frame_ms=20)
+    else:
+        wav_path = tmp_path / "fluxer.wav"
+        with wave.open(str(wav_path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(1000)
+            wav.writeframes(b"\x00\x00" * 40)
+        call = bridge.publish_wav_file(wav_path, frame_ms=20)
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        await call
+
+    assert FakeAudioSource.instances[0].closed is True
+    assert FakeLocalAudioTrack.instances[0].stopped is True
+    assert room.local_participant.unpublished == []
+
+
+@pytest.mark.asyncio
 async def test_publish_wav_file_rejects_non_mono_pcm(monkeypatch, tmp_path):
     import wave
 
@@ -422,6 +467,21 @@ class FakeAudioStream:
         self.closed = True
 
 
+class ExplodingAudioStream(FakeAudioStream):
+    instances = []
+
+    @classmethod
+    def from_track(cls, *, track, sample_rate, num_channels, frame_size_ms):
+        stream = cls([FakeAudioFrameEvent(b"\x01\x00" * 200)])
+        cls.instances.append(stream)
+        return stream
+
+    async def __anext__(self):
+        if self.events:
+            return self.events.pop(0)
+        raise RuntimeError("stream exploded")
+
+
 @pytest.mark.asyncio
 async def test_collect_remote_audio_pcm16_from_existing_track(monkeypatch):
     FakeAudioStream.tracks = []
@@ -466,4 +526,30 @@ async def test_collect_remote_audio_pcm16_returns_when_matching_track_ends(monke
     )
 
     assert len(pcm) == 800
+    assert "track_subscribed" not in room.handlers
+
+
+@pytest.mark.asyncio
+async def test_iter_remote_audio_pcm16_cleanup_suppresses_finished_stream_task_exception(monkeypatch):
+    from types import SimpleNamespace
+
+    ExplodingAudioStream.instances = []
+    room = FakeRoom()
+    track = type("RemoteAudioTrack", (), {"kind": "audio"})()
+    participant = SimpleNamespace(identity="user-a", track_publications={"pub": SimpleNamespace(track=track)})
+    room.remote_participants["user-a"] = participant
+
+    fake_rtc = type("FakeRtc", (), {"AudioStream": ExplodingAudioStream})()
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: fake_rtc)
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    bridge._room = room
+
+    generator = bridge.iter_remote_audio_pcm16(sample_rate=24000, participant_identity="user-a")
+    assert await anext(generator) == b"\x01\x00" * 200
+    await asyncio.sleep(0)
+
+    close_generator = getattr(generator, "aclose")
+    await close_generator()
+
+    assert ExplodingAudioStream.instances[0].closed is True
     assert "track_subscribed" not in room.handlers

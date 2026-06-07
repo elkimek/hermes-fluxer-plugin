@@ -301,6 +301,34 @@ def test_voice_supervisor_spawns_when_enabled_scoped_and_auto_join(tmp_path, mon
     assert kwargs["env"]["FLUXER_VOICE_SILENCE_MS"] == "850"
 
 
+def test_voice_supervisor_spawn_failure_is_non_fatal(tmp_path, monkeypatch, caplog):
+    for key in (
+        "FLUXER_VOICE_ENABLED",
+        "FLUXER_VOICE_AUTO_JOIN",
+        "FLUXER_VOICE_CHANNEL_IDS",
+        "FLUXER_VOICE_TARGET_USER_IDS",
+        "FLUXER_VOICE_SUPERVISOR_DISABLED",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+
+    def fail_spawn(*args, **kwargs):
+        raise FileNotFoundError("missing-python")
+
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(
+        extra={"voice": {"enabled": True, "auto_join": True, "channel_ids": ["voice-1"]}},
+        plugin_root=root,
+        popen_factory=fail_spawn,
+    )
+
+    assert supervisor.start() is False
+    assert supervisor.process is None
+    assert "continuing without voice supervisor" in caplog.text
+
+
 def test_voice_supervisor_internal_disable_guard_prevents_recursive_spawn(tmp_path, monkeypatch):
     monkeypatch.setenv("FLUXER_VOICE_ENABLED", "true")
     monkeypatch.setenv("FLUXER_VOICE_AUTO_JOIN", "true")

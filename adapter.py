@@ -524,12 +524,20 @@ class FluxerVoiceSupervisorProcess:
         if not script.exists():
             logger.warning("Fluxer realtime voice supervisor script missing: %s", script)
             return False
-        self.process = self.popen_factory(
-            self.build_command(),
-            cwd=str(self.plugin_root),
-            env=self._child_env(),
-            start_new_session=True,
-        )
+        try:
+            self.process = self.popen_factory(
+                self.build_command(),
+                cwd=str(self.plugin_root),
+                env=self._child_env(),
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self.process = None
+            logger.warning(
+                "Fluxer realtime voice supervisor failed to start; continuing without voice supervisor: %s",
+                exc,
+            )
+            return False
         logger.info("Fluxer realtime voice supervisor started with PID %s", getattr(self.process, "pid", None))
         return True
 

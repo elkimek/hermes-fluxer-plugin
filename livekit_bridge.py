@@ -376,15 +376,16 @@ class FluxerLiveKitSmokeBridge:
         track = rtc.LocalAudioTrack.create_audio_track(track_name, source)
         options = rtc.TrackPublishOptions()
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
-        publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
-        logger.info(
-            "Fluxer LiveKit smoke bridge published test tone track sid=%s source=%s kind=%s muted=%s",
-            getattr(publication, "sid", "<none>"),
-            getattr(publication, "source", "<unknown>"),
-            getattr(publication, "kind", "<unknown>"),
-            getattr(publication, "muted", "<unknown>"),
-        )
+        publication = None
         try:
+            publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
+            logger.info(
+                "Fluxer LiveKit smoke bridge published test tone track sid=%s source=%s kind=%s muted=%s",
+                getattr(publication, "sid", "<none>"),
+                getattr(publication, "source", "<unknown>"),
+                getattr(publication, "kind", "<unknown>"),
+                getattr(publication, "muted", "<unknown>"),
+            )
             await _wait_for_livekit_subscription(publication)
 
             frame_samples = max(1, sample_rate * frame_ms // 1000)
@@ -440,15 +441,16 @@ class FluxerLiveKitSmokeBridge:
             track = rtc.LocalAudioTrack.create_audio_track(track_name, source)
             options = rtc.TrackPublishOptions()
             options.source = rtc.TrackSource.SOURCE_MICROPHONE
-            publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
-            logger.info(
-                "Fluxer LiveKit smoke bridge published WAV track sid=%s source=%s kind=%s muted=%s",
-                getattr(publication, "sid", "<none>"),
-                getattr(publication, "source", "<unknown>"),
-                getattr(publication, "kind", "<unknown>"),
-                getattr(publication, "muted", "<unknown>"),
-            )
+            publication = None
             try:
+                publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
+                logger.info(
+                    "Fluxer LiveKit smoke bridge published WAV track sid=%s source=%s kind=%s muted=%s",
+                    getattr(publication, "sid", "<none>"),
+                    getattr(publication, "source", "<unknown>"),
+                    getattr(publication, "kind", "<unknown>"),
+                    getattr(publication, "muted", "<unknown>"),
+                )
                 await _wait_for_livekit_subscription(publication)
 
                 frame_samples = max(1, sample_rate * frame_ms // 1000)
@@ -490,15 +492,16 @@ class FluxerLiveKitSmokeBridge:
         track = rtc.LocalAudioTrack.create_audio_track(track_name, source)
         options = rtc.TrackPublishOptions()
         options.source = rtc.TrackSource.SOURCE_MICROPHONE
-        publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
-        logger.info(
-            "Fluxer LiveKit bridge published PCM track sid=%s source=%s kind=%s muted=%s",
-            getattr(publication, "sid", "<none>"),
-            getattr(publication, "source", "<unknown>"),
-            getattr(publication, "kind", "<unknown>"),
-            getattr(publication, "muted", "<unknown>"),
-        )
+        publication = None
         try:
+            publication = await _maybe_await(self._room.local_participant.publish_track(track, options))
+            logger.info(
+                "Fluxer LiveKit bridge published PCM track sid=%s source=%s kind=%s muted=%s",
+                getattr(publication, "sid", "<none>"),
+                getattr(publication, "source", "<unknown>"),
+                getattr(publication, "kind", "<unknown>"),
+                getattr(publication, "muted", "<unknown>"),
+            )
             await _wait_for_livekit_subscription(publication)
 
             frame_samples = max(1, sample_rate * frame_ms // 1000)
@@ -645,8 +648,12 @@ class FluxerLiveKitSmokeBridge:
                 for task in stream_tasks:
                     task.cancel()
                 for task in stream_tasks:
-                    with contextlib.suppress(asyncio.CancelledError):
+                    try:
                         await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:
+                        logger.warning("Fluxer LiveKit remote audio stream task ended during cleanup: %s", exc)
 
         return generator()
 
