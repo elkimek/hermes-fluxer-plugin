@@ -11,9 +11,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
+import os
 import sys
+import tempfile
 import types
 from typing import Any
+
+
+# Tests instantiate real Hermes BasePlatformAdapter when the Hermes checkout is
+# importable. Its _mark_connected/_mark_disconnected helpers write
+# gateway_state.json under HERMES_HOME, so never let standalone plugin tests
+# mutate the live user's dashboard/gateway runtime files.
+os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="fluxer-platform-test-home-")
 
 
 try:  # Prefer the real Hermes gateway package when the test runner has it.
