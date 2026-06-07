@@ -688,18 +688,22 @@ class FluxerLiveKitSmokeBridge:
                 participant_identity=participant_identity,
                 participant_identity_prefix=participant_identity_prefix,
             )
+            deadline = asyncio.get_running_loop().time() + timeout
             try:
-                async for chunk in chunks:
+                while True:
+                    remaining = max(0.001, deadline - asyncio.get_running_loop().time())
+                    chunk = await asyncio.wait_for(anext(chunks), timeout=remaining)
                     collected.extend(chunk)
                     if len(collected) >= target_bytes:
                         return bytes(collected[:target_bytes])
+            except StopAsyncIteration:
                 return bytes(collected)
             finally:
                 close = getattr(chunks, "aclose", None)
                 if close is not None:
                     await close()
 
-        return await asyncio.wait_for(_collect(), timeout=timeout)
+        return await _collect()
 
     async def disconnect(self) -> None:
         room = self._room

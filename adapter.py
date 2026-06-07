@@ -569,6 +569,7 @@ class FluxerVoiceSupervisorProcess:
         self._watch_task = loop.create_task(self._watch_process(proc), name="fluxer-voice-supervisor-watch")
 
     async def _watch_process(self, proc: subprocess.Popen) -> None:
+        current_task = asyncio.current_task()
         try:
             return_code = await asyncio.to_thread(proc.wait)
         except asyncio.CancelledError:
@@ -576,17 +577,22 @@ class FluxerVoiceSupervisorProcess:
         except Exception as exc:
             logger.debug("Fluxer realtime voice supervisor watcher stopped: %s", exc)
             return
-        if self.process is not proc:
-            return
-        self.process = None
-        self._watch_task = None
-        if not self.should_start():
-            logger.info("Fluxer realtime voice supervisor exited with code %s", return_code)
-            return
-        logger.warning("Fluxer realtime voice supervisor exited with code %s; restarting", return_code)
-        await asyncio.sleep(self._restart_delay_seconds)
-        if self.process is None and self.should_start():
-            self.start()
+        try:
+            if self.process is not proc:
+                return
+            self.process = None
+            if not self.should_start():
+                logger.info("Fluxer realtime voice supervisor exited with code %s", return_code)
+                return
+            logger.warning("Fluxer realtime voice supervisor exited with code %s; restarting", return_code)
+            await asyncio.sleep(self._restart_delay_seconds)
+            if self.process is None and self.should_start():
+                if self._watch_task is current_task:
+                    self._watch_task = None
+                self.start()
+        finally:
+            if self._watch_task is current_task:
+                self._watch_task = None
 
     async def stop(self) -> None:
         watch_task = self._watch_task

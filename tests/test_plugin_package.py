@@ -456,6 +456,45 @@ async def test_voice_supervisor_watcher_restarts_exited_child(tmp_path, monkeypa
     await supervisor.stop()
 
 
+@pytest.mark.asyncio
+async def test_voice_supervisor_stop_cancels_pending_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLUXER_VOICE_ENABLED", "true")
+    monkeypatch.setenv("FLUXER_VOICE_AUTO_JOIN", "true")
+    monkeypatch.setenv("FLUXER_VOICE_CHANNEL_IDS", "voice-1")
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+    processes = []
+
+    class ExitingProcess(_FakeVoiceProcess):
+        def wait(self, timeout=None) -> int:
+            self.wait_calls.append(timeout)
+            self.terminated = True
+            return 17
+
+    def fake_popen(*args, **kwargs):
+        proc = ExitingProcess()
+        processes.append(proc)
+        return proc
+
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(extra={}, plugin_root=root, popen_factory=fake_popen)
+    supervisor._restart_delay_seconds = 0.2
+
+    assert supervisor.start() is True
+    deadline = time.monotonic() + 1.0
+    while supervisor.process is not None and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert len(processes) == 1
+    assert supervisor.process is None
+    assert supervisor._watch_task is not None
+    await supervisor.stop()
+    await asyncio.sleep(0.25)
+
+    assert len(processes) == 1
+    assert supervisor._watch_task is None
+
+
 def test_voice_supervisor_signal_fallback_suppresses_missing_process(monkeypatch):
     class GoneProcess:
         pid = 999999
