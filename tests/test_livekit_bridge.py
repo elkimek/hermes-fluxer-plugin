@@ -350,6 +350,26 @@ async def test_pcm16_publisher_streams_chunks_and_flushes_remainder(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_pcm16_publisher_cleans_source_and_track_if_publish_fails(monkeypatch):
+    FakeAudioSource.instances = []
+    FakeLocalAudioTrack.instances = []
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)
+    room = FailingPublishRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+    await bridge.connect_from_voice_server_update({"endpoint": "wss://livekit.fluxer.example", "token": "secret"})
+
+    publisher = bridge.pcm16_publisher(sample_rate=1000, frame_ms=20, track_name="fluxer-stream")
+    with pytest.raises(RuntimeError, match="publish failed"):
+        await publisher.__aenter__()
+
+    assert FakeAudioSource.instances[0].closed is True
+    assert FakeLocalAudioTrack.instances[0].stopped is True
+    assert publisher._source is None
+    assert publisher._track is None
+    assert publisher._publication is None
+
+
+@pytest.mark.asyncio
 async def test_pcm16_publisher_close_times_out_hung_playout(monkeypatch):
     FakeAudioSource.instances = []
     monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeRtc)

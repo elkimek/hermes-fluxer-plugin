@@ -179,15 +179,19 @@ class _LiveKitPcm16Publisher:
         self._track = self._rtc.LocalAudioTrack.create_audio_track(self._track_name, self._source)
         options = self._rtc.TrackPublishOptions()
         options.source = self._rtc.TrackSource.SOURCE_MICROPHONE
-        self._publication = await _maybe_await(self._room.local_participant.publish_track(self._track, options))
-        logger.info(
-            "Fluxer LiveKit bridge opened streaming PCM track sid=%s source=%s kind=%s muted=%s",
-            getattr(self._publication, "sid", "<none>"),
-            getattr(self._publication, "source", "<unknown>"),
-            getattr(self._publication, "kind", "<unknown>"),
-            getattr(self._publication, "muted", "<unknown>"),
-        )
-        await _wait_for_livekit_subscription(self._publication)
+        try:
+            self._publication = await _maybe_await(self._room.local_participant.publish_track(self._track, options))
+            logger.info(
+                "Fluxer LiveKit bridge opened streaming PCM track sid=%s source=%s kind=%s muted=%s",
+                getattr(self._publication, "sid", "<none>"),
+                getattr(self._publication, "source", "<unknown>"),
+                getattr(self._publication, "kind", "<unknown>"),
+                getattr(self._publication, "muted", "<unknown>"),
+            )
+            await _wait_for_livekit_subscription(self._publication)
+        except Exception:
+            await self.close(wait_for_playout=False, flush_remainder=False)
+            raise
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
