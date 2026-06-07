@@ -701,7 +701,8 @@ class FluxerLiveKitSmokeBridge:
             finally:
                 close = getattr(chunks, "aclose", None)
                 if close is not None:
-                    await close()
+                    with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+                        await asyncio.wait_for(close(), timeout=min(5.0, max(0.05, timeout)))
 
         return await _collect()
 

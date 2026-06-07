@@ -398,6 +398,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         barge_in_seconds: float | None = None
         publisher: Any | None = None
         barge_in_capture = BargeInCapture()
+        xai_task: asyncio.Task[Any] | None = None
         try:
             xai_started = time.monotonic()
             barge_in_task: asyncio.Task[Any] | None = None
@@ -489,6 +490,10 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                     barge_in_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                         await barge_in_task
+                if xai_task is not None and not xai_task.done():
+                    xai_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                        await xai_task
                 publish_started = time.monotonic()
                 if publisher is not None and publisher.interrupted:
                     await publisher.close(wait_for_playout=False, flush_remainder=False)
@@ -765,7 +770,9 @@ async def run(args: argparse.Namespace) -> int:
     connected = asyncio.Event()
     result: dict[str, Any] = {"mode": "continuous_turn_loop"}
 
-    async def on_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
+    voice_update_task: asyncio.Task[Any] | None = None
+
+    async def process_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
         try:
             info = await bridge.connect_from_voice_server_update(raw_update)
             result["safe_update"] = safe_update
@@ -778,10 +785,23 @@ async def run(args: argparse.Namespace) -> int:
                 "participant_identity": info.participant_identity,
             }
             connected.set()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # token intentionally not included
             result["error"] = type(exc).__name__
             result["message"] = _redact_exception_message(exc, str(raw_update.get("token") or ""))
             connected.set()
+
+    async def on_voice_server_update(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
+        nonlocal voice_update_task
+        if voice_update_task is not None and not voice_update_task.done():
+            voice_update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await voice_update_task
+        voice_update_task = asyncio.create_task(
+            process_voice_server_update(raw_update, safe_update),
+            name="fluxer-xai-room-voice-server-update",
+        )
 
     adapter.set_voice_server_update_handler(on_voice_server_update)
     try:
@@ -845,6 +865,10 @@ async def run(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result.get("published_turn_count", 0) > 0 or result.get("interrupted_turn_count", 0) > 0 else 1
     finally:
+        if voice_update_task is not None and not voice_update_task.done():
+            voice_update_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await voice_update_task
         try:
             await adapter.send_voice_state_update(None, guild_id=args.guild_id)
         except Exception:

@@ -378,10 +378,10 @@ async def test_collect_remote_audio_closes_stream_generator_on_target_bytes(monk
 
 
 @pytest.mark.asyncio
-async def test_collect_remote_audio_closes_stream_generator_after_timeout(monkeypatch):
+async def test_collect_remote_audio_bounds_stream_generator_cleanup_after_timeout(monkeypatch):
     class SlowClosingChunks:
         def __init__(self):
-            self.closed = False
+            self.close_started = False
 
         def __aiter__(self):
             return self
@@ -391,17 +391,20 @@ async def test_collect_remote_audio_closes_stream_generator_after_timeout(monkey
             return b"\x01\x00" * 10
 
         async def aclose(self):
-            await asyncio.sleep(0.01)
-            self.closed = True
+            self.close_started = True
+            await asyncio.sleep(60)
 
     chunks = SlowClosingChunks()
     bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=FakeRoom)
     monkeypatch.setattr(bridge, "iter_remote_audio_pcm16", lambda **kwargs: chunks)
 
+    started = asyncio.get_running_loop().time()
     with pytest.raises((TimeoutError, asyncio.TimeoutError)):
         await bridge.collect_remote_audio_pcm16(duration_seconds=0.01, sample_rate=1000, timeout=0.001)
+    elapsed = asyncio.get_running_loop().time() - started
 
-    assert chunks.closed is True
+    assert chunks.close_started is True
+    assert elapsed < 0.25
 
 
 @pytest.mark.asyncio

@@ -983,6 +983,10 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         interrupt_watcher_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                             await interrupt_watcher_task
+                    if xai_task is not None and not xai_task.done():
+                        xai_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                            await xai_task
                     if not getattr(publisher, "interrupted", False):
                         await publisher.close()
                 xai_seconds = time.monotonic() - xai_started

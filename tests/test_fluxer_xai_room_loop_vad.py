@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import inspect
 
 import pytest
 
@@ -783,3 +784,23 @@ def test_diagnose_barge_in_publish_task_cleanup_suppresses_closed_publisher_race
     source = (room_loop.ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text(encoding="utf-8")
 
     assert "contextlib.suppress(asyncio.CancelledError, RuntimeError)" in source
+
+
+def test_xai_room_loop_voice_server_handler_schedules_livekit_connect_task():
+    source = inspect.getsource(room_loop.run)
+
+    handler_start = source.index("async def on_voice_server_update")
+    handler_source = source[handler_start : source.index("adapter.set_voice_server_update_handler", handler_start)]
+
+    assert "asyncio.create_task(" in handler_source
+    assert "process_voice_server_update(raw_update, safe_update)" in handler_source
+    assert "await bridge.connect_from_voice_server_update" not in handler_source
+
+
+def test_xai_room_loop_cancels_xai_task_before_publisher_close():
+    source = inspect.getsource(room_loop._conversation_loop)
+
+    cancel_xai = source.index("if xai_task is not None and not xai_task.done():")
+    close_publisher = source.index("await publisher.close", cancel_xai)
+
+    assert cancel_xai < close_publisher

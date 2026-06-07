@@ -1372,3 +1372,12 @@ def test_stt_voice_loop_enters_publisher_before_starting_barge_in_tasks():
 
     assert publisher_enter < first_barge_in_task
     assert publisher_enter < first_interrupt_watcher
+
+
+def test_stt_voice_loop_cancels_xai_task_before_publisher_close():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    cancel_xai = source.index("if xai_task is not None and not xai_task.done():")
+    close_publisher = source.index("await publisher.close", cancel_xai)
+
+    assert cancel_xai < close_publisher
