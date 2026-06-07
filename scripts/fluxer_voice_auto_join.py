@@ -234,7 +234,10 @@ class FluxerVoiceAutoJoinSupervisor:
             self.active_guild_id = None
             desired_channel_id = self.desired_channel_id
             desired_guild_id = self.desired_guild_id
-            if desired_channel_id and self.should_join_channel(guild_id=desired_guild_id, channel_id=desired_channel_id):
+            if code not in (0, None) and desired_channel_id and self.should_join_channel(
+                guild_id=desired_guild_id,
+                channel_id=desired_channel_id,
+            ):
                 await self._restart_desired_loop_after_exit(code=code, guild_id=desired_guild_id, channel_id=desired_channel_id)
 
     async def _restart_desired_loop_after_exit(self, *, code: int | None, guild_id: str | None, channel_id: str) -> None:

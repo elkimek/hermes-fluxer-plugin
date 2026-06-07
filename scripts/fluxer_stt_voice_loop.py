@@ -1014,7 +1014,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     result["turns"].append(turn)
                     append_jsonl(args.turn_log_jsonl, turn)
-                    continue
+                    result["stop_requested"] = True
+                    break
                 finally:
                     if barge_in_task is not None:
                         barge_in_capture.stop_event.set()

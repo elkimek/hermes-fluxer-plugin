@@ -262,6 +262,46 @@ async def test_supervisor_restarts_crashed_loop_while_target_remains(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_supervisor_does_not_restart_clean_loop_exit_while_target_remains(monkeypatch):
+    args = parse_args(
+        [
+            "--target-user-ids",
+            "user-1",
+            "--channel-ids",
+            "voice-1",
+            "--guild-ids",
+            "guild-1",
+            "--start-cooldown-seconds",
+            "0",
+        ]
+    )
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    events = []
+
+    class CleanProcess:
+        returncode = 0
+
+        async def wait(self):
+            return 0
+
+    async def fake_start(*, guild_id, channel_id):
+        events.append(("restart", guild_id, channel_id))
+
+    proc = CleanProcess()
+    sup.process = proc  # type: ignore[assignment]
+    sup.active_guild_id = "guild-1"
+    sup.active_channel_id = "voice-1"
+    sup.desired_guild_id = "guild-1"
+    sup.desired_channel_id = "voice-1"
+    monkeypatch.setattr(sup, "start_voice_loop", fake_start)
+
+    await sup._watch_process(proc)  # type: ignore[arg-type]
+
+    assert sup.process is None
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_supervisor_does_not_restart_after_target_left(monkeypatch):
     args = parse_args(
         [
