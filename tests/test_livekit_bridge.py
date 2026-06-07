@@ -455,6 +455,13 @@ async def test_collect_remote_audio_bounds_stream_generator_cleanup_after_timeou
     assert elapsed < 0.25
 
 
+def test_livekit_remote_audio_iterator_documents_external_timeout_requirement():
+    doc = livekit_bridge.FluxerLiveKitSmokeBridge.iter_remote_audio_pcm16.__doc__ or ""
+
+    assert "If no matching participant/track ever appears" in doc
+    assert "callers must impose their own timeout" in doc
+
+
 @pytest.mark.asyncio
 async def test_pcm16_publisher_cleans_source_and_track_if_publish_fails(monkeypatch):
     FakeAudioSource.instances = []

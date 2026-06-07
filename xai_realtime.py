@@ -513,6 +513,7 @@ class XAIRealtimeVoiceClient:
         iterator = ws.__aiter__()
         started = asyncio.get_running_loop().time()
         while True:
+            read_timeout: Optional[float] = None
             try:
                 remaining_timeout = None
                 if timeout is not None:
@@ -525,7 +526,7 @@ class XAIRealtimeVoiceClient:
                 break
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 if bytes_written == 0:
-                    limit = first_audio_timeout if first_audio_timeout is not None else timeout
+                    limit = read_timeout if read_timeout is not None else (first_audio_timeout if first_audio_timeout is not None else timeout)
                     message = f"xAI Realtime emitted no audio within {limit}s"
                 else:
                     message = f"xAI Realtime response did not finish within {timeout}s"

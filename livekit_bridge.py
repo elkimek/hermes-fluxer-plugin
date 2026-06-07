@@ -562,7 +562,13 @@ class FluxerLiveKitSmokeBridge:
         participant_identity: str | None = None,
         participant_identity_prefix: str | None = None,
     ) -> AsyncIterator[bytes]:
-        """Stream PCM16 mono chunks from subscribed remote LiveKit audio tracks."""
+        """Stream PCM16 mono chunks from subscribed remote LiveKit audio tracks.
+
+        The iterator terminates after the last matching subscribed track ends.
+        If no matching participant/track ever appears, it intentionally waits
+        for a future subscription; direct callers must impose their own timeout
+        or cancellation when absence of audio should end the wait.
+        """
 
         if self._room is None:
             raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
