@@ -925,6 +925,42 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         barge_in_seconds = time.monotonic() - xai_started
                         await publisher.interrupt()
                         raise BargeInInterrupt("user interrupted assistant speech")
+                except asyncio.CancelledError:
+                    logger.info("Cancelling STT-backed voice turn %s; interrupting publisher", turn_no)
+                    await _cancel_task_safely(xai_task)
+                    if not getattr(publisher, "interrupted", False):
+                        await publisher.interrupt()
+                    turn.update(
+                        {
+                            "published": False,
+                            "interrupted": True,
+                            "reason": "session_cancelled",
+                            "partial_response_bytes": getattr(publisher, "bytes_published", 0),
+                            "brain_provider": selected_brain_provider,
+                            "brain_provider_config": args.brain_provider,
+                            "brain_route_reason": brain_route_reason,
+                            "hermes_session_id": hermes_session_id if selected_brain_provider == "hermes" else None,
+                            "hermes_session_key": hermes_session_key if selected_brain_provider == "hermes" else None,
+                            "reply_transcript": reply_text,
+                            "publisher_queue_before_interrupt_seconds": round(
+                                getattr(publisher, "last_queue_duration_before_interrupt", 0.0) or 0.0,
+                                3,
+                            ),
+                            "publisher_queue_after_clear_seconds": round(
+                                getattr(publisher, "last_queue_duration_after_clear", 0.0) or 0.0,
+                                3,
+                            ),
+                            "timing": {
+                                "turn_seconds": round(time.monotonic() - turn_started, 3),
+                                "stt_seconds": round(stt_seconds, 3),
+                                "brain_seconds": round(brain_seconds, 3),
+                                "xai_first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
+                            },
+                        }
+                    )
+                    result["turns"].append(turn)
+                    append_jsonl(args.turn_log_jsonl, turn)
+                    raise
                 except BargeInInterrupt:
                     logger.info("Barge-in interrupted STT-backed voice turn %s", turn_no)
                     await _cancel_task_safely(xai_task)
@@ -934,7 +970,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                                 barge_in_capture.ready.wait(),
                                 timeout=getattr(args, "barge_in_capture_timeout", 2.0),
                             )
-                    await publisher.close(wait_for_playout=False, flush_remainder=False)
+                    if not getattr(publisher, "interrupted", False):
+                        await publisher.interrupt()
                     turn.update(
                         {
                             "published": False,
@@ -990,7 +1027,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                             await interrupt_watcher_task
                     await _cancel_task_safely(xai_task)
                     if not getattr(publisher, "interrupted", False):
-                        await publisher.close(wait_for_playout=False, flush_remainder=False)
+                        await publisher.close()
                 xai_seconds = time.monotonic() - xai_started
                 spoken_reply = reply_text or xai_result.transcript
                 history.append({"user": transcript, "assistant": spoken_reply})
@@ -1091,7 +1128,12 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     def request_shutdown_from_signal() -> None:
         result["signal_stop_requested"] = True
         shutdown_requested.set()
-        finished.set()
+        if session_task is not None and not session_task.done():
+            session_task.cancel()
+        elif voice_update_task is not None and not voice_update_task.done():
+            voice_update_task.cancel()
+        else:
+            finished.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         previous_signal_handlers[sig] = signal.getsignal(sig)

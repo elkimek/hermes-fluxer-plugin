@@ -673,6 +673,10 @@ def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
     assert 'getattr(exc_type, "_fluxer_fast_close", False)' in livekit_source
     assert 'exc_type.__name__ == "BargeInInterrupt"' not in livekit_source
     assert "not issubclass(exc_type, Exception)" in livekit_source
+    assert "except asyncio.CancelledError:\n                    logger.info(\"Cancelling STT-backed voice turn %s; interrupting publisher\"" in stt_loop_source
+    assert "await publisher.interrupt()" in stt_loop_source
+    assert "elif voice_update_task is not None and not voice_update_task.done():" in stt_loop_source
+    assert "shutdown_requested.set()\n        finished.set()" not in stt_loop_source
 
 
 def test_public_tree_contains_no_private_voice_dogfood_defaults():

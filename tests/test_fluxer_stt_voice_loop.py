@@ -1422,7 +1422,14 @@ def test_stt_voice_loop_redacts_session_level_error_result():
     assert 'result["message"] = _redact_exception_message(exc)' in source
 
 
-def test_stt_voice_loop_closes_publisher_without_playout_wait_after_cancellation_cleanup():
+def test_stt_voice_loop_interrupts_publisher_during_cancellation_cleanup():
     source = inspect.getsource(run_stt_voice_loop)
 
-    assert "await publisher.close(wait_for_playout=False, flush_remainder=False)" in source
+    cancellation_handler = source.index("except asyncio.CancelledError:\n                    logger.info(\"Cancelling STT-backed voice turn")
+    cancellation_block = source[cancellation_handler : source.index("except BargeInInterrupt:", cancellation_handler)]
+
+    assert "await publisher.interrupt()" in cancellation_block
+    assert 'result["turns"].append(turn)' in cancellation_block
+    assert "raise" in cancellation_block
+    assert "await publisher.close(wait_for_playout=False, flush_remainder=False)" not in cancellation_block
+    assert "shutdown_requested.set()\n        finished.set()" not in source
