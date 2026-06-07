@@ -78,6 +78,8 @@ class FluxerVoiceAutoJoinSupervisor:
         self.active_guild_id: str | None = None
         self.desired_channel_id: str | None = None
         self.desired_guild_id: str | None = None
+        self.pending_start_key: tuple[str, str] | None = None
+        self.pending_stop_reason: str | None = None
         self.last_start_monotonic = 0.0
 
     def should_watch_user(self, user_id: str) -> bool:
@@ -104,6 +106,46 @@ class FluxerVoiceAutoJoinSupervisor:
                     logger.error("voice auto-join operation failed", exc_info=(type(exc), exc, exc.__traceback__))
 
         task.add_done_callback(discard)
+
+    def schedule_start(self, *, guild_id: str | None, channel_id: str) -> None:
+        key = (guild_id or "", channel_id)
+        if self.pending_start_key == key:
+            logger.info("voice loop start already pending for channel=%s", channel_id)
+            return
+        if self.process and self.process.returncode is None and key == (self.active_guild_id or "", self.active_channel_id):
+            logger.info("voice loop already running for channel=%s", channel_id)
+            return
+        self.pending_start_key = key
+
+        async def start_if_still_desired() -> None:
+            try:
+                if self.desired_channel_id != channel_id or (self.desired_guild_id or "") != (guild_id or ""):
+                    logger.info("voice loop start skipped; desired target moved or left")
+                    return
+                await self.start_voice_loop(guild_id=guild_id, channel_id=channel_id)
+            finally:
+                if self.pending_start_key == key:
+                    self.pending_start_key = None
+
+        self.schedule_operation(start_if_still_desired(), name="fluxer-auto-join-start")
+
+    def schedule_stop(self, reason: str) -> None:
+        if self.pending_stop_reason == reason:
+            logger.info("voice loop stop already pending: %s", reason)
+            return
+        if (not self.process or self.process.returncode is not None) and self.active_channel_id is None:
+            logger.info("voice loop stop skipped; no active loop: %s", reason)
+            return
+        self.pending_stop_reason = reason
+
+        async def stop_once() -> None:
+            try:
+                await self.stop_voice_loop(reason)
+            finally:
+                if self.pending_stop_reason == reason:
+                    self.pending_stop_reason = None
+
+        self.schedule_operation(stop_once(), name="fluxer-auto-join-stop")
 
     async def cancel_operations(self) -> None:
         tasks = list(self.operation_tasks)
@@ -264,25 +306,21 @@ class FluxerVoiceAutoJoinSupervisor:
         if channel_id is None:
             self.desired_channel_id = None
             self.desired_guild_id = None
-            self.schedule_operation(
-                self.stop_voice_loop(f"target user {user_id} left voice"),
-                name="fluxer-auto-join-stop-left",
-            )
+            self.pending_start_key = None
+            self.schedule_stop(f"target user {user_id} left voice")
             return
         if not self.should_join_channel(guild_id=guild_id, channel_id=channel_id):
             self.desired_channel_id = None
             self.desired_guild_id = None
-            self.schedule_operation(
-                self.stop_voice_loop(f"target user {user_id} moved to unconfigured voice channel {channel_id}"),
-                name="fluxer-auto-join-stop-unconfigured",
-            )
+            self.pending_start_key = None
+            self.schedule_stop(f"target user {user_id} moved to unconfigured voice channel {channel_id}")
+            return
+        if self.desired_channel_id == channel_id and (self.desired_guild_id or "") == (guild_id or ""):
+            logger.info("voice loop target state unchanged for channel=%s", channel_id)
             return
         self.desired_channel_id = channel_id
         self.desired_guild_id = guild_id
-        self.schedule_operation(
-            self.start_voice_loop(guild_id=guild_id, channel_id=channel_id),
-            name="fluxer-auto-join-start",
-        )
+        self.schedule_start(guild_id=guild_id, channel_id=channel_id)
 
 
 async def run(args: argparse.Namespace) -> int:
