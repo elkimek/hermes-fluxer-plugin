@@ -60,6 +60,13 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
     assert "do not guess from cached context" in prompt
 
 
+def test_build_answer_prompt_keeps_counting_turns_interruptible():
+    prompt = build_answer_prompt("Hey, start counting slowly", history=[])
+
+    assert "count slowly from one upward as a continuous spoken stream" in prompt
+    assert "do not say 'let me know when to stop'" in prompt
+
+
 def test_build_hermes_messages_preserves_history_and_latest_transcript():
     messages = build_hermes_messages(
         "what are we building?",

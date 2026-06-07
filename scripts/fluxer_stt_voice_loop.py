@@ -311,6 +311,13 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
     """Build a compact text prompt for a voice answer grounded in STT text."""
 
     transcript = normalize_voice_transcript(transcript)
+    lower_transcript = " ".join(transcript.lower().split())
+    continuation_instruction = ""
+    if "count" in lower_transcript or "counting" in lower_transcript:
+        continuation_instruction = (
+            " If the latest transcript asks you to count or keep counting, count slowly from one upward as a continuous spoken stream; "
+            "do not summarize the task and do not say 'let me know when to stop'."
+        )
     history_lines: list[str] = []
     for item in history[-6:]:
         user = (item.get("user") or "").strip()
@@ -327,6 +334,7 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
         "Speak the assistant's next reply now. Use the latest transcript, relevant voice history, and the implementation context above. "
         "For casual or operational turns, keep it short. If the latest transcript asks for deep, personal, introspective, reflective, or self-knowledge content, answer with 2-4 substantive spoken sentences and do not end with a generic follow-up question. "
         "If the latest transcript is a stop/leave request, acknowledge briefly and stop without asking another question."
+        f"{continuation_instruction}"
     )
 
 
