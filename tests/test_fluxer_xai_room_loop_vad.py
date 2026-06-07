@@ -689,6 +689,85 @@ async def test_run_reports_voice_server_update_timeout_without_traceback(monkeyp
     assert "Traceback" not in captured.err
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("diagnose_barge_in", "target_name", "expected"),
+    [
+        (True, "_diagnose_barge_in", "Barge-in diagnostic exceeded safety timeout"),
+        (False, "_conversation_loop", "Conversation loop exceeded safety timeout"),
+    ],
+)
+async def test_run_reports_outer_safety_timeouts_without_traceback(monkeypatch, capsys, diagnose_barge_in, target_name, expected):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "test-token")
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            if channel_id is not None and self.handler is not None:
+                await self.handler(
+                    {"endpoint": "wss://livekit.example", "token": "ephemeral"},
+                    {"endpoint": "wss://livekit.example", "has_token": True},
+                )
+            return True
+
+        async def disconnect(self):
+            pass
+
+    class FakeBridge:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def connect_from_voice_server_update(self, raw_update):
+            return SimpleNamespace(
+                endpoint="wss://livekit.example",
+                guild_id="guild-1",
+                channel_id="voice-1",
+                connection_id="conn-1",
+                room_name="room",
+                participant_identity="bot",
+            )
+
+        async def disconnect(self):
+            pass
+
+    async def timeout_target(*args, **kwargs):
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(room_loop, "FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr(room_loop, "FluxerLiveKitSmokeBridge", FakeBridge)
+    monkeypatch.setattr(room_loop, target_name, timeout_target)
+    args = argparse.Namespace(
+        verbose=False,
+        channel_id="voice-1",
+        guild_id="guild-1",
+        unmute=False,
+        connect_timeout=1.0,
+        diagnose_barge_in=diagnose_barge_in,
+        diagnose_seconds=1.0,
+        max_runtime_seconds=1.0,
+    )
+
+    exit_code = await room_loop.run(args)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert expected in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_redact_exception_message_removes_livekit_tokens():
     exc = RuntimeError('connect failed Bearer abc.def token=secret123 {"token":"json-secret"}')
 

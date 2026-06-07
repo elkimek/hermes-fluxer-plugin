@@ -55,7 +55,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Verification
 
-- `PYTHONPATH=. pytest -q` → 134 passed
+- `PYTHONPATH=. pytest -q` → 136 passed
 - `python3 -m py_compile adapter.py livekit_bridge.py xai_realtime.py scripts/*.py`
 - `git diff --check`
 - Greptile local review against `origin/main` → accepted findings fixed: one-shot LiveKit track cleanup, xAI force-message `response.create`, release version bump, Python 3.10 asyncio timeout compatibility, supervisor spawn isolation from text gateway connectivity, LiveKit publish-failure cleanup, remote audio stream task cleanup, stale pending voice-join cleanup, xAI error-event diagnostic wrapping, YAML credential forwarding to the child voice process, and clean timeout exits in the continuous xAI room loop

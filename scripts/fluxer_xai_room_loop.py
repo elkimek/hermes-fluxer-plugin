@@ -817,11 +817,31 @@ async def run(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2, sort_keys=True))
             return 1
         if args.diagnose_barge_in:
-            diagnostic_result = await asyncio.wait_for(_diagnose_barge_in(args, bridge), timeout=args.diagnose_seconds + 30)
+            try:
+                diagnostic_result = await asyncio.wait_for(
+                    _diagnose_barge_in(args, bridge),
+                    timeout=args.diagnose_seconds + 30,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                print(
+                    f"Barge-in diagnostic exceeded safety timeout of {args.diagnose_seconds + 30}s",
+                    file=sys.stderr,
+                )
+                return 1
             result.update(diagnostic_result)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0 if diagnostic_result.get("detected") else 1
-        loop_result = await asyncio.wait_for(_conversation_loop(args, bridge), timeout=args.max_runtime_seconds + 30)
+        try:
+            loop_result = await asyncio.wait_for(
+                _conversation_loop(args, bridge),
+                timeout=args.max_runtime_seconds + 30,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            print(
+                f"Conversation loop exceeded safety timeout of {args.max_runtime_seconds + 30}s",
+                file=sys.stderr,
+            )
+            return 1
         result.update(loop_result)
         result["published_turn_count"] = sum(1 for turn in result.get("turns", []) if turn.get("published"))
         result["ignored_turn_count"] = sum(1 for turn in result.get("turns", []) if turn.get("ignored"))
