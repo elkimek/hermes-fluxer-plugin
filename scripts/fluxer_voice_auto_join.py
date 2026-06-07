@@ -72,6 +72,7 @@ class FluxerVoiceAutoJoinSupervisor:
         self.allowed_channel_ids = split_csv(args.channel_ids)
         self.allowed_guild_ids = split_csv(args.guild_ids)
         self.process: asyncio.subprocess.Process | None = None
+        self.watch_task: asyncio.Task[Any] | None = None
         self.active_channel_id: str | None = None
         self.active_guild_id: str | None = None
         self.desired_channel_id: str | None = None
@@ -158,11 +159,20 @@ class FluxerVoiceAutoJoinSupervisor:
         cmd = self.build_voice_loop_command(guild_id=guild_id, channel_id=channel_id)
         logger.info("starting voice loop for guild=%s channel=%s", guild_id or "<none>", channel_id)
         self.process = await asyncio.create_subprocess_exec(*cmd, cwd=str(ROOT))
-        asyncio.create_task(self._watch_process(self.process), name="fluxer-auto-join-voice-loop-watch")
+        self.watch_task = asyncio.create_task(self._watch_process(self.process), name="fluxer-auto-join-voice-loop-watch")
 
     async def stop_voice_loop(self, reason: str) -> None:
         proc = self.process
         if not proc or proc.returncode is not None:
+            watch_task = self.watch_task
+            if watch_task is not None and watch_task is not asyncio.current_task():
+                watch_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                    await watch_task
+            self.process = None
+            self.watch_task = None
+            self.active_channel_id = None
+            self.active_guild_id = None
             return
         logger.info("stopping voice loop: %s", reason)
         proc.terminate()
@@ -175,12 +185,27 @@ class FluxerVoiceAutoJoinSupervisor:
                 await asyncio.wait_for(proc.wait(), timeout=self.args.stop_timeout_seconds)
             except asyncio.TimeoutError:
                 logger.warning("voice loop did not exit after kill")
+        watch_task = self.watch_task
+        if watch_task is not None and watch_task is not asyncio.current_task():
+            watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await watch_task
+        if self.process is proc:
+            self.process = None
+            self.active_channel_id = None
+            self.active_guild_id = None
+        if self.watch_task is watch_task:
+            self.watch_task = None
 
     async def _watch_process(self, proc: asyncio.subprocess.Process) -> None:
-        code = await proc.wait()
+        try:
+            code = await proc.wait()
+        except asyncio.CancelledError:
+            raise
         if self.process is proc:
             logger.info("voice loop exited code=%s", code)
             self.process = None
+            self.watch_task = None
             self.active_channel_id = None
             self.active_guild_id = None
             desired_channel_id = self.desired_channel_id

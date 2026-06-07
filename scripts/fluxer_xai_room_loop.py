@@ -36,7 +36,7 @@ if str(ROOT) not in sys.path:
 from adapter import FluxerAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
-from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
+from xai_realtime import BargeInInterrupt, XAIRealtimeVoiceClient  # noqa: E402
 
 logger = logging.getLogger("fluxer_xai_room_loop")
 
@@ -54,10 +54,6 @@ def _redact_exception_message(exc: Exception, *secrets: str | None) -> str:
     message = re.sub(r"token=([A-Za-z0-9._~+/=-]+)", "token=[redacted-token]", message, flags=re.IGNORECASE)
     message = re.sub(r'("token"\s*:\s*")([^"]+)(")', r"\1[redacted-token]\3", message, flags=re.IGNORECASE)
     return message[:500]
-
-
-class BargeInInterrupt(Exception):
-    """Raised when fresh user speech interrupts assistant playback."""
 
 
 @dataclass

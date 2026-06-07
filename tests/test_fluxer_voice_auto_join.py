@@ -271,6 +271,36 @@ async def test_supervisor_does_not_restart_after_target_left(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_supervisor_tracks_and_clears_watch_task_for_stopped_dead_process():
+    args = parse_args([
+        "--target-user-ids",
+        "user-1",
+        "--channel-ids",
+        "voice-1",
+    ])
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+
+    class DeadProcess:
+        returncode = 0
+
+    async def never_finishes():
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(never_finishes())
+    sup.process = DeadProcess()  # type: ignore[assignment]
+    sup.watch_task = task
+    sup.active_guild_id = "guild-1"
+    sup.active_channel_id = "voice-1"
+
+    await sup.stop_voice_loop("already dead")
+
+    assert sup.process is None
+    assert sup.watch_task is None
+    assert sup.active_channel_id is None
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_stop_voice_loop_does_not_hang_when_killed_process_wait_times_out():
     args = parse_args([
         "--target-user-ids",

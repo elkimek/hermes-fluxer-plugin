@@ -55,10 +55,10 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Verification
 
-- `PYTHONPATH=. pytest -q` → 141 passed
+- `PYTHONPATH=. pytest -q` → 144 passed
 - `python3 -m py_compile adapter.py livekit_bridge.py xai_realtime.py scripts/*.py`
 - `git diff --check`
-- Greptile local review against `origin/main` → accepted findings fixed: one-shot/streaming LiveKit track cleanup, xAI force-message `response.create`, release version bump, Python 3.10 asyncio timeout compatibility, supervisor spawn isolation from text gateway connectivity, LiveKit publish-failure cleanup, remote audio stream task cleanup, stale pending voice-join cleanup, xAI error-event/malformed-event diagnostic wrapping, YAML credential forwarding to the child voice process, YAML null-value skipping, clean timeout exits in the continuous xAI room loop, and non-blocking STT voice session dispatch outside the gateway handler
+- Greptile local review against `origin/main` → accepted findings fixed: one-shot/streaming LiveKit track cleanup, xAI force-message `response.create`, release version bump, Python 3.10 asyncio timeout compatibility, supervisor spawn isolation from text gateway connectivity, LiveKit publish-failure cleanup, remote audio stream task cleanup, stale pending voice-join cleanup, xAI error-event/malformed-event diagnostic wrapping, YAML credential forwarding to the child voice process, YAML null-value skipping, clean timeout exits in the continuous xAI room loop, non-blocking STT voice session dispatch outside the gateway handler, tracked auto-join process watcher cleanup, WAV timeout event-tail preservation, and typed barge-in interrupt propagation
 - Voice env/config audit: 44 `FLUXER_VOICE_*` variables used by code, declared in `plugin.yaml`, and documented in `docs/voice-configuration.md`
 - Private dogfood grep audit for user IDs, voice/guild IDs, local paths, context-cache filename, and assistant-specific names → 0 shippable hits
 

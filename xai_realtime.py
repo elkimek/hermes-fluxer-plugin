@@ -28,6 +28,10 @@ class XAIRealtimeAudioResult:
     transcript: str = ""
 
 
+class BargeInInterrupt(Exception):
+    """Raised when fresh user speech interrupts assistant playback."""
+
+
 class XAIRealtimeStreamError(RuntimeError):
     """xAI realtime stream failure with sanitized event context."""
 
@@ -110,7 +114,7 @@ class XAIRealtimeVoiceClient:
         ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
         try:
             try:
-                return await asyncio.wait_for(self._text_response_to_wav_on_ws(ws, text, output_path), timeout=timeout)
+                return await asyncio.wait_for(self._text_response_to_wav_on_ws(ws, text, output_path, timeout=timeout), timeout=timeout + 1.0)
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
                     f"xAI Realtime response did not finish within {timeout}s",
@@ -174,8 +178,8 @@ class XAIRealtimeVoiceClient:
         try:
             try:
                 return await asyncio.wait_for(
-                    self._force_message_to_wav_on_ws(ws, text, output_path, interruptible=interruptible),
-                    timeout=timeout,
+                    self._force_message_to_wav_on_ws(ws, text, output_path, timeout=timeout, interruptible=interruptible),
+                    timeout=timeout + 1.0,
                 )
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
@@ -258,7 +262,10 @@ class XAIRealtimeVoiceClient:
         ws = await _connect_websocket(_xai_realtime_url(self.model), api_key=self.api_key)
         try:
             try:
-                return await asyncio.wait_for(self._audio_response_from_pcm16_on_ws(ws, pcm_audio, output_path), timeout=timeout)
+                return await asyncio.wait_for(
+                    self._audio_response_from_pcm16_on_ws(ws, pcm_audio, output_path, timeout=timeout),
+                    timeout=timeout + 1.0,
+                )
             except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise XAIRealtimeStreamError(
                     f"xAI Realtime response did not finish within {timeout}s",
@@ -304,6 +311,25 @@ class XAIRealtimeVoiceClient:
         finally:
             await ws.close()
 
+    def _remaining_timeout(self, started: float, timeout: Optional[float]) -> Optional[float]:
+        if timeout is None:
+            return None
+        return max(0.001, timeout - (asyncio.get_running_loop().time() - started))
+
+    async def _wait_for_setup(self, awaitable: Awaitable[Any], *, started: float, timeout: Optional[float]) -> None:
+        try:
+            remaining = self._remaining_timeout(started, timeout)
+            if remaining is None:
+                await awaitable
+            else:
+                await asyncio.wait_for(awaitable, timeout=remaining)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            raise XAIRealtimeStreamError(
+                f"xAI Realtime response did not finish within {timeout}s",
+                events_seen=[],
+                cause=exc,
+            ) from exc
+
     async def _text_response_to_sink_on_ws(
         self,
         ws: Any,
@@ -316,9 +342,17 @@ class XAIRealtimeVoiceClient:
         await self._send_text_response_request(ws, text)
         return await self._collect_audio_to_sink(ws, on_audio_delta, timeout=timeout, first_audio_timeout=first_audio_timeout)
 
-    async def _text_response_to_wav_on_ws(self, ws: Any, text: str, output_path: str | Path) -> XAIRealtimeAudioResult:
-        await self._send_text_response_request(ws, text)
-        return await self._collect_audio_to_wav(ws, output_path)
+    async def _text_response_to_wav_on_ws(
+        self,
+        ws: Any,
+        text: str,
+        output_path: str | Path,
+        *,
+        timeout: Optional[float] = None,
+    ) -> XAIRealtimeAudioResult:
+        started = asyncio.get_running_loop().time()
+        await self._wait_for_setup(self._send_text_response_request(ws, text), started=started, timeout=timeout)
+        return await self._collect_audio_to_wav(ws, output_path, timeout=self._remaining_timeout(started, timeout))
 
     async def _send_text_response_request(self, ws: Any, text: str) -> None:
         await self._configure_session(ws)
@@ -341,9 +375,12 @@ class XAIRealtimeVoiceClient:
         ws: Any,
         pcm_audio: bytes,
         output_path: str | Path,
+        *,
+        timeout: Optional[float] = None,
     ) -> XAIRealtimeAudioResult:
-        await self._send_audio_response_request(ws, pcm_audio)
-        return await self._collect_audio_to_wav(ws, output_path)
+        started = asyncio.get_running_loop().time()
+        await self._wait_for_setup(self._send_audio_response_request(ws, pcm_audio), started=started, timeout=timeout)
+        return await self._collect_audio_to_wav(ws, output_path, timeout=self._remaining_timeout(started, timeout))
 
     async def _audio_response_from_pcm16_to_sink_on_ws(
         self,
@@ -384,10 +421,12 @@ class XAIRealtimeVoiceClient:
         text: str,
         output_path: str | Path,
         *,
+        timeout: Optional[float] = None,
         interruptible: bool,
     ) -> XAIRealtimeAudioResult:
-        await self._send_force_message_request(ws, text, interruptible=interruptible)
-        return await self._collect_audio_to_wav(ws, output_path)
+        started = asyncio.get_running_loop().time()
+        await self._wait_for_setup(self._send_force_message_request(ws, text, interruptible=interruptible), started=started, timeout=timeout)
+        return await self._collect_audio_to_wav(ws, output_path, timeout=self._remaining_timeout(started, timeout))
 
     async def _force_message_to_sink_on_ws(
         self,
@@ -424,13 +463,19 @@ class XAIRealtimeVoiceClient:
         )
         await ws.send(json.dumps({"type": "response.create"}))
 
-    async def _collect_audio_to_wav(self, ws: Any, output_path: str | Path) -> XAIRealtimeAudioResult:
+    async def _collect_audio_to_wav(
+        self,
+        ws: Any,
+        output_path: str | Path,
+        *,
+        timeout: Optional[float] = None,
+    ) -> XAIRealtimeAudioResult:
         pcm_parts: list[bytes] = []
 
         async def append_delta(chunk: bytes) -> None:
             pcm_parts.append(chunk)
 
-        result = await self._collect_audio_to_sink(ws, append_delta)
+        result = await self._collect_audio_to_sink(ws, append_delta, timeout=timeout)
         pcm = b"".join(pcm_parts)
         wav_path = _write_pcm16_wav(output_path, pcm, sample_rate=self.sample_rate)
         return XAIRealtimeAudioResult(
@@ -506,7 +551,7 @@ class XAIRealtimeVoiceClient:
                     try:
                         await on_audio_delta(chunk)
                     except Exception as exc:
-                        if type(exc).__name__ == "BargeInInterrupt":
+                        if isinstance(exc, BargeInInterrupt):
                             raise
                         raise XAIRealtimeStreamError(
                             "xAI audio sink failed while handling output delta",
