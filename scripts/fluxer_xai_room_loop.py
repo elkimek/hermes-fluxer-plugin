@@ -359,7 +359,7 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
                 pcm = await _capture_one_speech_segment(args, bridge, timeout=max(1.0, remaining))
                 capture_seconds = time.monotonic() - capture_started
                 captured_audio_seconds = _pcm16_duration_seconds(pcm, sample_rate=args.sample_rate)
-            except (TimeoutError, StopAsyncIteration):
+            except (TimeoutError, asyncio.TimeoutError, StopAsyncIteration):
                 break
         turn_no = len(turns) + 1
         logger.info("Captured speech turn %s bytes=%s rms=%s", turn_no, len(pcm), _pcm16_rms(pcm))
@@ -804,7 +804,15 @@ async def run(args: argparse.Namespace) -> int:
         if not sent:
             print("VOICE_STATE_UPDATE was not sent; websocket unavailable", file=sys.stderr)
             return 1
-        await asyncio.wait_for(connected.wait(), timeout=args.connect_timeout)
+        try:
+            await asyncio.wait_for(connected.wait(), timeout=args.connect_timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            print(
+                f"No VOICE_SERVER_UPDATE received within {args.connect_timeout}s; "
+                "check channel-id, guild-id, and FLUXER_BOT_TOKEN",
+                file=sys.stderr,
+            )
+            return 1
         if result.get("error"):
             print(json.dumps(result, indent=2, sort_keys=True))
             return 1

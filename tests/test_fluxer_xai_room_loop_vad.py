@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 
 import pytest
 
@@ -516,6 +517,51 @@ async def test_conversation_loop_exits_cleanly_when_remote_stream_ends(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_conversation_loop_exits_cleanly_on_asyncio_capture_timeout(monkeypatch):
+    args = argparse.Namespace(
+        max_runtime_seconds=10.0,
+        max_turns=2,
+        sample_rate=1000,
+        frame_ms=20,
+        participant_identity=None,
+        energy_threshold=350,
+        silence_ms=80,
+        end_padding_ms=20,
+        min_segment_ms=60,
+        max_segment_seconds=2.0,
+        disable_wake_gate=True,
+        xai_model="grok-voice-latest",
+        xai_voice="eve",
+        xai_instructions="test",
+        wake_gate_instructions="gate",
+        xai_timeout=5.0,
+        xai_first_audio_timeout=5.0,
+        disable_barge_in=True,
+        barge_in_energy_threshold=700,
+        barge_in_min_ms=60,
+        barge_in_capture_timeout=2.0,
+    )
+
+    class FakeBridge:
+        pass
+
+    async def timeout_capture(*args, **kwargs):
+        raise asyncio.TimeoutError
+
+    class FakeXAI:
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(room_loop, "XAIRealtimeVoiceClient", FakeXAI)
+    monkeypatch.setattr(room_loop, "_capture_one_speech_segment", timeout_capture)
+
+    result = await room_loop._conversation_loop(args, FakeBridge())  # type: ignore[arg-type]
+
+    assert result["turns"] == []
+    assert result["turn_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_conversation_loop_closes_publisher_when_enter_fails(monkeypatch):
     args = argparse.Namespace(
         max_runtime_seconds=10.0,
@@ -586,6 +632,61 @@ async def test_conversation_loop_closes_publisher_when_enter_fails(monkeypatch):
     assert bridge.publisher.closed is True
     assert result["turns"][0]["published"] is False
     assert result["turns"][0]["error"] == "RuntimeError: publish failed"
+
+
+@pytest.mark.asyncio
+async def test_run_reports_voice_server_update_timeout_without_traceback(monkeypatch, capsys):
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "test-token")
+
+    class FakeAdapter:
+        def __init__(self, config):
+            self.handler = None
+            self.left = False
+            self.disconnected = False
+
+        def set_voice_server_update_handler(self, handler):
+            self.handler = handler
+
+        async def connect(self):
+            return True
+
+        async def wait_until_gateway_ready(self, timeout):
+            return True
+
+        async def send_voice_state_update(self, channel_id, **kwargs):
+            if channel_id is None:
+                self.left = True
+            return True
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    class FakeBridge:
+        def __init__(self, *args, **kwargs):
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    monkeypatch.setattr(room_loop, "FluxerAdapter", FakeAdapter)
+    monkeypatch.setattr(room_loop, "FluxerLiveKitSmokeBridge", FakeBridge)
+    args = argparse.Namespace(
+        verbose=False,
+        channel_id="voice-1",
+        guild_id="guild-1",
+        unmute=False,
+        connect_timeout=0.001,
+        diagnose_barge_in=False,
+        diagnose_seconds=1.0,
+        max_runtime_seconds=1.0,
+    )
+
+    exit_code = await room_loop.run(args)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "No VOICE_SERVER_UPDATE received within 0.001s" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_redact_exception_message_removes_livekit_tokens():
