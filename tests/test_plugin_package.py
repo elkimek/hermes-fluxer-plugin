@@ -382,6 +382,35 @@ async def test_reconnect_restarts_voice_supervisor(monkeypatch):
     assert starts == ["mark_connected", "start"]
 
 
+@pytest.mark.asyncio
+async def test_connect_gateway_once_clears_stale_pending_voice_joins(monkeypatch):
+    import asyncio
+    import contextlib
+    import sys
+    from types import SimpleNamespace
+
+    class FakeWebSocket:
+        async def close(self):
+            pass
+
+    async def fake_connect(*args, **kwargs):
+        return FakeWebSocket()
+
+    adapter = fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra={"bot_token": "app.secret"}))
+    adapter.gateway_url = "wss://gateway.example/ws"
+    adapter._pending_voice_joins["guild-1:voice-1"] = {"guild_id": "guild-1", "channel_id": "voice-1"}
+    adapter._recover_backlog = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_connect))
+
+    await adapter._connect_gateway_once()
+
+    assert adapter._pending_voice_joins == {}
+    assert adapter._listener_task is not None
+    adapter._listener_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await adapter._listener_task
+
+
 def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
     livekit_source = (ROOT / "livekit_bridge.py").read_text(encoding="utf-8")
     auto_join_source = (ROOT / "scripts" / "fluxer_voice_auto_join.py").read_text(encoding="utf-8")

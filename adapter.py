@@ -961,6 +961,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._awaiting_heartbeat_ack = False
         self._last_heartbeat_sent_at = None
         self._last_heartbeat_ack_at = None
+        self._pending_voice_joins.clear()
         self._gateway_ready_event.clear()
 
         sep = "&" if "?" in self.gateway_url else "?"

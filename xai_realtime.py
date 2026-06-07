@@ -482,7 +482,10 @@ class XAIRealtimeVoiceClient:
                 events.append(event_type)
             if event_type == "error":
                 message = event.get("error") or event
-                raise RuntimeError(f"xAI Realtime error: {message}")
+                raise XAIRealtimeStreamError(
+                    f"xAI Realtime error: {message}",
+                    events_seen=events,
+                )
             if event_type == "response.output_audio.delta":
                 chunk = _decode_audio_delta(event)
                 if chunk:

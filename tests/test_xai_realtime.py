@@ -300,7 +300,7 @@ async def test_xai_realtime_raises_on_error_event(tmp_path):
     ws = FakeRealtimeWebSocket([{"type": "error", "error": {"message": "bad request"}}])
     client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret")
 
-    with pytest.raises(RuntimeError, match="bad request"):
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError, match="bad request.*events_tail=.*error"):
         await client._text_response_to_wav_on_ws(ws, "hello", tmp_path / "out.wav")
 
 
