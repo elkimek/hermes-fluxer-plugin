@@ -185,6 +185,30 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
     assert env["FLUXER_VOICE_BARGE_IN_MIN_MS"] == "120"
 
 
+def test_voice_supervisor_child_env_forwards_yaml_credentials_without_overriding_env(monkeypatch, tmp_path):
+    for key in ("FLUXER_BOT_TOKEN", "FLUXER_BASE_URL", "FLUXER_GATEWAY_URL"):
+        monkeypatch.delenv(key, raising=False)
+
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(
+        plugin_root=tmp_path,
+        extra={
+            "bot_token": " yaml-token ",
+            "base_url": "https://fluxer.example/api",
+            "gateway_url": "wss://gateway.example/ws",
+            "voice": {"enabled": True},
+        },
+    )
+
+    env = supervisor._child_env()
+
+    assert env["FLUXER_BOT_TOKEN"] == "yaml-token"
+    assert env["FLUXER_BASE_URL"] == "https://fluxer.example/api"
+    assert env["FLUXER_GATEWAY_URL"] == "wss://gateway.example/ws"
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "env-token")
+    assert supervisor._child_env()["FLUXER_BOT_TOKEN"] == "env-token"
+
+
 def test_fluxer_voice_yaml_config_bridge_ignores_legacy_top_level_vad_timeouts(monkeypatch):
     for key in (
         "FLUXER_VOICE_FRAME_MS",

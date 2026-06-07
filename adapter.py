@@ -443,6 +443,13 @@ class FluxerVoiceSupervisorProcess:
         # own connect() call, while the scripts still need ENABLED/AUTO_JOIN to
         # pass their explicit run gates.
         env["FLUXER_VOICE_SUPERVISOR_DISABLED"] = "true"
+        for extra_key, env_name in {
+            "bot_token": "FLUXER_BOT_TOKEN",
+            "base_url": "FLUXER_BASE_URL",
+            "gateway_url": "FLUXER_GATEWAY_URL",
+        }.items():
+            if env_name not in env and self.extra.get(extra_key):
+                env[env_name] = str(self.extra[extra_key]).strip()
         voice = _voice_config_dict(self.extra)
         mappings = {
             "enabled": "FLUXER_VOICE_ENABLED",
@@ -505,7 +512,7 @@ class FluxerVoiceSupervisorProcess:
             if isinstance(values, dict):
                 for key, env_name in nested.items():
                     if env_name not in env and key in values:
-                        env[env_name] = str(values[key])
+                        env[env_name] = _coerce_env_value(values[key])
         return env
 
     def start(self) -> bool:
