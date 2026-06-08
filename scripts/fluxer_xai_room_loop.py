@@ -548,7 +548,8 @@ async def _wait_for_barge_in(
                 return
     finally:
         current_task = asyncio.current_task()
-        if current_task is None or not current_task.cancelling():
+        task_is_cancelling = bool(getattr(current_task, "cancelling", lambda: False)()) if current_task is not None else False
+        if not task_is_cancelling:
             with contextlib.suppress(Exception):
                 await maybe_detect_semantic_stop()
         if segment and capture.event.is_set() and not capture.ready.is_set():
