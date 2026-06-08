@@ -293,6 +293,30 @@ async def test_xai_realtime_no_audio_timeout_reports_tighter_global_deadline():
 
 
 @pytest.mark.asyncio
+async def test_xai_realtime_no_audio_timeout_reports_configured_timeout_not_remaining_budget():
+    ws = SequenceDelayRealtimeWebSocket(
+        [{"type": "response.created"}, pcm_delta(b"\x01\x00")],
+        delays=[0, 0.05],
+    )
+    client = xai_realtime.XAIRealtimeVoiceClient(api_key="secret", sample_rate=24000)
+
+    async def sink(chunk: bytes):
+        raise AssertionError("sink should not receive late audio")
+
+    with pytest.raises(xai_realtime.XAIRealtimeStreamError) as exc_info:
+        await client._audio_response_from_pcm16_to_sink_on_ws(
+            ws,
+            b"\x10\x00",
+            sink,
+            timeout=0.001,
+        )
+
+    message = str(exc_info.value)
+    assert "emitted no audio within 0.001" in message
+    assert "emitted no audio within 0.000" not in message
+
+
+@pytest.mark.asyncio
 async def test_xai_realtime_wraps_audio_sink_failures_with_event_tail():
     ws = FakeRealtimeWebSocket([
         {"type": "response.created"},
