@@ -1414,15 +1414,15 @@ def test_stt_voice_loop_barge_in_path_cancels_xai_before_closing_publisher():
     assert cancel_xai < final_cleanup
 
 
-def test_stt_voice_loop_barge_in_stops_session_instead_of_continuing_to_relisten():
+def test_stt_voice_loop_barge_in_keeps_room_session_alive():
     source = inspect.getsource(run_stt_voice_loop)
 
     barge_in_handler = source.index("except BargeInInterrupt:")
     barge_in_block = source[barge_in_handler : source.index("finally:", barge_in_handler)]
 
-    assert 'result["stop_requested"] = True' in barge_in_block
-    assert "break" in barge_in_block
-    assert "continue" not in barge_in_block
+    assert 'result["stop_requested"] = True' not in barge_in_block
+    assert "continue" in barge_in_block
+    assert 'Barge-in means "stop talking now", not "leave the voice room"' in barge_in_block
 
 
 def test_stt_voice_loop_redacts_livekit_token_from_join_errors():
