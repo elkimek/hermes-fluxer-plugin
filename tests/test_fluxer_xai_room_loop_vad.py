@@ -1053,3 +1053,33 @@ async def test_barge_in_stop_phrase_fast_path_ignores_non_stop_echo():
     assert capture.semantic_stop_detected is False
     assert capture.semantic_stop_transcript == "one two three four"
     assert bridge.iterator.closed is True
+
+@pytest.mark.asyncio
+async def test_barge_in_stop_phrase_fast_path_runs_before_silence_finalizes():
+    async def transcribe_stop(pcm: bytes) -> str:
+        await room_loop.asyncio.sleep(0)
+        assert pcm
+        return "stop"
+
+    args = argparse.Namespace(
+        sample_rate=1000,
+        frame_ms=20,
+        participant_identity=None,
+        barge_in_energy_threshold=700,
+        barge_in_min_ms=300,
+        barge_in_window_ms=1200,
+        barge_in_stop_phrase_energy_threshold=300,
+        barge_in_stop_phrase_min_ms=120,
+        barge_in_stop_phrase_silence_ms=180,
+        barge_in_stop_phrase_max_seconds=2.0,
+        barge_in_stop_phrase_transcriber=transcribe_stop,
+    )
+    bridge = FakeBargeBridge([pcm16(420, 20) for _ in range(20)])
+    capture = room_loop.BargeInCapture()
+
+    await room_loop._wait_for_barge_in(args, bridge, capture)
+
+    assert capture.event.is_set()
+    assert capture.semantic_stop_detected is True
+    assert capture.semantic_stop_transcript == "stop"
+    assert capture.semantic_stop_candidate_ms >= 120

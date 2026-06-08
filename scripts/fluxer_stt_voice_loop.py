@@ -981,6 +981,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                                 "semantic_stop_detected": barge_in_capture.semantic_stop_detected,
                                 "semantic_stop_transcript": barge_in_capture.semantic_stop_transcript,
                                 "semantic_stop_error": barge_in_capture.semantic_stop_error,
+                                "semantic_stop_candidate_ms": barge_in_capture.semantic_stop_candidate_ms,
+                                "semantic_stop_candidate_bytes": barge_in_capture.semantic_stop_candidate_bytes,
                             },
                             "publisher_queue_before_interrupt_seconds": round(
                                 getattr(publisher, "last_queue_duration_before_interrupt", 0.0) or 0.0,
@@ -1098,6 +1100,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                             "semantic_stop_detected": barge_in_capture.semantic_stop_detected,
                             "semantic_stop_transcript": barge_in_capture.semantic_stop_transcript,
                             "semantic_stop_error": barge_in_capture.semantic_stop_error,
+                            "semantic_stop_candidate_ms": barge_in_capture.semantic_stop_candidate_ms,
+                            "semantic_stop_candidate_bytes": barge_in_capture.semantic_stop_candidate_bytes,
                         }
                         if not args.disable_barge_in
                         else None,

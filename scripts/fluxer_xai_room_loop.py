@@ -125,6 +125,8 @@ class BargeInCapture:
     semantic_stop_detected: bool = False
     semantic_stop_transcript: str = ""
     semantic_stop_error: str = ""
+    semantic_stop_candidate_ms: int = 0
+    semantic_stop_candidate_bytes: int = 0
 
 
 DEFAULT_INSTRUCTIONS = """You are the configured assistant speaking with a user in a Fluxer voice room.
@@ -357,26 +359,43 @@ async def _wait_for_barge_in(
     stop_trailing_silence = 0
     stop_candidate_ms = 0
     stop_candidate_active = False
+    semantic_task: asyncio.Task[tuple[str, bytes, int]] | None = None
 
-    async def maybe_detect_semantic_stop() -> bool:
-        nonlocal stop_segment, stop_trailing_silence, stop_candidate_ms, stop_candidate_active
+    async def transcribe_stop_candidate(candidate: bytes, candidate_ms: int) -> tuple[str, bytes, int]:
+        assert stop_transcriber is not None
+        maybe_text = stop_transcriber(candidate)
+        transcript = await maybe_text if inspect.isawaitable(maybe_text) else maybe_text
+        return str(transcript or "").strip(), candidate, candidate_ms
+
+    def reset_stop_candidate() -> None:
+        nonlocal stop_trailing_silence, stop_candidate_ms, stop_candidate_active, semantic_task
+        stop_segment.clear()
+        stop_trailing_silence = 0
+        stop_candidate_ms = 0
+        stop_candidate_active = False
+        semantic_task = None
+
+    def arm_semantic_stop_task() -> None:
+        nonlocal semantic_task
         if not stop_phrase_enabled or stop_candidate_ms < stop_phrase_min_ms or not stop_segment:
-            return False
+            return
+        if semantic_task is not None and not semantic_task.done():
+            return
         candidate = bytes(stop_segment)
-        try:
-            maybe_text = stop_transcriber(candidate)
-            transcript = await maybe_text if inspect.isawaitable(maybe_text) else maybe_text
-            capture.semantic_stop_transcript = str(transcript or "").strip()
-        except Exception as exc:  # pragma: no cover - defensive diagnostics only
-            capture.semantic_stop_error = _redact_exception_message(exc)
-            logger.warning("Barge-in stop phrase transcription failed: %s", capture.semantic_stop_error)
-            transcript = ""
-        should_stop = _looks_like_stop_command(str(transcript or ""))
-        if should_stop:
+        capture.semantic_stop_candidate_ms = stop_candidate_ms
+        capture.semantic_stop_candidate_bytes = len(candidate)
+        semantic_task = asyncio.create_task(
+            transcribe_stop_candidate(candidate, stop_candidate_ms),
+            name="fluxer-semantic-stop-barge-in",
+        )
+
+    async def apply_semantic_stop_result(transcript: str, candidate: bytes, candidate_ms: int) -> bool:
+        capture.semantic_stop_transcript = transcript
+        if _looks_like_stop_command(transcript):
             capture.semantic_stop_detected = True
             capture.detected_seconds = time.monotonic() - started
-            capture.detected_voiced_ms = stop_candidate_ms
-            capture.voiced_ms = max(capture.voiced_ms, stop_candidate_ms)
+            capture.detected_voiced_ms = candidate_ms
+            capture.voiced_ms = max(capture.voiced_ms, candidate_ms)
             capture.pcm = candidate
             capture.captured_audio_seconds = _pcm16_duration_seconds(candidate, sample_rate=args.sample_rate)
             capture.ready.set()
@@ -386,15 +405,46 @@ async def _wait_for_barge_in(
                 capture.detected_seconds,
                 capture.chunks_seen,
                 capture.max_rms,
-                stop_candidate_ms,
+                candidate_ms,
                 capture.semantic_stop_transcript,
             )
             return True
-        stop_segment.clear()
-        stop_trailing_silence = 0
-        stop_candidate_ms = 0
-        stop_candidate_active = False
+        reset_stop_candidate()
         return False
+
+    async def maybe_apply_semantic_task() -> bool:
+        nonlocal semantic_task
+        if semantic_task is None or not semantic_task.done():
+            return False
+        task = semantic_task
+        semantic_task = None
+        try:
+            transcript, candidate, candidate_ms = task.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive diagnostics only
+            capture.semantic_stop_error = _redact_exception_message(exc)
+            logger.warning("Barge-in stop phrase transcription failed: %s", capture.semantic_stop_error)
+            reset_stop_candidate()
+            return False
+        return await apply_semantic_stop_result(transcript, candidate, candidate_ms)
+
+    async def maybe_detect_semantic_stop() -> bool:
+        if not stop_phrase_enabled or stop_candidate_ms < stop_phrase_min_ms or not stop_segment:
+            return False
+        arm_semantic_stop_task()
+        if semantic_task is None:
+            return False
+        try:
+            transcript, candidate, candidate_ms = await semantic_task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive diagnostics only
+            capture.semantic_stop_error = _redact_exception_message(exc)
+            logger.warning("Barge-in stop phrase transcription failed: %s", capture.semantic_stop_error)
+            reset_stop_candidate()
+            return False
+        return await apply_semantic_stop_result(transcript, candidate, candidate_ms)
 
     logger.debug(
         "barge listener started threshold=%s min_ms=%s window_ms=%s stop_phrase_threshold=%s stop_phrase_min_ms=%s participant_identity=%s",
@@ -408,6 +458,8 @@ async def _wait_for_barge_in(
     try:
         async for chunk in chunks:
             if capture.stop_event.is_set():
+                return
+            if await maybe_apply_semantic_task():
                 return
             if not chunk:
                 continue
@@ -428,6 +480,7 @@ async def _wait_for_barge_in(
                     stop_trailing_silence = 0
                     stop_candidate_ms += chunk_ms
                     stop_segment.extend(chunk)
+                    arm_semantic_stop_task()
                 elif stop_candidate_active:
                     stop_segment.extend(chunk)
                     stop_trailing_silence += len(chunk)
@@ -494,7 +547,7 @@ async def _wait_for_barge_in(
                     capture.ready.set()
                 return
     finally:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(BaseException):
             await maybe_detect_semantic_stop()
         if segment and capture.event.is_set() and not capture.ready.is_set():
             capture.pcm = bytes(segment)
