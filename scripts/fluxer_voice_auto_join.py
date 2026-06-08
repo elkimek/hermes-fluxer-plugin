@@ -195,6 +195,14 @@ class FluxerVoiceAutoJoinSupervisor:
             str(self.args.barge_in_window_ms),
             "--barge-in-capture-timeout",
             str(self.args.barge_in_capture_timeout),
+            "--barge-in-stop-phrase-energy-threshold",
+            str(self.args.barge_in_stop_phrase_energy_threshold),
+            "--barge-in-stop-phrase-min-ms",
+            str(self.args.barge_in_stop_phrase_min_ms),
+            "--barge-in-stop-phrase-silence-ms",
+            str(self.args.barge_in_stop_phrase_silence_ms),
+            "--barge-in-stop-phrase-max-seconds",
+            str(self.args.barge_in_stop_phrase_max_seconds),
             "--max-runtime-seconds",
             str(self.args.max_runtime_seconds),
             "--turn-log-jsonl",
@@ -408,6 +416,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "1200")))
     parser.add_argument("--barge-in-window-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_WINDOW_MS", "0")))
     parser.add_argument("--barge-in-capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS", "2.0")))
+    parser.add_argument("--barge-in-stop-phrase-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD", "450")))
+    parser.add_argument("--barge-in-stop-phrase-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS", "120")))
+    parser.add_argument("--barge-in-stop-phrase-silence-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS", "180")))
+    parser.add_argument("--barge-in-stop-phrase-max-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS", "2.0")))
     parser.add_argument("--max-runtime-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_RUNTIME_SECONDS", "3600.0")))
     parser.add_argument("--connect-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS", "30.0")))
     parser.add_argument("--start-cooldown-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_START_COOLDOWN_SECONDS", "5.0")))

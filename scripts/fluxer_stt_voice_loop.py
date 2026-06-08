@@ -731,6 +731,20 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             # Let Fluxer publish/subscription state settle before the first fixed window.
             await asyncio.sleep(args.initial_settle_seconds)
 
+            async def transcribe_barge_in_stop_phrase(pcm: bytes) -> str:
+                wav_path = Path(tempfile.gettempdir()) / f"fluxer_stt_loop_barge_stop_{generation}_{int(time.time() * 1000)}.wav"
+                write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
+                stt_result = await asyncio.to_thread(
+                    transcribe_with_provider,
+                    str(wav_path),
+                    provider=args.stt_provider,
+                    model=args.stt_model,
+                    elevenlabs_language_code=args.elevenlabs_language_code,
+                )
+                return normalize_voice_transcript((stt_result.get("transcript") or "").strip())
+
+            args.barge_in_stop_phrase_transcriber = transcribe_barge_in_stop_phrase
+
             for turn_no in range(1, args.max_turns + 1):
                 if shutdown_requested.is_set():
                     result["stop_requested"] = True
@@ -950,6 +964,24 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                             "hermes_session_id": hermes_session_id if selected_brain_provider == "hermes" else None,
                             "hermes_session_key": hermes_session_key if selected_brain_provider == "hermes" else None,
                             "reply_transcript": reply_text,
+                            "barge_in_diagnostic": {
+                                "chunks_seen": barge_in_capture.chunks_seen,
+                                "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
+                                if barge_in_capture.first_chunk_seconds is not None
+                                else None,
+                                "max_rms": barge_in_capture.max_rms,
+                                "voiced_ms": barge_in_capture.voiced_ms,
+                                "detected_voiced_ms": barge_in_capture.detected_voiced_ms,
+                                "detected_seconds": round(barge_in_capture.detected_seconds, 3)
+                                if barge_in_capture.detected_seconds is not None
+                                else None,
+                                "threshold": args.barge_in_energy_threshold,
+                                "min_ms": args.barge_in_min_ms,
+                                "window_ms": getattr(args, "barge_in_window_ms", 0),
+                                "semantic_stop_detected": barge_in_capture.semantic_stop_detected,
+                                "semantic_stop_transcript": barge_in_capture.semantic_stop_transcript,
+                                "semantic_stop_error": barge_in_capture.semantic_stop_error,
+                            },
                             "publisher_queue_before_interrupt_seconds": round(
                                 getattr(publisher, "last_queue_duration_before_interrupt", 0.0) or 0.0,
                                 3,
@@ -1063,6 +1095,9 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                             "voiced_ms": barge_in_capture.voiced_ms,
                             "threshold": args.barge_in_energy_threshold,
                             "min_ms": args.barge_in_min_ms,
+                            "semantic_stop_detected": barge_in_capture.semantic_stop_detected,
+                            "semantic_stop_transcript": barge_in_capture.semantic_stop_transcript,
+                            "semantic_stop_error": barge_in_capture.semantic_stop_error,
                         }
                         if not args.disable_barge_in
                         else None,
@@ -1263,6 +1298,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "180")))
     parser.add_argument("--barge-in-window-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_WINDOW_MS", "0")))
     parser.add_argument("--barge-in-capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS", "2.0")))
+    parser.add_argument("--barge-in-stop-phrase-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD", "450")))
+    parser.add_argument("--barge-in-stop-phrase-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS", "120")))
+    parser.add_argument("--barge-in-stop-phrase-silence-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS", "180")))
+    parser.add_argument("--barge-in-stop-phrase-max-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS", "2.0")))
     parser.add_argument(
         "--barge-in-after-first-audio-only",
         action=argparse.BooleanOptionalAction,

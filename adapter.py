@@ -513,6 +513,10 @@ class FluxerVoiceSupervisorProcess:
                 "min_ms": "FLUXER_VOICE_BARGE_IN_MIN_MS",
                 "window_ms": "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
                 "capture_timeout_seconds": "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+                "stop_phrase_energy_threshold": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD",
+                "stop_phrase_min_ms": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS",
+                "stop_phrase_silence_ms": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS",
+                "stop_phrase_max_seconds": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
                 "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
             },
         }.items():
@@ -2825,6 +2829,10 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "min_ms": "FLUXER_VOICE_BARGE_IN_MIN_MS",
         "window_ms": "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
         "capture_timeout_seconds": "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+        "stop_phrase_energy_threshold": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD",
+        "stop_phrase_min_ms": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS",
+        "stop_phrase_silence_ms": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS",
+        "stop_phrase_max_seconds": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
         "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
     }.items():
         if key in barge_in:

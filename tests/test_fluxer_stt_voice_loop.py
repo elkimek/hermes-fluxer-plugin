@@ -369,6 +369,9 @@ def test_parse_args_defaults_to_realtime_voice_stack(monkeypatch):
     assert args.disable_barge_in is False
     assert args.barge_in_energy_threshold == 700
     assert args.barge_in_min_ms == 180
+    assert args.barge_in_stop_phrase_energy_threshold == 450
+    assert args.barge_in_stop_phrase_min_ms == 120
+    assert args.barge_in_stop_phrase_silence_ms == 180
     assert args.barge_in_after_first_audio_only is True
 
 

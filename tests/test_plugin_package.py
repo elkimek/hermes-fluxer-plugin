@@ -110,6 +110,10 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
         "FLUXER_VOICE_BARGE_IN_MIN_MS",
         "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
         "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
         "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -137,6 +141,10 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
                     "min_ms": 180,
                     "window_ms": 1200,
                     "capture_timeout_seconds": 2,
+                    "stop_phrase_energy_threshold": 450,
+                    "stop_phrase_min_ms": 120,
+                    "stop_phrase_silence_ms": 180,
+                    "stop_phrase_max_seconds": 2.0,
                     "after_first_audio_only": False,
                 },
             }
@@ -164,6 +172,10 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     assert os.environ["FLUXER_VOICE_BARGE_IN_MIN_MS"] == "180"
     assert os.environ["FLUXER_VOICE_BARGE_IN_WINDOW_MS"] == "1200"
     assert os.environ["FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS"] == "2"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD"] == "450"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS"] == "120"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS"] == "180"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS"] == "2.0"
     assert os.environ["FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY"] == "false"
 
 
@@ -186,6 +198,10 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
         "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
         "FLUXER_VOICE_BARGE_IN_MIN_MS",
         "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
         "FLUXER_VOICE_BRAIN_PROVIDER",
         "FLUXER_VOICE_MAX_SEGMENT_SECONDS",
     ):
@@ -202,7 +218,15 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
                 "stop_timeout_seconds": 99,
                 "vad": {"frame_ms": 20, "energy_threshold": 300, "max_segment_seconds": None},
                 "timeouts": {"start_cooldown_seconds": 5, "stop_timeout_seconds": 2},
-                "barge_in": {"energy_threshold": 400, "min_ms": 120, "window_ms": 900},
+                "barge_in": {
+                    "energy_threshold": 400,
+                    "min_ms": 120,
+                    "window_ms": 900,
+                    "stop_phrase_energy_threshold": 350,
+                    "stop_phrase_min_ms": 100,
+                    "stop_phrase_silence_ms": 160,
+                    "stop_phrase_max_seconds": 1.5,
+                },
             }
         },
     )
@@ -216,6 +240,10 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
     assert env["FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD"] == "400"
     assert env["FLUXER_VOICE_BARGE_IN_MIN_MS"] == "120"
     assert env["FLUXER_VOICE_BARGE_IN_WINDOW_MS"] == "900"
+    assert env["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD"] == "350"
+    assert env["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS"] == "100"
+    assert env["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS"] == "160"
+    assert env["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS"] == "1.5"
     assert "FLUXER_VOICE_BRAIN_PROVIDER" not in env
     assert "FLUXER_VOICE_MAX_SEGMENT_SECONDS" not in env
 

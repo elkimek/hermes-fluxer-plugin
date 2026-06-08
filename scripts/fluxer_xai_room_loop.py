@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -121,6 +122,9 @@ class BargeInCapture:
     voiced_ms: int = 0
     detected_voiced_ms: int = 0
     detected_seconds: float | None = None
+    semantic_stop_detected: bool = False
+    semantic_stop_transcript: str = ""
+    semantic_stop_error: str = ""
 
 
 DEFAULT_INSTRUCTIONS = """You are the configured assistant speaking with a user in a Fluxer voice room.
@@ -153,6 +157,28 @@ def _pcm16_duration_seconds(pcm: bytes, *, sample_rate: int) -> float:
     if sample_rate <= 0:
         return 0.0
     return (len(pcm) // 2) / sample_rate
+
+
+def _looks_like_stop_command(transcript: str) -> bool:
+    """Return true for direct spoken stop/shut-up commands during playback."""
+
+    normalized = re.sub(r"[^a-z0-9' ]+", " ", transcript.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+    direct_patterns = (
+        r"\b(stop|stahp)\b",
+        r"\bstop (counting|talking|speaking|please|now|it|this|there|here)\b",
+        r"\b(can you|could you|please|just|ok|okay|hey)? ?stop\b",
+        r"\bthat's enough\b",
+        r"\benough\b",
+        r"\bshut up\b",
+        r"\bbe quiet\b",
+        r"\bsilence\b",
+        r"\bhold on\b",
+        r"\bwait\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in direct_patterns)
 
 
 def _barge_in_carryover_decision(args: argparse.Namespace, pcm: bytes, *, sample_rate: int) -> tuple[bytes | None, bool, float]:
@@ -312,11 +338,71 @@ async def _wait_for_barge_in(
     in_segment = False
     started = time.monotonic()
     window_ms = int(getattr(args, "barge_in_window_ms", 0) or 0)
+
+    stop_transcriber = getattr(args, "barge_in_stop_phrase_transcriber", None)
+    stop_phrase_enabled = callable(stop_transcriber)
+    stop_phrase_energy_threshold = int(
+        getattr(
+            args,
+            "barge_in_stop_phrase_energy_threshold",
+            max(1, int(args.barge_in_energy_threshold * 0.6)),
+        )
+    )
+    stop_phrase_min_ms = int(getattr(args, "barge_in_stop_phrase_min_ms", 120))
+    stop_phrase_silence_bytes_limit = int(
+        bytes_per_ms * int(getattr(args, "barge_in_stop_phrase_silence_ms", 180))
+    )
+    stop_phrase_max_bytes = int(args.sample_rate * float(getattr(args, "barge_in_stop_phrase_max_seconds", 2.0))) * 2
+    stop_segment = bytearray()
+    stop_trailing_silence = 0
+    stop_candidate_ms = 0
+    stop_candidate_active = False
+
+    async def maybe_detect_semantic_stop() -> bool:
+        nonlocal stop_segment, stop_trailing_silence, stop_candidate_ms, stop_candidate_active
+        if not stop_phrase_enabled or stop_candidate_ms < stop_phrase_min_ms or not stop_segment:
+            return False
+        candidate = bytes(stop_segment)
+        try:
+            maybe_text = stop_transcriber(candidate)
+            transcript = await maybe_text if inspect.isawaitable(maybe_text) else maybe_text
+            capture.semantic_stop_transcript = str(transcript or "").strip()
+        except Exception as exc:  # pragma: no cover - defensive diagnostics only
+            capture.semantic_stop_error = _redact_exception_message(exc)
+            logger.warning("Barge-in stop phrase transcription failed: %s", capture.semantic_stop_error)
+            transcript = ""
+        should_stop = _looks_like_stop_command(str(transcript or ""))
+        if should_stop:
+            capture.semantic_stop_detected = True
+            capture.detected_seconds = time.monotonic() - started
+            capture.detected_voiced_ms = stop_candidate_ms
+            capture.voiced_ms = max(capture.voiced_ms, stop_candidate_ms)
+            capture.pcm = candidate
+            capture.captured_audio_seconds = _pcm16_duration_seconds(candidate, sample_rate=args.sample_rate)
+            capture.ready.set()
+            capture.event.set()
+            logger.info(
+                "Semantic stop barge-in detected after %.3fs chunks=%s max_rms=%s candidate_ms=%s transcript=%r",
+                capture.detected_seconds,
+                capture.chunks_seen,
+                capture.max_rms,
+                stop_candidate_ms,
+                capture.semantic_stop_transcript,
+            )
+            return True
+        stop_segment.clear()
+        stop_trailing_silence = 0
+        stop_candidate_ms = 0
+        stop_candidate_active = False
+        return False
+
     logger.debug(
-        "barge listener started threshold=%s min_ms=%s window_ms=%s participant_identity=%s",
+        "barge listener started threshold=%s min_ms=%s window_ms=%s stop_phrase_threshold=%s stop_phrase_min_ms=%s participant_identity=%s",
         args.barge_in_energy_threshold,
         args.barge_in_min_ms,
         window_ms,
+        stop_phrase_energy_threshold if stop_phrase_enabled else None,
+        stop_phrase_min_ms if stop_phrase_enabled else None,
         args.participant_identity,
     )
     try:
@@ -334,6 +420,24 @@ async def _wait_for_barge_in(
                 capture.first_chunk_seconds = now - started
                 logger.debug("barge listener first chunk after %.3fs", capture.first_chunk_seconds)
             capture.max_rms = max(capture.max_rms, rms)
+
+            if stop_phrase_enabled:
+                stop_voiced = rms >= stop_phrase_energy_threshold
+                if stop_voiced:
+                    stop_candidate_active = True
+                    stop_trailing_silence = 0
+                    stop_candidate_ms += chunk_ms
+                    stop_segment.extend(chunk)
+                elif stop_candidate_active:
+                    stop_segment.extend(chunk)
+                    stop_trailing_silence += len(chunk)
+                if stop_candidate_active and (
+                    stop_trailing_silence >= stop_phrase_silence_bytes_limit
+                    or len(stop_segment) >= stop_phrase_max_bytes
+                ):
+                    if await maybe_detect_semantic_stop():
+                        return
+
             voiced = rms >= args.barge_in_energy_threshold
             if voiced:
                 in_segment = True
@@ -390,6 +494,8 @@ async def _wait_for_barge_in(
                     capture.ready.set()
                 return
     finally:
+        with contextlib.suppress(Exception):
+            await maybe_detect_semantic_stop()
         if segment and capture.event.is_set() and not capture.ready.is_set():
             capture.pcm = bytes(segment)
             capture.captured_audio_seconds = _pcm16_duration_seconds(capture.pcm, sample_rate=args.sample_rate)
