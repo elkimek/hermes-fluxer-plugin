@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -161,7 +162,11 @@ def transcribe_audio(file_path: str, model: str | None = None) -> dict[str, Any]
     if not command_template:
         return {"success": False, "transcript": "", "provider": "local", "error": "local STT command not configured"}
     with tempfile.TemporaryDirectory() as tmp:
-        command = command_template.format(input_path=str(Path(file_path)), model=model or "base", output_dir=tmp)
+        command = command_template.format(
+            input_path=shlex.quote(str(Path(file_path))),
+            model=shlex.quote(model or "base"),
+            output_dir=shlex.quote(tmp),
+        )
         proc = subprocess.run(command, shell=True, text=True, capture_output=True, timeout=300)
         if proc.returncode != 0:
             return {"success": False, "transcript": "", "provider": "local", "error": proc.stderr.strip() or proc.stdout.strip()}

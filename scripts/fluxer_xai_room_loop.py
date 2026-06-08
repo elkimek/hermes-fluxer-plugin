@@ -547,8 +547,10 @@ async def _wait_for_barge_in(
                     capture.ready.set()
                 return
     finally:
-        with contextlib.suppress(BaseException):
-            await maybe_detect_semantic_stop()
+        current_task = asyncio.current_task()
+        if current_task is None or not current_task.cancelling():
+            with contextlib.suppress(Exception):
+                await maybe_detect_semantic_stop()
         if segment and capture.event.is_set() and not capture.ready.is_set():
             capture.pcm = bytes(segment)
             capture.captured_audio_seconds = _pcm16_duration_seconds(capture.pcm, sample_rate=args.sample_rate)
