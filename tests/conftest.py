@@ -10,11 +10,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from types import SimpleNamespace
+import atexit
 import os
+import shutil
 import sys
 import tempfile
 import types
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -22,7 +24,9 @@ from typing import Any
 # importable. Its _mark_connected/_mark_disconnected helpers write
 # gateway_state.json under HERMES_HOME, so never let standalone plugin tests
 # mutate the live user's dashboard/gateway runtime files.
-os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="fluxer-platform-test-home-")
+_hermes_test_home = tempfile.mkdtemp(prefix="fluxer-platform-test-home-")
+atexit.register(shutil.rmtree, _hermes_test_home, ignore_errors=True)
+os.environ["HERMES_HOME"] = _hermes_test_home
 
 
 try:  # Prefer the real Hermes gateway package when the test runner has it.

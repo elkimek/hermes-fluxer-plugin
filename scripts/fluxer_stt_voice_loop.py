@@ -313,7 +313,7 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
     transcript = normalize_voice_transcript(transcript)
     lower_transcript = " ".join(transcript.lower().split())
     continuation_instruction = ""
-    if "count" in lower_transcript or "counting" in lower_transcript:
+    if "count" in lower_transcript:
         continuation_instruction = (
             " If the latest transcript asks you to count or keep counting, count slowly from one upward as a continuous spoken stream; "
             "do not summarize the task and do not say 'let me know when to stop'."
@@ -734,14 +734,18 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             async def transcribe_barge_in_stop_phrase(pcm: bytes) -> str:
                 wav_path = Path(tempfile.gettempdir()) / f"fluxer_stt_loop_barge_stop_{generation}_{int(time.time() * 1000)}.wav"
                 write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
-                stt_result = await asyncio.to_thread(
-                    transcribe_with_provider,
-                    str(wav_path),
-                    provider=args.stt_provider,
-                    model=args.stt_model,
-                    elevenlabs_language_code=args.elevenlabs_language_code,
-                )
-                return normalize_voice_transcript((stt_result.get("transcript") or "").strip())
+                try:
+                    stt_result = await asyncio.to_thread(
+                        transcribe_with_provider,
+                        str(wav_path),
+                        provider=args.stt_provider,
+                        model=args.stt_model,
+                        elevenlabs_language_code=args.elevenlabs_language_code,
+                    )
+                    return normalize_voice_transcript((stt_result.get("transcript") or "").strip())
+                finally:
+                    with contextlib.suppress(OSError):
+                        wav_path.unlink()
 
             args.barge_in_stop_phrase_transcriber = transcribe_barge_in_stop_phrase
 
