@@ -511,6 +511,7 @@ class FluxerVoiceSupervisorProcess:
                 "disable": "FLUXER_VOICE_DISABLE_BARGE_IN",
                 "energy_threshold": "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
                 "min_ms": "FLUXER_VOICE_BARGE_IN_MIN_MS",
+                "window_ms": "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
                 "capture_timeout_seconds": "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
                 "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
             },
@@ -2822,6 +2823,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "disable": "FLUXER_VOICE_DISABLE_BARGE_IN",
         "energy_threshold": "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
         "min_ms": "FLUXER_VOICE_BARGE_IN_MIN_MS",
+        "window_ms": "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
         "capture_timeout_seconds": "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
         "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
     }.items():

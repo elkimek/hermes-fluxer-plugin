@@ -306,12 +306,17 @@ async def _wait_for_barge_in(
     segment = bytearray()
     trailing_silence = 0
     voiced_ms = 0
+    window_voiced_ms = 0
+    elapsed_ms = 0
+    voiced_window: list[tuple[int, int]] = []
     in_segment = False
     started = time.monotonic()
+    window_ms = int(getattr(args, "barge_in_window_ms", 0) or 0)
     logger.debug(
-        "barge listener started threshold=%s min_ms=%s participant_identity=%s",
+        "barge listener started threshold=%s min_ms=%s window_ms=%s participant_identity=%s",
         args.barge_in_energy_threshold,
         args.barge_in_min_ms,
+        window_ms,
         args.participant_identity,
     )
     try:
@@ -322,6 +327,8 @@ async def _wait_for_barge_in(
                 continue
             rms = _pcm16_rms(chunk)
             now = time.monotonic()
+            chunk_ms = max(1, int(round(len(chunk) / bytes_per_ms))) if bytes_per_ms else args.frame_ms
+            elapsed_ms += chunk_ms
             capture.chunks_seen += 1
             if capture.first_chunk_seconds is None:
                 capture.first_chunk_seconds = now - started
@@ -331,28 +338,38 @@ async def _wait_for_barge_in(
             if voiced:
                 in_segment = True
                 trailing_silence = 0
-                voiced_ms += args.frame_ms
-                capture.voiced_ms = voiced_ms
+                voiced_ms += chunk_ms
+                if window_ms > 0:
+                    voiced_window.append((elapsed_ms, chunk_ms))
+                    window_start = elapsed_ms - window_ms
+                    voiced_window = [(at_ms, ms) for at_ms, ms in voiced_window if at_ms > window_start]
+                    window_voiced_ms = sum(ms for _, ms in voiced_window)
+                    capture.voiced_ms = window_voiced_ms
+                else:
+                    capture.voiced_ms = voiced_ms
                 segment.extend(chunk)
                 if getattr(args, "verbose", False):
                     logger.debug(
-                        "barge listener voiced chunk=%s rms=%s max_rms=%s voiced_ms=%s threshold=%s",
+                        "barge listener voiced chunk=%s rms=%s max_rms=%s voiced_ms=%s window_voiced_ms=%s threshold=%s",
                         capture.chunks_seen,
                         rms,
                         capture.max_rms,
                         voiced_ms,
+                        window_voiced_ms,
                         args.barge_in_energy_threshold,
                     )
-                if voiced_ms >= args.barge_in_min_ms:
+                detection_voiced_ms = window_voiced_ms if window_ms > 0 else voiced_ms
+                if detection_voiced_ms >= args.barge_in_min_ms:
                     if not capture.event.is_set():
                         capture.detected_seconds = time.monotonic() - started
-                        capture.detected_voiced_ms = voiced_ms
+                        capture.detected_voiced_ms = detection_voiced_ms
                         logger.info(
-                            "Barge-in detected after %.3fs chunks=%s max_rms=%s voiced_ms=%s",
+                            "Barge-in detected after %.3fs chunks=%s max_rms=%s voiced_ms=%s window_voiced_ms=%s",
                             capture.detected_seconds,
                             capture.chunks_seen,
                             capture.max_rms,
                             voiced_ms,
+                            window_voiced_ms,
                         )
                     capture.event.set()
             elif in_segment:
@@ -972,6 +989,7 @@ def main() -> int:
     parser.add_argument("--barge-in-after-first-audio-only", action="store_true", help="Test mode: arm barge-in only after first assistant audio so the initial user utterance tail cannot cancel before playback")
     parser.add_argument("--barge-in-energy-threshold", type=int, default=700)
     parser.add_argument("--barge-in-min-ms", type=int, default=240)
+    parser.add_argument("--barge-in-window-ms", type=int, default=0)
     parser.add_argument("--barge-in-capture-timeout", type=float, default=2.0, help="How long to wait for the interrupting utterance to finish so it can become the next prompt")
     parser.add_argument("--diagnose-barge-in", action="store_true", help="Run an audible LiveKit-only barge-in receive/publish diagnostic instead of xAI conversation")
     parser.add_argument("--diagnose-seconds", type=float, default=20.0, help="Seconds to run --diagnose-barge-in")

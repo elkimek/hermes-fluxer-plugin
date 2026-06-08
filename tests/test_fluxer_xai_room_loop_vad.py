@@ -195,6 +195,85 @@ async def test_barge_in_resets_on_short_noise_gap():
 
 
 @pytest.mark.asyncio
+async def test_barge_in_accumulates_bursty_voice_inside_configured_window():
+    args = argparse.Namespace(
+        sample_rate=1000,
+        frame_ms=20,
+        participant_identity=None,
+        barge_in_energy_threshold=700,
+        barge_in_min_ms=200,
+        barge_in_window_ms=1200,
+    )
+    # Browser/Fluxer voice activity can blink on/off while the user is really
+    # speaking. Ten 20ms voiced chunks separated by short gaps should count as
+    # one barge-in attempt even though no chunk run is 200ms continuous.
+    bridge = FakeBargeBridge(
+        [
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+            pcm16(0, 20),
+            pcm16(900, 20),
+        ]
+    )
+    capture = room_loop.BargeInCapture()
+
+    await room_loop._wait_for_barge_in(args, bridge, capture)
+
+    assert capture.event.is_set()
+    assert capture.detected_voiced_ms == 200
+    assert capture.voiced_ms == 200
+    assert bridge.iterator.closed is True
+
+
+@pytest.mark.asyncio
+async def test_barge_in_ignores_short_echo_bursts_below_windowed_minimum():
+    args = argparse.Namespace(
+        sample_rate=1000,
+        frame_ms=20,
+        participant_identity=None,
+        barge_in_energy_threshold=180,
+        barge_in_min_ms=200,
+        barge_in_window_ms=1200,
+    )
+    # Soundbar/speaker echo can create loud but short bursts while the assistant
+    # is speaking. Four 20ms bursts should not interrupt even though each is
+    # above the energy threshold.
+    bridge = FakeBargeBridge(
+        [
+            pcm16(500, 20),
+            pcm16(0, 120),
+            pcm16(500, 20),
+            pcm16(0, 120),
+            pcm16(500, 20),
+            pcm16(0, 120),
+            pcm16(500, 20),
+        ]
+    )
+    capture = room_loop.BargeInCapture()
+
+    await room_loop._wait_for_barge_in(args, bridge, capture)
+
+    assert not capture.event.is_set()
+    assert capture.voiced_ms == 80
+    assert bridge.iterator.closed is True
+
+
+@pytest.mark.asyncio
 async def test_barge_in_capture_sets_interrupt_early_and_retains_utterance_pcm():
     args = argparse.Namespace(
         sample_rate=1000,

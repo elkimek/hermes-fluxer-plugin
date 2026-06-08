@@ -226,8 +226,12 @@ optional_env:
     prompt: "Voice barge-in energy threshold"
     password: false
   - name: FLUXER_VOICE_BARGE_IN_MIN_MS
-    description: "Minimum sustained speech duration in milliseconds required to interrupt assistant audio"
+    description: "Minimum speech duration in milliseconds required inside the barge-in detection window"
     prompt: "Voice barge-in minimum ms"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_WINDOW_MS
+    description: "Optional sliding window in milliseconds for accumulating bursty speech during barge-in; 0 requires continuous speech"
+    prompt: "Voice barge-in sliding window ms"
     password: false
   - name: FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS
     description: "Maximum seconds to retain interrupted user speech as carryover diagnostics"
