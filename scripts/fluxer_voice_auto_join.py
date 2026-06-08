@@ -78,6 +78,8 @@ class FluxerVoiceAutoJoinSupervisor:
         self.active_guild_id: str | None = None
         self.desired_channel_id: str | None = None
         self.desired_guild_id: str | None = None
+        self.pending_start_key: tuple[str, str] | None = None
+        self.pending_stop_reason: str | None = None
         self.last_start_monotonic = 0.0
 
     def should_watch_user(self, user_id: str) -> bool:
@@ -104,6 +106,46 @@ class FluxerVoiceAutoJoinSupervisor:
                     logger.error("voice auto-join operation failed", exc_info=(type(exc), exc, exc.__traceback__))
 
         task.add_done_callback(discard)
+
+    def schedule_start(self, *, guild_id: str | None, channel_id: str) -> None:
+        key = (guild_id or "", channel_id)
+        if self.pending_start_key == key:
+            logger.info("voice loop start already pending for channel=%s", channel_id)
+            return
+        if self.process and self.process.returncode is None and key == (self.active_guild_id or "", self.active_channel_id):
+            logger.info("voice loop already running for channel=%s", channel_id)
+            return
+        self.pending_start_key = key
+
+        async def start_if_still_desired() -> None:
+            try:
+                if self.desired_channel_id != channel_id or (self.desired_guild_id or "") != (guild_id or ""):
+                    logger.info("voice loop start skipped; desired target moved or left")
+                    return
+                await self.start_voice_loop(guild_id=guild_id, channel_id=channel_id)
+            finally:
+                if self.pending_start_key == key:
+                    self.pending_start_key = None
+
+        self.schedule_operation(start_if_still_desired(), name="fluxer-auto-join-start")
+
+    def schedule_stop(self, reason: str) -> None:
+        if self.pending_stop_reason == reason:
+            logger.info("voice loop stop already pending: %s", reason)
+            return
+        if (not self.process or self.process.returncode is not None) and self.active_channel_id is None:
+            logger.info("voice loop stop skipped; no active loop: %s", reason)
+            return
+        self.pending_stop_reason = reason
+
+        async def stop_once() -> None:
+            try:
+                await self.stop_voice_loop(reason)
+            finally:
+                if self.pending_stop_reason == reason:
+                    self.pending_stop_reason = None
+
+        self.schedule_operation(stop_once(), name="fluxer-auto-join-stop")
 
     async def cancel_operations(self) -> None:
         tasks = list(self.operation_tasks)
@@ -149,8 +191,18 @@ class FluxerVoiceAutoJoinSupervisor:
             str(self.args.barge_in_energy_threshold),
             "--barge-in-min-ms",
             str(self.args.barge_in_min_ms),
+            "--barge-in-window-ms",
+            str(self.args.barge_in_window_ms),
             "--barge-in-capture-timeout",
             str(self.args.barge_in_capture_timeout),
+            "--barge-in-stop-phrase-energy-threshold",
+            str(self.args.barge_in_stop_phrase_energy_threshold),
+            "--barge-in-stop-phrase-min-ms",
+            str(self.args.barge_in_stop_phrase_min_ms),
+            "--barge-in-stop-phrase-silence-ms",
+            str(self.args.barge_in_stop_phrase_silence_ms),
+            "--barge-in-stop-phrase-max-seconds",
+            str(self.args.barge_in_stop_phrase_max_seconds),
             "--max-runtime-seconds",
             str(self.args.max_runtime_seconds),
             "--turn-log-jsonl",
@@ -234,7 +286,10 @@ class FluxerVoiceAutoJoinSupervisor:
             self.active_guild_id = None
             desired_channel_id = self.desired_channel_id
             desired_guild_id = self.desired_guild_id
-            if desired_channel_id and self.should_join_channel(guild_id=desired_guild_id, channel_id=desired_channel_id):
+            if code not in (0, None) and desired_channel_id and self.should_join_channel(
+                guild_id=desired_guild_id,
+                channel_id=desired_channel_id,
+            ):
                 await self._restart_desired_loop_after_exit(code=code, guild_id=desired_guild_id, channel_id=desired_channel_id)
 
     async def _restart_desired_loop_after_exit(self, *, code: int | None, guild_id: str | None, channel_id: str) -> None:
@@ -261,25 +316,21 @@ class FluxerVoiceAutoJoinSupervisor:
         if channel_id is None:
             self.desired_channel_id = None
             self.desired_guild_id = None
-            self.schedule_operation(
-                self.stop_voice_loop(f"target user {user_id} left voice"),
-                name="fluxer-auto-join-stop-left",
-            )
+            self.pending_start_key = None
+            self.schedule_stop(f"target user {user_id} left voice")
             return
         if not self.should_join_channel(guild_id=guild_id, channel_id=channel_id):
             self.desired_channel_id = None
             self.desired_guild_id = None
-            self.schedule_operation(
-                self.stop_voice_loop(f"target user {user_id} moved to unconfigured voice channel {channel_id}"),
-                name="fluxer-auto-join-stop-unconfigured",
-            )
+            self.pending_start_key = None
+            self.schedule_stop(f"target user {user_id} moved to unconfigured voice channel {channel_id}")
+            return
+        if self.desired_channel_id == channel_id and (self.desired_guild_id or "") == (guild_id or ""):
+            logger.info("voice loop target state unchanged for channel=%s", channel_id)
             return
         self.desired_channel_id = channel_id
         self.desired_guild_id = guild_id
-        self.schedule_operation(
-            self.start_voice_loop(guild_id=guild_id, channel_id=channel_id),
-            name="fluxer-auto-join-start",
-        )
+        self.schedule_start(guild_id=guild_id, channel_id=channel_id)
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -303,6 +354,7 @@ async def run(args: argparse.Namespace) -> int:
             extra={
                 "bot_token": bot_token,
                 "allow_all_users": env_truthy("FLUXER_ALLOW_ALL_USERS"),
+                "gateway_state_updates": False,
                 "voice": {"supervisor_disabled": True},
             },
         )
@@ -360,9 +412,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--end-padding-ms", type=int, default=int(os.getenv("FLUXER_VOICE_END_PADDING_MS", "180")))
     parser.add_argument("--min-segment-ms", type=int, default=int(os.getenv("FLUXER_VOICE_MIN_SEGMENT_MS", "1200")))
     parser.add_argument("--max-segment-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_SEGMENT_SECONDS", "9.0")))
-    parser.add_argument("--barge-in-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", os.getenv("FLUXER_VOICE_ENERGY_THRESHOLD", "300"))))
-    parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "120")))
+    parser.add_argument("--barge-in-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", "180")))
+    parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "1200")))
+    parser.add_argument("--barge-in-window-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_WINDOW_MS", "0")))
     parser.add_argument("--barge-in-capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS", "2.0")))
+    parser.add_argument("--barge-in-stop-phrase-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD", "450")))
+    parser.add_argument("--barge-in-stop-phrase-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS", "120")))
+    parser.add_argument("--barge-in-stop-phrase-silence-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS", "180")))
+    parser.add_argument("--barge-in-stop-phrase-max-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS", "2.0")))
     parser.add_argument("--max-runtime-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_MAX_RUNTIME_SECONDS", "3600.0")))
     parser.add_argument("--connect-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_CONNECT_TIMEOUT_SECONDS", "30.0")))
     parser.add_argument("--start-cooldown-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_START_COOLDOWN_SECONDS", "5.0")))

@@ -34,3 +34,4 @@ py-modules = ["adapter", "livekit_bridge", "xai_realtime"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

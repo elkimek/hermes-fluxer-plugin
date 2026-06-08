@@ -56,6 +56,54 @@ class FailingPublishRoom(FakeRoom):
         self.local_participant = FailingPublishParticipant()
 
 
+class FailingConnectRoom(FakeRoom):
+    async def connect(self, url, token, options=None):
+        self.connected.append((url, token, options))
+        raise RuntimeError("connect failed")
+
+
+@pytest.mark.asyncio
+async def test_smoke_bridge_connect_failure_disconnects_transient_room():
+    room = FailingConnectRoom()
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+
+    with pytest.raises(RuntimeError, match="connect failed"):
+        await bridge.connect_from_voice_server_update(
+            {
+                "endpoint": "wss://livekit.fluxer.example",
+                "token": "ephemeral-livekit-token",
+            }
+        )
+
+    assert room.disconnected is True
+    assert bridge.connected is False
+    assert bridge.last_connection is None
+
+
+@pytest.mark.asyncio
+async def test_smoke_bridge_connect_cancellation_disconnects_transient_room():
+    room = FailingConnectRoom()
+
+    async def cancelled_connect(url, token, options=None):
+        room.connected.append((url, token, options))
+        raise asyncio.CancelledError
+
+    room.connect = cancelled_connect  # type: ignore[method-assign]
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=lambda: room)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bridge.connect_from_voice_server_update(
+            {
+                "endpoint": "wss://livekit.fluxer.example",
+                "token": "ephemeral-livekit-token",
+            }
+        )
+
+    assert room.disconnected is True
+    assert bridge.connected is False
+    assert bridge.last_connection is None
+
+
 @pytest.mark.asyncio
 async def test_smoke_bridge_connects_with_raw_token_but_only_returns_safe_metadata():
     rooms = []
@@ -405,6 +453,13 @@ async def test_collect_remote_audio_bounds_stream_generator_cleanup_after_timeou
 
     assert chunks.close_started is True
     assert elapsed < 0.25
+
+
+def test_livekit_remote_audio_iterator_documents_external_timeout_requirement():
+    doc = livekit_bridge.FluxerLiveKitSmokeBridge.iter_remote_audio_pcm16.__doc__ or ""
+
+    assert "If no matching participant/track ever appears" in doc
+    assert "callers must impose their own timeout" in doc
 
 
 @pytest.mark.asyncio

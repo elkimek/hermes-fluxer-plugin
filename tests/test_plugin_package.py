@@ -108,7 +108,12 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
         "FLUXER_VOICE_DISABLE_BARGE_IN",
         "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
         "FLUXER_VOICE_BARGE_IN_MIN_MS",
+        "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
         "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
         "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -134,7 +139,12 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
                     "disable": True,
                     "energy_threshold": 700,
                     "min_ms": 180,
+                    "window_ms": 1200,
                     "capture_timeout_seconds": 2,
+                    "stop_phrase_energy_threshold": 450,
+                    "stop_phrase_min_ms": 120,
+                    "stop_phrase_silence_ms": 180,
+                    "stop_phrase_max_seconds": 2.0,
                     "after_first_audio_only": False,
                 },
             }
@@ -160,7 +170,12 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     assert os.environ["FLUXER_VOICE_DISABLE_BARGE_IN"] == "true"
     assert os.environ["FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD"] == "700"
     assert os.environ["FLUXER_VOICE_BARGE_IN_MIN_MS"] == "180"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_WINDOW_MS"] == "1200"
     assert os.environ["FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS"] == "2"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD"] == "450"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS"] == "120"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS"] == "180"
+    assert os.environ["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS"] == "2.0"
     assert os.environ["FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY"] == "false"
 
 
@@ -182,6 +197,11 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
         "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
         "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
         "FLUXER_VOICE_BARGE_IN_MIN_MS",
+        "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS",
+        "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
         "FLUXER_VOICE_BRAIN_PROVIDER",
         "FLUXER_VOICE_MAX_SEGMENT_SECONDS",
     ):
@@ -198,7 +218,15 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
                 "stop_timeout_seconds": 99,
                 "vad": {"frame_ms": 20, "energy_threshold": 300, "max_segment_seconds": None},
                 "timeouts": {"start_cooldown_seconds": 5, "stop_timeout_seconds": 2},
-                "barge_in": {"energy_threshold": 400, "min_ms": 120},
+                "barge_in": {
+                    "energy_threshold": 400,
+                    "min_ms": 120,
+                    "window_ms": 900,
+                    "stop_phrase_energy_threshold": 350,
+                    "stop_phrase_min_ms": 100,
+                    "stop_phrase_silence_ms": 160,
+                    "stop_phrase_max_seconds": 1.5,
+                },
             }
         },
     )
@@ -211,6 +239,11 @@ def test_voice_supervisor_child_env_prefers_nested_vad_timeouts_over_legacy_top_
     assert env["FLUXER_VOICE_STOP_TIMEOUT_SECONDS"] == "2"
     assert env["FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD"] == "400"
     assert env["FLUXER_VOICE_BARGE_IN_MIN_MS"] == "120"
+    assert env["FLUXER_VOICE_BARGE_IN_WINDOW_MS"] == "900"
+    assert env["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD"] == "350"
+    assert env["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS"] == "100"
+    assert env["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS"] == "160"
+    assert env["FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS"] == "1.5"
     assert "FLUXER_VOICE_BRAIN_PROVIDER" not in env
     assert "FLUXER_VOICE_MAX_SEGMENT_SECONDS" not in env
 
@@ -495,6 +528,59 @@ async def test_voice_supervisor_stop_cancels_pending_restart(tmp_path, monkeypat
     assert supervisor._watch_task is None
 
 
+@pytest.mark.asyncio
+async def test_voice_supervisor_reconnect_start_replaces_sleeping_old_watcher(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLUXER_VOICE_ENABLED", "true")
+    monkeypatch.setenv("FLUXER_VOICE_AUTO_JOIN", "true")
+    monkeypatch.setenv("FLUXER_VOICE_CHANNEL_IDS", "voice-1")
+    root = tmp_path
+    (root / "scripts").mkdir()
+    (root / "scripts" / "fluxer_voice_auto_join.py").write_text("", encoding="utf-8")
+    processes = []
+
+    class ExitingProcess(_FakeVoiceProcess):
+        def wait(self, timeout=None) -> int:
+            self.wait_calls.append(timeout)
+            self.terminated = True
+            return 17
+
+    class RunningProcess(_FakeVoiceProcess):
+        pass
+
+    def fake_popen(*args, **kwargs):
+        proc = ExitingProcess() if not processes else RunningProcess()
+        processes.append(proc)
+        return proc
+
+    supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(extra={}, plugin_root=root, popen_factory=fake_popen)
+    supervisor._restart_delay_seconds = 0.2
+
+    assert supervisor.start() is True
+    deadline = time.monotonic() + 1.0
+    while supervisor.process is not None and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert len(processes) == 1
+    assert supervisor.process is None
+    old_watch = supervisor._watch_task
+    assert old_watch is not None and not old_watch.done()
+
+    assert supervisor.start() is True
+    new_proc = processes[1]
+    assert supervisor.process is new_proc
+    assert supervisor._watch_process_ref is new_proc
+    assert supervisor._watch_task is not old_watch
+    assert supervisor._watch_task is not None and not supervisor._watch_task.done()
+
+    new_proc.terminated = True
+    deadline = time.monotonic() + 1.0
+    while supervisor.process is new_proc and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert supervisor.process is None
+    await supervisor.stop()
+
+
 def test_voice_supervisor_signal_fallback_suppresses_missing_process(monkeypatch):
     class GoneProcess:
         pid = 999999
@@ -509,6 +595,35 @@ def test_voice_supervisor_signal_fallback_suppresses_missing_process(monkeypatch
         fluxer_adapter.signal.SIGTERM,
         fallback=GoneProcess().terminate,
     )
+
+
+@pytest.mark.asyncio
+async def test_sidecar_adapter_can_disable_gateway_state_updates(monkeypatch):
+    marks = []
+    monkeypatch.setattr(
+        fluxer_adapter.BasePlatformAdapter,
+        "_mark_connected",
+        lambda self: marks.append("connected"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fluxer_adapter.BasePlatformAdapter,
+        "_mark_disconnected",
+        lambda self: marks.append("disconnected"),
+        raising=False,
+    )
+
+    main_adapter = fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra={"bot_token": "app.secret"}))
+    main_adapter._mark_connected()
+    main_adapter._mark_disconnected()
+
+    sidecar_adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "gateway_state_updates": False})
+    )
+    sidecar_adapter._mark_connected()
+    sidecar_adapter._mark_disconnected()
+
+    assert marks == ["connected", "disconnected"]
 
 
 @pytest.mark.asyncio
@@ -532,7 +647,7 @@ async def test_reconnect_restarts_voice_supervisor(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_connect_gateway_once_clears_stale_pending_voice_joins(monkeypatch):
+async def test_connect_gateway_once_preserves_pending_voice_joins(monkeypatch):
     import asyncio
     import contextlib
     import sys
@@ -553,7 +668,7 @@ async def test_connect_gateway_once_clears_stale_pending_voice_joins(monkeypatch
 
     await adapter._connect_gateway_once()
 
-    assert adapter._pending_voice_joins == {}
+    assert adapter._pending_voice_joins == {"guild-1:voice-1": {"guild_id": "guild-1", "channel_id": "voice-1"}}
     assert adapter._listener_task is not None
     adapter._listener_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -581,6 +696,20 @@ def test_realtime_voice_code_avoids_reviewed_runtime_footguns():
     assert "__globals__" not in stt_loop_source
     assert "await _maybe_await(room.disconnect())" in livekit_source
     assert "logger.exception(\n                    \"Fluxer voice server update bridge handler failed" in adapter_source
+    assert "self._pending_voice_joins.clear()" not in adapter_source
+    assert "if self._voice_supervisor:" not in adapter_source
+    assert "await asyncio.wait_for(task, timeout=" in livekit_source
+    assert "await asyncio.wait({task}, timeout=timeout)" in xai_room_loop_source
+    assert 'getattr(current, "cancelling", None)' not in xai_room_loop_source
+    assert "contextlib.suppress(asyncio.CancelledError, Exception)" in xai_room_loop_source
+    assert "await asyncio.wait_for(task, timeout=timeout)" not in xai_room_loop_source
+    assert 'getattr(exc_type, "_fluxer_fast_close", False)' in livekit_source
+    assert 'exc_type.__name__ == "BargeInInterrupt"' not in livekit_source
+    assert "not issubclass(exc_type, Exception)" in livekit_source
+    assert "except asyncio.CancelledError:\n                    logger.info(\"Cancelling STT-backed voice turn %s; interrupting publisher\"" in stt_loop_source
+    assert "await publisher.interrupt()" in stt_loop_source
+    assert "elif voice_update_task is not None and not voice_update_task.done():" in stt_loop_source
+    assert "shutdown_requested.set()\n        finished.set()" not in stt_loop_source
 
 
 def test_public_tree_contains_no_private_voice_dogfood_defaults():
@@ -1224,6 +1353,7 @@ def test_xai_realtime_defaults_are_generic_and_concise():
 
 def test_continuous_room_loop_script_has_noise_and_language_guardrails():
     source = (ROOT / "scripts" / "fluxer_xai_room_loop.py").read_text()
+    realtime_source = (ROOT / "xai_realtime.py").read_text()
 
     assert "default to English" in source
     assert "Ignore background music" in source
@@ -1238,11 +1368,19 @@ def test_continuous_room_loop_script_has_noise_and_language_guardrails():
     assert "pcm16_publisher" in source
     assert "first_audio_seconds" in source
     assert "BargeInInterrupt" in source
+    assert "_fluxer_fast_close = True" in realtime_source
     assert "--disable-barge-in" in source
     assert "barge_in_min_ms" in source
     assert "--diagnose-barge-in" in source
     assert "barge probe chunk" in source
     assert "xAI response/publish failed for turn %s: %s: %s" in source
+
+
+def test_voice_auto_join_default_barge_in_is_not_hair_trigger():
+    source = (ROOT / "scripts" / "fluxer_voice_auto_join.py").read_text()
+
+    assert 'FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", "180"' in source
+    assert 'FLUXER_VOICE_BARGE_IN_MIN_MS", "1200"' in source
 
 
 def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():

@@ -56,10 +56,10 @@ def test_supervisor_builds_voice_loop_command_with_target_prefix():
     assert ["--max-segment-seconds", "9.0"] == cmd[
         cmd.index("--max-segment-seconds") : cmd.index("--max-segment-seconds") + 2
     ]
-    assert ["--barge-in-energy-threshold", "300"] == cmd[
+    assert ["--barge-in-energy-threshold", "180"] == cmd[
         cmd.index("--barge-in-energy-threshold") : cmd.index("--barge-in-energy-threshold") + 2
     ]
-    assert ["--barge-in-min-ms", "120"] == cmd[cmd.index("--barge-in-min-ms") : cmd.index("--barge-in-min-ms") + 2]
+    assert ["--barge-in-min-ms", "1200"] == cmd[cmd.index("--barge-in-min-ms") : cmd.index("--barge-in-min-ms") + 2]
     assert "--elevenlabs-language-code" not in cmd
 
 
@@ -71,6 +71,26 @@ def test_supervisor_with_empty_targets_watches_nobody(monkeypatch):
 
     assert sup.target_user_ids == set()
     assert sup.should_watch_user("user-1") is False
+
+
+def test_supervisor_barge_in_defaults_do_not_reuse_capture_energy_threshold(monkeypatch):
+    monkeypatch.setenv("FLUXER_VOICE_ENERGY_THRESHOLD", "300")
+    monkeypatch.delenv("FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", raising=False)
+    monkeypatch.delenv("FLUXER_VOICE_BARGE_IN_MIN_MS", raising=False)
+    args = parse_args([
+        "--target-user-ids",
+        "user-1",
+        "--channel-ids",
+        "voice-1",
+    ])
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+
+    cmd = sup.build_voice_loop_command(guild_id=None, channel_id="voice-1")
+
+    assert ["--barge-in-energy-threshold", "180"] == cmd[
+        cmd.index("--barge-in-energy-threshold") : cmd.index("--barge-in-energy-threshold") + 2
+    ]
+    assert ["--barge-in-min-ms", "1200"] == cmd[cmd.index("--barge-in-min-ms") : cmd.index("--barge-in-min-ms") + 2]
 
 
 @pytest.mark.asyncio
@@ -143,6 +163,9 @@ async def test_supervisor_starts_on_target_join_and_stops_on_leave(monkeypatch):
     await sup.handle_voice_state_update({"user_id": "intruder", "guild_id": "guild-1", "channel_id": "voice-1"})
     await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-2", "channel_id": "voice-1"})
     await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": "voice-1"})
+    await asyncio.gather(*list(sup.operation_tasks))
+    sup.active_guild_id = "guild-1"
+    sup.active_channel_id = "voice-1"
     await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": None})
     for _ in range(3):
         if not sup.operation_tasks:
@@ -150,7 +173,6 @@ async def test_supervisor_starts_on_target_join_and_stops_on_leave(monkeypatch):
         await asyncio.gather(*list(sup.operation_tasks))
 
     assert events == [
-        ("stop", "target user user-1 moved to unconfigured voice channel voice-1"),
         ("start", "guild-1", "voice-1"),
         ("stop", "target user user-1 left voice"),
     ]
@@ -168,6 +190,8 @@ async def test_supervisor_leave_handler_does_not_wait_for_slow_stop(monkeypatch)
         await release_stop.wait()
 
     monkeypatch.setattr(sup, "stop_voice_loop", slow_stop)
+    sup.active_guild_id = "guild-1"
+    sup.active_channel_id = "voice-1"
 
     await asyncio.wait_for(
         sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": None}),
@@ -180,6 +204,73 @@ async def test_supervisor_leave_handler_does_not_wait_for_slow_stop(monkeypatch)
     await asyncio.gather(*list(sup.operation_tasks))
     await asyncio.sleep(0)
     assert sup.operation_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_dedupes_duplicate_join_events(monkeypatch):
+    args = parse_args(["--target-user-ids", "user-1", "--channel-ids", "voice-1", "--guild-ids", "guild-1"])
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    events = []
+
+    async def fake_start(*, guild_id, channel_id):
+        events.append(("start", guild_id, channel_id))
+
+    monkeypatch.setattr(sup, "start_voice_loop", fake_start)
+
+    await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": "voice-1"})
+    await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": "voice-1"})
+
+    assert len(sup.operation_tasks) == 1
+    await asyncio.gather(*list(sup.operation_tasks))
+    assert events == [("start", "guild-1", "voice-1")]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_dedupes_duplicate_leave_events(monkeypatch):
+    args = parse_args(["--target-user-ids", "user-1", "--channel-ids", "voice-1", "--guild-ids", "guild-1"])
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+    events = []
+
+    async def slow_stop(reason):
+        events.append(("stop", reason))
+        stop_started.set()
+        await release_stop.wait()
+
+    monkeypatch.setattr(sup, "stop_voice_loop", slow_stop)
+    sup.active_guild_id = "guild-1"
+    sup.active_channel_id = "voice-1"
+    sup.desired_guild_id = "guild-1"
+    sup.desired_channel_id = "voice-1"
+
+    await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": None})
+    await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": None})
+    await asyncio.wait_for(stop_started.wait(), timeout=0.1)
+
+    assert len(sup.operation_tasks) == 1
+    release_stop.set()
+    await asyncio.gather(*list(sup.operation_tasks))
+    assert events == [("stop", "target user user-1 left voice")]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancels_pending_start_when_target_leaves(monkeypatch):
+    args = parse_args(["--target-user-ids", "user-1", "--channel-ids", "voice-1", "--guild-ids", "guild-1"])
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    events = []
+
+    async def fake_start(*, guild_id, channel_id):
+        events.append(("start", guild_id, channel_id))
+
+    monkeypatch.setattr(sup, "start_voice_loop", fake_start)
+
+    await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": "voice-1"})
+    await sup.handle_voice_state_update({"user_id": "user-1", "guild_id": "guild-1", "channel_id": None})
+    await asyncio.gather(*list(sup.operation_tasks))
+
+    assert events == []
+    assert sup.pending_start_key is None
 
 
 @pytest.mark.asyncio
@@ -259,6 +350,46 @@ async def test_supervisor_restarts_crashed_loop_while_target_remains(monkeypatch
 
     assert sup.process is None
     assert events == [("restart", "guild-1", "voice-1")]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_restart_clean_loop_exit_while_target_remains(monkeypatch):
+    args = parse_args(
+        [
+            "--target-user-ids",
+            "user-1",
+            "--channel-ids",
+            "voice-1",
+            "--guild-ids",
+            "guild-1",
+            "--start-cooldown-seconds",
+            "0",
+        ]
+    )
+    sup = FluxerVoiceAutoJoinSupervisor(args)
+    events = []
+
+    class CleanProcess:
+        returncode = 0
+
+        async def wait(self):
+            return 0
+
+    async def fake_start(*, guild_id, channel_id):
+        events.append(("restart", guild_id, channel_id))
+
+    proc = CleanProcess()
+    sup.process = proc  # type: ignore[assignment]
+    sup.active_guild_id = "guild-1"
+    sup.active_channel_id = "voice-1"
+    sup.desired_guild_id = "guild-1"
+    sup.desired_channel_id = "voice-1"
+    monkeypatch.setattr(sup, "start_voice_loop", fake_start)
+
+    await sup._watch_process(proc)  # type: ignore[arg-type]
+
+    assert sup.process is None
+    assert events == []
 
 
 @pytest.mark.asyncio

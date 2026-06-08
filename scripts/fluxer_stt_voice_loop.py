@@ -46,7 +46,11 @@ from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from scripts.fluxer_xai_room_loop import (  # noqa: E402
     BargeInCapture,
     BargeInInterrupt,
+    _acquire_lock_with_timeout,
     _capture_one_speech_segment,
+    _cancel_previous_task_safely,
+    _cancel_task_safely,
+    _redact_exception_message,
     _wait_for_barge_in,
 )
 from tools.transcription_tools import (  # noqa: E402
@@ -307,6 +311,13 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
     """Build a compact text prompt for a voice answer grounded in STT text."""
 
     transcript = normalize_voice_transcript(transcript)
+    lower_transcript = " ".join(transcript.lower().split())
+    continuation_instruction = ""
+    if "count" in lower_transcript:
+        continuation_instruction = (
+            " If the latest transcript asks you to count or keep counting, count slowly from one upward as a continuous spoken stream; "
+            "do not summarize the task and do not say 'let me know when to stop'."
+        )
     history_lines: list[str] = []
     for item in history[-6:]:
         user = (item.get("user") or "").strip()
@@ -323,6 +334,7 @@ def build_answer_prompt(transcript: str, *, history: list[dict[str, str]], syste
         "Speak the assistant's next reply now. Use the latest transcript, relevant voice history, and the implementation context above. "
         "For casual or operational turns, keep it short. If the latest transcript asks for deep, personal, introspective, reflective, or self-knowledge content, answer with 2-4 substantive spoken sentences and do not end with a generic follow-up question. "
         "If the latest transcript is a stop/leave request, acknowledge briefly and stop without asking another question."
+        f"{continuation_instruction}"
     )
 
 
@@ -688,6 +700,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             extra={
                 "bot_token": bot_token,
                 "allow_all_users": env_truthy("FLUXER_ALLOW_ALL_USERS"),
+                "gateway_state_updates": False,
                 "voice": {"supervisor_disabled": True},
             },
         )
@@ -709,6 +722,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     sticky_brain_provider = "xai-fast"
     session_task: asyncio.Task[Any] | None = None
     voice_update_task: asyncio.Task[Any] | None = None
+    voice_update_lock = asyncio.Lock()
     session_generation = 0
 
     async def run_voice_session(info: Any, safe_update: dict[str, Any], generation: int) -> None:
@@ -716,6 +730,24 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         try:
             # Let Fluxer publish/subscription state settle before the first fixed window.
             await asyncio.sleep(args.initial_settle_seconds)
+
+            async def transcribe_barge_in_stop_phrase(pcm: bytes) -> str:
+                wav_path = Path(tempfile.gettempdir()) / f"fluxer_stt_loop_barge_stop_{generation}_{int(time.time() * 1000)}.wav"
+                write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
+                try:
+                    stt_result = await asyncio.to_thread(
+                        transcribe_with_provider,
+                        str(wav_path),
+                        provider=args.stt_provider,
+                        model=args.stt_model,
+                        elevenlabs_language_code=args.elevenlabs_language_code,
+                    )
+                    return normalize_voice_transcript((stt_result.get("transcript") or "").strip())
+                finally:
+                    with contextlib.suppress(OSError):
+                        wav_path.unlink()
+
+            args.barge_in_stop_phrase_transcriber = transcribe_barge_in_stop_phrase
 
             for turn_no in range(1, args.max_turns + 1):
                 if shutdown_requested.is_set():
@@ -901,9 +933,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                             if barge_event_task in done and barge_in_capture.event.is_set() and not xai_task.done():
                                 barge_in_seconds = time.monotonic() - xai_started
                                 await publisher.interrupt()
-                                xai_task.cancel()
-                                with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                                    await xai_task
+                                await _cancel_task_safely(xai_task)
                                 raise BargeInInterrupt("user interrupted assistant speech before xAI audio")
                             try:
                                 xai_result = await xai_task
@@ -921,15 +951,73 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         barge_in_seconds = time.monotonic() - xai_started
                         await publisher.interrupt()
                         raise BargeInInterrupt("user interrupted assistant speech")
+                except asyncio.CancelledError:
+                    logger.info("Cancelling STT-backed voice turn %s; interrupting publisher", turn_no)
+                    await _cancel_task_safely(xai_task)
+                    if not getattr(publisher, "interrupted", False):
+                        await publisher.interrupt()
+                    turn.update(
+                        {
+                            "published": False,
+                            "interrupted": True,
+                            "reason": "session_cancelled",
+                            "partial_response_bytes": getattr(publisher, "bytes_published", 0),
+                            "brain_provider": selected_brain_provider,
+                            "brain_provider_config": args.brain_provider,
+                            "brain_route_reason": brain_route_reason,
+                            "hermes_session_id": hermes_session_id if selected_brain_provider == "hermes" else None,
+                            "hermes_session_key": hermes_session_key if selected_brain_provider == "hermes" else None,
+                            "reply_transcript": reply_text,
+                            "barge_in_diagnostic": {
+                                "chunks_seen": barge_in_capture.chunks_seen,
+                                "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
+                                if barge_in_capture.first_chunk_seconds is not None
+                                else None,
+                                "max_rms": barge_in_capture.max_rms,
+                                "voiced_ms": barge_in_capture.voiced_ms,
+                                "detected_voiced_ms": barge_in_capture.detected_voiced_ms,
+                                "detected_seconds": round(barge_in_capture.detected_seconds, 3)
+                                if barge_in_capture.detected_seconds is not None
+                                else None,
+                                "threshold": args.barge_in_energy_threshold,
+                                "min_ms": args.barge_in_min_ms,
+                                "window_ms": getattr(args, "barge_in_window_ms", 0),
+                                "semantic_stop_detected": barge_in_capture.semantic_stop_detected,
+                                "semantic_stop_transcript": barge_in_capture.semantic_stop_transcript,
+                                "semantic_stop_error": barge_in_capture.semantic_stop_error,
+                                "semantic_stop_candidate_ms": barge_in_capture.semantic_stop_candidate_ms,
+                                "semantic_stop_candidate_bytes": barge_in_capture.semantic_stop_candidate_bytes,
+                            },
+                            "publisher_queue_before_interrupt_seconds": round(
+                                getattr(publisher, "last_queue_duration_before_interrupt", 0.0) or 0.0,
+                                3,
+                            ),
+                            "publisher_queue_after_clear_seconds": round(
+                                getattr(publisher, "last_queue_duration_after_clear", 0.0) or 0.0,
+                                3,
+                            ),
+                            "timing": {
+                                "turn_seconds": round(time.monotonic() - turn_started, 3),
+                                "stt_seconds": round(stt_seconds, 3),
+                                "brain_seconds": round(brain_seconds, 3),
+                                "xai_first_audio_seconds": round(first_audio_seconds, 3) if first_audio_seconds is not None else None,
+                            },
+                        }
+                    )
+                    result["turns"].append(turn)
+                    append_jsonl(args.turn_log_jsonl, turn)
+                    raise
                 except BargeInInterrupt:
                     logger.info("Barge-in interrupted STT-backed voice turn %s", turn_no)
+                    await _cancel_task_safely(xai_task)
                     if barge_in_capture.event.is_set():
                         with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
                             await asyncio.wait_for(
                                 barge_in_capture.ready.wait(),
                                 timeout=getattr(args, "barge_in_capture_timeout", 2.0),
                             )
-                    await publisher.close(wait_for_playout=False, flush_remainder=False)
+                    if not getattr(publisher, "interrupted", False):
+                        await publisher.interrupt()
                     turn.update(
                         {
                             "published": False,
@@ -948,6 +1036,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                                 else None,
                                 "max_rms": barge_in_capture.max_rms,
                                 "voiced_ms": barge_in_capture.voiced_ms,
+                                "detected_voiced_ms": barge_in_capture.detected_voiced_ms,
                                 "detected_seconds": round(barge_in_capture.detected_seconds, 3)
                                 if barge_in_capture.detected_seconds is not None
                                 else None,
@@ -972,6 +1061,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     result["turns"].append(turn)
                     append_jsonl(args.turn_log_jsonl, turn)
+                    # Barge-in means "stop talking now", not "leave the voice room".
+                    # Keep the LiveKit session alive and immediately re-listen for the next user turn.
                     continue
                 finally:
                     if barge_in_task is not None:
@@ -983,10 +1074,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         interrupt_watcher_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                             await interrupt_watcher_task
-                    if xai_task is not None and not xai_task.done():
-                        xai_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                            await xai_task
+                    await _cancel_task_safely(xai_task)
                     if not getattr(publisher, "interrupted", False):
                         await publisher.close()
                 xai_seconds = time.monotonic() - xai_started
@@ -1005,6 +1093,23 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         "reply_transcript": spoken_reply,
                         "reply_bytes": xai_result.bytes_written,
                         "xai_events_tail": list(xai_result.events_seen[-5:]),
+                        "barge_in_diagnostic": {
+                            "chunks_seen": barge_in_capture.chunks_seen,
+                            "first_chunk_seconds": round(barge_in_capture.first_chunk_seconds, 3)
+                            if barge_in_capture.first_chunk_seconds is not None
+                            else None,
+                            "max_rms": barge_in_capture.max_rms,
+                            "voiced_ms": barge_in_capture.voiced_ms,
+                            "threshold": args.barge_in_energy_threshold,
+                            "min_ms": args.barge_in_min_ms,
+                            "semantic_stop_detected": barge_in_capture.semantic_stop_detected,
+                            "semantic_stop_transcript": barge_in_capture.semantic_stop_transcript,
+                            "semantic_stop_error": barge_in_capture.semantic_stop_error,
+                            "semantic_stop_candidate_ms": barge_in_capture.semantic_stop_candidate_ms,
+                            "semantic_stop_candidate_bytes": barge_in_capture.semantic_stop_candidate_bytes,
+                        }
+                        if not args.disable_barge_in
+                        else None,
                         "timing": {
                             "turn_seconds": round(time.monotonic() - turn_started, 3),
                             "stt_seconds": round(stt_seconds, 3),
@@ -1025,7 +1130,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as exc:
             logger.exception("STT-backed Fluxer voice loop failed")
             result["error"] = type(exc).__name__
-            result["message"] = str(exc)
+            result["message"] = _redact_exception_message(exc)
             connected.set()
         finally:
             if generation == session_generation:
@@ -1039,7 +1144,11 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                 session_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                     await session_task
-            info = await bridge.connect_from_voice_server_update(raw_update)
+            await _acquire_lock_with_timeout(voice_update_lock, timeout=args.connect_timeout)
+            try:
+                info = await bridge.connect_from_voice_server_update(raw_update)
+            finally:
+                voice_update_lock.release()
             leave_connection_id = info.connection_id
             result["connection"] = {
                 "endpoint": info.endpoint,
@@ -1058,7 +1167,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as exc:
             logger.exception("STT-backed Fluxer voice loop failed to join LiveKit")
             result["error"] = type(exc).__name__
-            result["message"] = str(exc)
+            result["message"] = _redact_exception_message(exc, str(raw_update.get("token") or ""))
             connected.set()
             finished.set()
 
@@ -1067,10 +1176,7 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
         raw_update: dict[str, Any],
         safe_update: dict[str, Any],
     ) -> None:
-        if previous_task is not None and not previous_task.done():
-            previous_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
-                await previous_task
+        await _cancel_previous_task_safely(previous_task)
         await process_voice_server_update(raw_update, safe_update)
 
     async def handler(raw_update: dict[str, Any], safe_update: dict[str, Any]) -> None:
@@ -1088,7 +1194,12 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     def request_shutdown_from_signal() -> None:
         result["signal_stop_requested"] = True
         shutdown_requested.set()
-        finished.set()
+        if session_task is not None and not session_task.done():
+            session_task.cancel()
+        elif voice_update_task is not None and not voice_update_task.done():
+            voice_update_task.cancel()
+        else:
+            finished.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         previous_signal_handlers[sig] = signal.getsignal(sig)
@@ -1194,7 +1305,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--disable-barge-in", action="store_true", default=env_truthy("FLUXER_VOICE_DISABLE_BARGE_IN"))
     parser.add_argument("--barge-in-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD", "700")))
     parser.add_argument("--barge-in-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_MIN_MS", "180")))
+    parser.add_argument("--barge-in-window-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_WINDOW_MS", "0")))
     parser.add_argument("--barge-in-capture-timeout", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS", "2.0")))
+    parser.add_argument("--barge-in-stop-phrase-energy-threshold", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD", "450")))
+    parser.add_argument("--barge-in-stop-phrase-min-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS", "120")))
+    parser.add_argument("--barge-in-stop-phrase-silence-ms", type=int, default=int(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS", "180")))
+    parser.add_argument("--barge-in-stop-phrase-max-seconds", type=float, default=float(os.getenv("FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS", "2.0")))
     parser.add_argument(
         "--barge-in-after-first-audio-only",
         action=argparse.BooleanOptionalAction,

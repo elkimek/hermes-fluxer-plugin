@@ -226,12 +226,32 @@ optional_env:
     prompt: "Voice barge-in energy threshold"
     password: false
   - name: FLUXER_VOICE_BARGE_IN_MIN_MS
-    description: "Minimum sustained speech duration in milliseconds required to interrupt assistant audio"
+    description: "Minimum speech duration in milliseconds required inside the barge-in detection window"
     prompt: "Voice barge-in minimum ms"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_WINDOW_MS
+    description: "Optional sliding window in milliseconds for accumulating bursty speech during barge-in; 0 requires continuous speech"
+    prompt: "Voice barge-in sliding window ms"
     password: false
   - name: FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS
     description: "Maximum seconds to retain interrupted user speech as carryover diagnostics"
     prompt: "Voice barge-in capture timeout seconds"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD
+    description: "Lower RMS threshold for STT-verified stop-command interruption during assistant playback"
+    prompt: "Voice barge-in stop-phrase energy threshold"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS
+    description: "Minimum candidate speech milliseconds before STT-verifying a stop command"
+    prompt: "Voice barge-in stop-phrase minimum ms"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS
+    description: "Silence milliseconds used to finalize a stop-command candidate for STT verification"
+    prompt: "Voice barge-in stop-phrase silence ms"
+    password: false
+  - name: FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS
+    description: "Maximum candidate seconds sent to STT for stop-command verification"
+    prompt: "Voice barge-in stop-phrase max seconds"
     password: false
   - name: FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY
     description: "Arm barge-in only after first assistant audio is published to avoid false triggers from the user's prompt tail"

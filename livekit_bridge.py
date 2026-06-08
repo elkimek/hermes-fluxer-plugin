@@ -195,6 +195,9 @@ class _LiveKitPcm16Publisher:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if exc_type is not None and (not issubclass(exc_type, Exception) or getattr(exc_type, "_fluxer_fast_close", False)):
+            await self.close(wait_for_playout=False, flush_remainder=False)
+            return
         await self.close()
 
     async def write(self, pcm: bytes) -> None:
@@ -325,10 +328,15 @@ class FluxerLiveKitSmokeBridge:
             options = room_options_factory(auto_subscribe=self._auto_subscribe)
 
         room = room_factory()
-        if options is None:
-            await room.connect(endpoint, token)
-        else:
-            await room.connect(endpoint, token, options)
+        try:
+            if options is None:
+                await room.connect(endpoint, token)
+            else:
+                await room.connect(endpoint, token, options)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await _maybe_await(room.disconnect())
+            raise
 
         info = FluxerLiveKitConnectionInfo(
             endpoint=endpoint,
@@ -557,7 +565,13 @@ class FluxerLiveKitSmokeBridge:
         participant_identity: str | None = None,
         participant_identity_prefix: str | None = None,
     ) -> AsyncIterator[bytes]:
-        """Stream PCM16 mono chunks from subscribed remote LiveKit audio tracks."""
+        """Stream PCM16 mono chunks from subscribed remote LiveKit audio tracks.
+
+        The iterator terminates after the last matching subscribed track ends.
+        If no matching participant/track ever appears, it intentionally waits
+        for a future subscription; direct callers must impose their own timeout
+        or cancellation when absence of audio should end the wait.
+        """
 
         if self._room is None:
             raise RuntimeError("Fluxer LiveKit smoke bridge is not connected")
@@ -653,9 +667,11 @@ class FluxerLiveKitSmokeBridge:
                     task.cancel()
                 for task in stream_tasks:
                     try:
-                        await task
+                        await asyncio.wait_for(task, timeout=2.0)
                     except asyncio.CancelledError:
                         pass
+                    except (TimeoutError, asyncio.TimeoutError):
+                        logger.warning("Fluxer LiveKit remote audio stream task cleanup timed out")
                     except Exception as exc:
                         logger.warning("Fluxer LiveKit remote audio stream task ended during cleanup: %s", exc)
 

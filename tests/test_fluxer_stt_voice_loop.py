@@ -15,6 +15,7 @@ from scripts.fluxer_stt_voice_loop import (
     append_jsonl,
     build_answer_prompt,
     build_hermes_messages,
+    _redact_exception_message,
     collect_voice_session_recall,
     compose_system_prompt,
     hermes_voice_session_identity,
@@ -57,6 +58,13 @@ def test_build_answer_prompt_grounds_latest_transcript_and_history():
     assert "2-4 substantive spoken sentences" in prompt
     assert "do not end with a generic follow-up question" in prompt
     assert "do not guess from cached context" in prompt
+
+
+def test_build_answer_prompt_keeps_counting_turns_interruptible():
+    prompt = build_answer_prompt("Hey, start counting slowly", history=[])
+
+    assert "count slowly from one upward as a continuous spoken stream" in prompt
+    assert "do not say 'let me know when to stop'" in prompt
 
 
 def test_build_hermes_messages_preserves_history_and_latest_transcript():
@@ -361,6 +369,9 @@ def test_parse_args_defaults_to_realtime_voice_stack(monkeypatch):
     assert args.disable_barge_in is False
     assert args.barge_in_energy_threshold == 700
     assert args.barge_in_min_ms == 180
+    assert args.barge_in_stop_phrase_energy_threshold == 450
+    assert args.barge_in_stop_phrase_min_ms == 120
+    assert args.barge_in_stop_phrase_silence_ms == 180
     assert args.barge_in_after_first_audio_only is True
 
 
@@ -1250,6 +1261,14 @@ async def test_stt_voice_loop_awaits_cancelled_voice_server_connect_before_recon
     assert result["error"] == "TimeoutError"
 
 
+def test_stt_voice_loop_serializes_voice_server_update_connects():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    assert "voice_update_lock = asyncio.Lock()" in source
+    assert "_acquire_lock_with_timeout(voice_update_lock, timeout=args.connect_timeout)" in source
+    assert "voice_update_lock.release()" in source
+
+
 @pytest.mark.asyncio
 async def test_stt_voice_loop_cancels_active_session_before_second_voice_server_update(monkeypatch, tmp_path):
     first_capture_started = asyncio.Event()
@@ -1381,3 +1400,57 @@ def test_stt_voice_loop_cancels_xai_task_before_publisher_close():
     close_publisher = source.index("await publisher.close", cancel_xai)
 
     assert cancel_xai < close_publisher
+
+
+def test_stt_voice_loop_barge_in_path_cancels_xai_before_closing_publisher():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    barge_in_handler = source.index("except BargeInInterrupt:")
+    first_barge_close = source.index("await publisher.close", barge_in_handler)
+    final_cleanup = source.index("finally:", barge_in_handler)
+    cancel_xai = source.index("_cancel_task_safely(xai_task", barge_in_handler)
+
+    assert cancel_xai < first_barge_close
+    assert cancel_xai < final_cleanup
+
+
+def test_stt_voice_loop_barge_in_keeps_room_session_alive():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    barge_in_handler = source.index("except BargeInInterrupt:")
+    barge_in_block = source[barge_in_handler : source.index("finally:", barge_in_handler)]
+
+    assert 'result["stop_requested"] = True' not in barge_in_block
+    assert "continue" in barge_in_block
+    assert 'Barge-in means "stop talking now", not "leave the voice room"' in barge_in_block
+
+
+def test_stt_voice_loop_redacts_livekit_token_from_join_errors():
+    exc = RuntimeError('connect failed Bearer abc.def token=secret123 {"token":"json-secret"}')
+
+    message = _redact_exception_message(exc, "abc.def", "secret123", "json-secret")
+
+    assert "abc.def" not in message
+    assert "secret123" not in message
+    assert "json-secret" not in message
+    assert "[redacted-token]" in message
+
+
+def test_stt_voice_loop_redacts_session_level_error_result():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    assert 'result["message"] = str(exc)' not in source
+    assert 'result["message"] = _redact_exception_message(exc)' in source
+
+
+def test_stt_voice_loop_interrupts_publisher_during_cancellation_cleanup():
+    source = inspect.getsource(run_stt_voice_loop)
+
+    cancellation_handler = source.index("except asyncio.CancelledError:\n                    logger.info(\"Cancelling STT-backed voice turn")
+    cancellation_block = source[cancellation_handler : source.index("except BargeInInterrupt:", cancellation_handler)]
+
+    assert "await publisher.interrupt()" in cancellation_block
+    assert 'result["turns"].append(turn)' in cancellation_block
+    assert "raise" in cancellation_block
+    assert "await publisher.close(wait_for_playout=False, flush_remainder=False)" not in cancellation_block
+    assert "shutdown_requested.set()\n        finished.set()" not in source

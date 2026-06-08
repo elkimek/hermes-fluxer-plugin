@@ -410,6 +410,7 @@ class FluxerVoiceSupervisorProcess:
         self.popen_factory = popen_factory
         self.process: Optional[subprocess.Popen] = None
         self._watch_task: Optional[asyncio.Task[Any]] = None
+        self._watch_process_ref: Optional[subprocess.Popen] = None
         self._restart_delay_seconds = 2.0
 
     @property
@@ -510,7 +511,12 @@ class FluxerVoiceSupervisorProcess:
                 "disable": "FLUXER_VOICE_DISABLE_BARGE_IN",
                 "energy_threshold": "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
                 "min_ms": "FLUXER_VOICE_BARGE_IN_MIN_MS",
+                "window_ms": "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
                 "capture_timeout_seconds": "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+                "stop_phrase_energy_threshold": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD",
+                "stop_phrase_min_ms": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS",
+                "stop_phrase_silence_ms": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS",
+                "stop_phrase_max_seconds": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
                 "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
             },
         }.items():
@@ -561,11 +567,14 @@ class FluxerVoiceSupervisorProcess:
 
     def _start_watch_task(self, proc: subprocess.Popen) -> None:
         if self._watch_task is not None and not self._watch_task.done():
-            return
+            if self._watch_process_ref is proc:
+                return
+            self._watch_task.cancel()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        self._watch_process_ref = proc
         self._watch_task = loop.create_task(self._watch_process(proc), name="fluxer-voice-supervisor-watch")
 
     async def _watch_process(self, proc: subprocess.Popen) -> None:
@@ -589,14 +598,17 @@ class FluxerVoiceSupervisorProcess:
             if self.process is None and self.should_start():
                 if self._watch_task is current_task:
                     self._watch_task = None
+                    self._watch_process_ref = None
                 self.start()
         finally:
             if self._watch_task is current_task:
                 self._watch_task = None
+                self._watch_process_ref = None
 
     async def stop(self) -> None:
         watch_task = self._watch_task
         self._watch_task = None
+        self._watch_process_ref = None
         if watch_task is not None and not watch_task.done():
             watch_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, RuntimeError):
@@ -827,6 +839,7 @@ class FluxerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("fluxer"))
         extra = getattr(config, "extra", {}) or {}
+        self._gateway_state_updates_enabled = _coerce_bool(extra.get("gateway_state_updates"), True)
         self.base_url = _strip_slash(
             os.getenv("FLUXER_BASE_URL") or extra.get("base_url") or _DEFAULT_BASE_URL
         )
@@ -951,6 +964,14 @@ class FluxerAdapter(BasePlatformAdapter):
         self._voice_supervisor = FluxerVoiceSupervisorProcess(extra=extra)
         self._gateway_ready_event = asyncio.Event()
 
+    def _mark_connected(self) -> None:
+        if self._gateway_state_updates_enabled:
+            super()._mark_connected()
+
+    def _mark_disconnected(self) -> None:
+        if self._gateway_state_updates_enabled:
+            super()._mark_disconnected()
+
     async def connect(self) -> bool:
         if not self.bot_token:
             self._set_fatal_error(
@@ -1021,7 +1042,6 @@ class FluxerAdapter(BasePlatformAdapter):
         self._awaiting_heartbeat_ack = False
         self._last_heartbeat_sent_at = None
         self._last_heartbeat_ack_at = None
-        self._pending_voice_joins.clear()
         self._gateway_ready_event.clear()
 
         sep = "&" if "?" in self.gateway_url else "?"
@@ -1049,8 +1069,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 await asyncio.sleep(delay)
                 await self._connect_gateway_once()
                 self._mark_connected()
-                if self._voice_supervisor:
-                    self._voice_supervisor.start()
+                self._voice_supervisor.start()
                 logger.info("Fluxer gateway reconnected after %s", reason)
                 return
             except asyncio.CancelledError:
@@ -2808,7 +2827,12 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "disable": "FLUXER_VOICE_DISABLE_BARGE_IN",
         "energy_threshold": "FLUXER_VOICE_BARGE_IN_ENERGY_THRESHOLD",
         "min_ms": "FLUXER_VOICE_BARGE_IN_MIN_MS",
+        "window_ms": "FLUXER_VOICE_BARGE_IN_WINDOW_MS",
         "capture_timeout_seconds": "FLUXER_VOICE_BARGE_IN_CAPTURE_TIMEOUT_SECONDS",
+        "stop_phrase_energy_threshold": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_ENERGY_THRESHOLD",
+        "stop_phrase_min_ms": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MIN_MS",
+        "stop_phrase_silence_ms": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_SILENCE_MS",
+        "stop_phrase_max_seconds": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
         "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
     }.items():
         if key in barge_in:

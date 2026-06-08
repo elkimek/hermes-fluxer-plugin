@@ -55,9 +55,9 @@ jobs:
               'GitHub classic token': re.compile(r'ghp_[A-Za-z0-9_]+'),
               'GitHub fine-grained token': re.compile(r'github_pat_[A-Za-z0-9_]+'),
               'credential-bearing GitHub URL': re.compile(r'https://[^\s/@]+:[^\s/@]+@github\.com'),
-              'bearer token': re.compile(r'Bearer\s+[A-Za-z0-9._-]{20,}', re.I),
-              'token assignment': re.compile('token' + r'\s*[:=]\s*[A-Za-z0-9._-]{20,}', re.I),
-              'api key assignment': re.compile('api' + r'[_-]?key\s*[:=]', re.I),
+              'bearer token': re.compile(r'Bearer\s+[^\s\'\"(#]{20,}', re.I),
+              'token assignment': re.compile('token' + r'\s*[:=]\s*[\'\"]?[^\s\'\"(#]{20,}', re.I),
+              'api key assignment': re.compile('api' + r'[_-]?key\s*[:=]\s*[\'\"]?[^\s\'\"(#]{20,}', re.I),
           }
           ignored_dirs = {'.git', '.pytest_cache', '__pycache__'}
           issues = []

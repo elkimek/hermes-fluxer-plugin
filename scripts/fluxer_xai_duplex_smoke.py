@@ -84,6 +84,7 @@ async def run(args: argparse.Namespace) -> int:
                 "base_url": os.getenv("FLUXER_BASE_URL", ""),
                 "gateway_url": os.getenv("FLUXER_GATEWAY_URL", ""),
                 "allow_all_users": env_truthy("FLUXER_ALLOW_ALL_USERS"),
+                "gateway_state_updates": False,
             },
         )
     )

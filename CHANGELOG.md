@@ -8,6 +8,20 @@ This project uses simple semantic versioning while the plugin is young:
 - minor versions for new user-visible capabilities;
 - major versions only for breaking configuration or runtime behavior.
 
+## [0.2.1] - 2026-06-08
+
+### Changed
+
+- Improved realtime Fluxer voice interruption behavior for speaker/soundbar setups: the assistant now ignores short echo bursts more reliably while still allowing the user to interrupt with natural stop phrases like “stop”, “stop counting”, “enough”, or “wait”.
+- Kept the assistant in the voice room after a barge-in interruption, so stopping speech no longer forces the user to leave and rejoin before continuing the conversation.
+- Made voice auto-join and barge-in handling more stable across reconnects, duplicate voice updates, and restart/recovery paths.
+- Expanded the public voice configuration docs with the new barge-in tuning options.
+
+### Verification
+
+- `pytest -q` → 190 passed
+- Live Fluxer voice-room testing with soundbar echo: no-interrupt echo test passed; short/long/natural stop interruptions worked; assistant stayed joined after interruption.
+
 ## [0.2.0] - 2026-06-06
 
 ### Added
@@ -55,10 +69,10 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Verification
 
-- `PYTHONPATH=. pytest -q` → 159 passed
+- `PYTHONPATH=. pytest -q` → 160 passed
 - `python3 -m py_compile adapter.py livekit_bridge.py xai_realtime.py scripts/*.py`
 - `git diff --check`
-- Greptile local review against `origin/main` → accepted findings fixed: one-shot/streaming LiveKit track cleanup, xAI force-message `response.create`, release version bump, Python 3.10 asyncio timeout compatibility, supervisor spawn isolation from text gateway connectivity, LiveKit publish-failure cleanup, remote audio stream task cleanup including bounded timeout cleanup, stale pending voice-join cleanup, xAI error-event/malformed-event diagnostic wrapping, YAML credential forwarding to the gateway and child voice process, YAML null-value skipping, YAML `channel_ids: null` supervisor scoping, explicit leave pending-join cleanup, delayed unmatched voice-server handoff suppression, outer supervisor absolute script paths, outer supervisor restart watcher, restart-window cancellation on stop, shutdown ProcessLookupError suppression, clean timeout exits in the continuous xAI room loop, non-blocking xAI room LiveKit handoff, non-blocking and serialized STT voice server update handling outside the gateway handler, second `VOICE_SERVER_UPDATE` stale-session cancellation, xAI task cancellation before publisher close, sink timeout event-tail preservation, tracked auto-join process watcher cleanup, non-blocking auto-join start/stop transitions, WAV timeout event-tail preservation, typed barge-in interrupt propagation, and empty ElevenLabs language-code omission
+- Greptile local review against `origin/main` → accepted findings fixed: one-shot/streaming LiveKit track cleanup, xAI force-message `response.create`, release version bump, Python 3.10 asyncio timeout compatibility, supervisor spawn isolation from text gateway connectivity, LiveKit publish-failure cleanup, remote audio stream task cleanup including bounded timeout cleanup, stale pending voice-join cleanup, xAI error-event/malformed-event diagnostic wrapping, YAML credential forwarding to the gateway and child voice process, YAML null-value skipping, YAML `channel_ids: null` supervisor scoping, explicit leave pending-join cleanup, delayed unmatched voice-server handoff suppression, outer supervisor absolute script paths, outer supervisor restart watcher, restart-window cancellation on stop, shutdown ProcessLookupError suppression, clean timeout exits in the continuous xAI room loop, non-blocking xAI room LiveKit handoff including second-update cancellation, diagnostic publish-task exception suppression, non-blocking and serialized STT voice server update handling outside the gateway handler, second `VOICE_SERVER_UPDATE` stale-session cancellation, xAI task cancellation before publisher close, sink timeout event-tail preservation, tracked auto-join process watcher cleanup, non-blocking auto-join start/stop transitions, WAV timeout event-tail preservation, typed barge-in interrupt propagation, and empty ElevenLabs language-code omission
 - Voice env/config audit: 44 `FLUXER_VOICE_*` variables used by code, declared in `plugin.yaml`, and documented in `docs/voice-configuration.md`
 - Private dogfood grep audit for user IDs, voice/guild IDs, local paths, context-cache filename, and assistant-specific names → 0 shippable hits
 
