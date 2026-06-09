@@ -8,6 +8,22 @@ This project uses simple semantic versioning while the plugin is young:
 - minor versions for new user-visible capabilities;
 - major versions only for breaking configuration or runtime behavior.
 
+## [0.2.2] - 2026-06-09
+
+### Changed
+
+- Advertised Fluxer's markdown code-block capability to Hermes so terminal tool-progress messages render full commands as clean fenced code blocks instead of truncated one-line previews on Hermes versions that support this display mode.
+
+### User impact
+
+- When Hermes runs a terminal command from Fluxer, the live progress bubble is easier to read and copy: Fluxer shows the command in its native code-block UI while the final answer remains unchanged.
+
+### Verification
+
+- `PYTHONPATH=<hermes-agent-checkout>:. pytest -q tests/test_plugin_package.py` → 57 passed
+- `PYTHONPATH=<hermes-agent-checkout>:. python -m py_compile adapter.py tests/test_plugin_package.py`
+- Live Hermes/Fluxer gateway restart verified `fluxer` connected and `supports_code_blocks=True` for the standalone plugin.
+
 ## [0.2.1] - 2026-06-08
 
 ### Changed

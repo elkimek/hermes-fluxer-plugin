@@ -1,7 +1,7 @@
 name: fluxer-platform
 label: Fluxer
 kind: platform
-version: 0.2.1
+version: 0.2.2
 description: >
   Fluxer gateway adapter for Hermes Agent. Native Fluxer integration using
   Fluxer's bot REST API for outbound messages, Gateway WebSocket events for

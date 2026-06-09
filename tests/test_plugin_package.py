@@ -47,6 +47,10 @@ def test_plugin_manifest_is_platform_plugin():
     }.issubset(optional)
 
 
+def test_fluxer_adapter_advertises_markdown_code_blocks():
+    assert fluxer_adapter.FluxerAdapter.supports_code_blocks is True
+
+
 def test_voice_env_surface_is_declared_and_documented():
     code_text = "\n".join(
         (ROOT / path).read_text(encoding="utf-8")

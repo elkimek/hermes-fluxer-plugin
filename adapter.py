@@ -836,6 +836,11 @@ def _directory_channel_type(raw: Any) -> Optional[str]:
 class FluxerAdapter(BasePlatformAdapter):
     """Fluxer adapter using bot REST + Gateway websocket APIs."""
 
+    # Fluxer renders fenced markdown code blocks with syntax highlighting/copy UI.
+    # Hermes gateway uses this capability flag to display terminal tool commands
+    # as clean fenced blocks in editable tool-progress messages.
+    supports_code_blocks = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("fluxer"))
         extra = getattr(config, "extra", {}) or {}
