@@ -7,7 +7,7 @@ Text-first adapter:
 Fluxer self-hosting is still moving, so this adapter intentionally keeps the
 surface conservative and easy to test. Media/rich embeds can layer on once the
 API settles.
-"""
+)"""
 
 from __future__ import annotations
 
@@ -41,6 +41,42 @@ from gateway.platforms.base import (
     cache_image_from_url,
     safe_url_for_log,
 )
+
+
+def _ensure_fluxer_platform_registered() -> None:
+    """Make sure ``Platform(\"fluxer\")`` is a valid enum member.
+
+    When the adapter is instantiated by the Hermes plugin manager, the manager
+    has already registered ``fluxer`` via ``platform_registry`` and
+    ``Platform._missing_`` will create the pseudo-member on first access.
+
+    When the adapter is instantiated from standalone scripts (voice auto-join
+    sidecar, smoke tests), the plugin manager may not have run yet. In that case
+    we register a minimal platform entry ourselves so ``Platform(\"fluxer\")``
+    succeeds and the adapter's ``self.platform`` matches the real key used in
+    ``GatewayRunner.adapters``.
+    """
+    try:
+        Platform("fluxer")
+        return
+    except ValueError:
+        pass
+    try:
+        from gateway.platform_registry import platform_registry, PlatformEntry
+
+        if not platform_registry.is_registered("fluxer"):
+            platform_registry.register(
+                PlatformEntry(
+                    name="fluxer",
+                    label="Fluxer",
+                    adapter_factory=lambda cfg: FluxerAdapter(cfg),
+                    check_fn=lambda: True,
+                    source="plugin",
+                )
+            )
+    except Exception:
+        pass
+
 
 logger = logging.getLogger(__name__)
 
@@ -842,6 +878,7 @@ class FluxerAdapter(BasePlatformAdapter):
     supports_code_blocks = True
 
     def __init__(self, config: PlatformConfig):
+        _ensure_fluxer_platform_registered()
         super().__init__(config, Platform("fluxer"))
         extra = getattr(config, "extra", {}) or {}
         self._gateway_state_updates_enabled = _coerce_bool(extra.get("gateway_state_updates"), True)

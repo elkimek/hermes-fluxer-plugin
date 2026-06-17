@@ -8,6 +8,23 @@ This project uses simple semantic versioning while the plugin is young:
 - minor versions for new user-visible capabilities;
 - major versions only for breaking configuration or runtime behavior.
 
+## [0.2.3] - 2026-06-17
+
+### Fixed
+
+- Restored visible tool-progress and streaming update bubbles in Fluxer chat after a compatibility regression made them silently disappear.
+
+### User impact
+
+- You again see live "⚙️ terminal" and other tool-progress messages while Hermes is working, instead of only seeing the final answer after it finishes.
+
+### Verification
+
+- `python -m py_compile adapter.py` → clean
+- `pytest -q tests/test_plugin_package.py -k 'code_block or platform or adapter'` → 4 passed
+- Live Hermes/Fluxer gateway restart verified `fluxer` connected and the voice auto-join sidecar running.
+- Confirmed a tool-triggering message from Fluxer now renders the progress bubble.
+
 ## [0.2.2] - 2026-06-09
 
 ### Changed
