@@ -8,6 +8,23 @@ This project uses simple semantic versioning while the plugin is young:
 - minor versions for new user-visible capabilities;
 - major versions only for breaking configuration or runtime behavior.
 
+
+## [0.2.4] - 2026-07-01
+
+### Fixed
+
+- Restored compatibility with newer Hermes gateway reconnect calls by accepting the `connect(is_reconnect=...)` lifecycle keyword.
+- Preserved reconnect behavior by skipping startup-only native command registration when Hermes calls the public reconnect path.
+
+### User impact
+
+- Fluxer no longer fails gateway startup or reconnect with `FluxerAdapter.connect() got an unexpected keyword argument 'is_reconnect'` on newer Hermes versions.
+
+### Verification
+
+- `pytest -q` → 196 passed locally.
+- Live installed-plugin smoke verified `connect(is_reconnect=True)` succeeds against the Hermes Fluxer plugin copy.
+
 ## [0.2.3] - 2026-06-17
 
 ### Fixed

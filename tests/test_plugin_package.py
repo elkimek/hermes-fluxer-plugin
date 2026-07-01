@@ -1,6 +1,7 @@
 from pathlib import Path
 import ast
 import asyncio
+import inspect
 import os
 import time
 from unittest.mock import AsyncMock
@@ -863,6 +864,41 @@ def test_connect_guard_only_requires_bot_token_because_base_url_has_default():
 
     assert "if not self.bot_token:" in connect_source
     assert "if not self.base_url or not self.bot_token:" not in connect_source
+
+
+@pytest.mark.asyncio
+async def test_connect_accepts_gateway_reconnect_keyword(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "gateway_state_updates": False})
+    )
+    adapter._connect_gateway_once = AsyncMock()
+    adapter._maybe_register_native_commands = AsyncMock()
+    adapter._voice_supervisor.start = lambda: None
+
+    signature = inspect.signature(adapter.connect)
+    assert signature.parameters["is_reconnect"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    assert await adapter.connect(is_reconnect=True) is True
+    adapter._connect_gateway_once.assert_awaited_once()
+    adapter._maybe_register_native_commands.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_initial_connect_still_registers_native_commands(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "gateway_state_updates": False})
+    )
+    adapter._connect_gateway_once = AsyncMock()
+    adapter._maybe_register_native_commands = AsyncMock()
+    adapter._voice_supervisor.start = lambda: None
+
+    assert await adapter.connect() is True
+    adapter._connect_gateway_once.assert_awaited_once()
+    adapter._maybe_register_native_commands.assert_awaited_once()
 
 
 @pytest.mark.asyncio
