@@ -1014,7 +1014,7 @@ class FluxerAdapter(BasePlatformAdapter):
         if self._gateway_state_updates_enabled:
             super()._mark_disconnected()
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.bot_token:
             self._set_fatal_error(
                 "missing_config",
@@ -1026,7 +1026,8 @@ class FluxerAdapter(BasePlatformAdapter):
             self._closing = False
             self._mark_connected()
             await self._connect_gateway_once()
-            await self._maybe_register_native_commands()
+            if not is_reconnect:
+                await self._maybe_register_native_commands()
             self._voice_supervisor.start()
             return True
         except Exception as exc:
