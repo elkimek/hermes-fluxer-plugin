@@ -2,7 +2,9 @@ from pathlib import Path
 import ast
 import asyncio
 import inspect
+import json
 import os
+import sys
 import time
 from unittest.mock import AsyncMock, call
 
@@ -622,15 +624,15 @@ def test_plugin_manifest_is_platform_plugin():
     }.issubset(optional)
 
 
-def test_release_metadata_matches_v033_changelog():
+def test_release_metadata_matches_v040_changelog():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = tomllib.load(handle)["project"]
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert manifest["version"] == "0.3.3"
-    assert project["version"] == "0.3.3"
-    assert "## [0.3.3] - 2026-08-30" in changelog
+    assert manifest["version"] == "0.4.0"
+    assert project["version"] == "0.4.0"
+    assert "## [0.4.0] - 2026-09-08" in changelog
 
 
 def test_fluxer_adapter_advertises_markdown_code_blocks():
@@ -880,6 +882,125 @@ def test_multiplexed_adapter_reads_active_profile_scope_not_process_env(monkeypa
     assert adapter._allowed_user_ids == {"secondary-user"}
     assert child_env["FLUXER_BOT_TOKEN"] == "secondary-token"
     assert child_env["XAI_API_KEY"] == "secondary-xai"
+
+
+def _stub_module(name: str, **attrs):
+    import types as _types
+
+    mod = _types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    return mod
+
+
+def _install_gateway_shared_helper(monkeypatch, get_scoped_secret):
+    monkeypatch.setitem(sys.modules, "gateway", _stub_module("gateway", __path__=[]))
+    monkeypatch.setitem(sys.modules, "gateway.platforms", _stub_module("gateway.platforms", __path__=[]))
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.platforms._shared",
+        _stub_module("gateway.platforms._shared", get_scoped_secret=get_scoped_secret),
+    )
+
+
+def test_fluxer_env_prefers_gateway_shared_helper(monkeypatch):
+    """When Hermes' sanctioned scoped-secret helper is importable, _fluxer_env
+    delegates to it (profile scope / default-profile fallback semantics live
+    there) instead of reading os.environ directly."""
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "env-token")
+    calls = []
+
+    def get_scoped_secret(name, default=None):
+        calls.append(name)
+        return "shared-val" if name == "FLUXER_BOT_TOKEN" else default
+
+    _install_gateway_shared_helper(monkeypatch, get_scoped_secret)
+    assert fluxer_adapter._fluxer_env("FLUXER_BOT_TOKEN") == "shared-val"
+    assert fluxer_adapter._fluxer_env("FLUXER_UNSET", "dflt") == "dflt"
+    assert calls == ["FLUXER_BOT_TOKEN", "FLUXER_UNSET"]
+
+
+class _UnscopedSecretError(RuntimeError):
+    pass
+
+
+def test_fluxer_env_legacy_scope_raise_falls_back_to_os_env(monkeypatch):
+    """Legacy Hermes: agent.secret_scope.get_secret fails closed with
+    UnscopedSecretError when unscoped under multiplexing; _fluxer_env must fall
+    back to os.environ instead of propagating the raise."""
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "env-token")
+    monkeypatch.setitem(sys.modules, "gateway", None)  # no shared helper
+
+    def get_secret(name, default=None):
+        raise _UnscopedSecretError()
+
+    monkeypatch.setitem(sys.modules, "agent", _stub_module("agent", __path__=[]))
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.secret_scope",
+        _stub_module(
+            "agent.secret_scope",
+            UnscopedSecretError=_UnscopedSecretError,
+            get_secret=get_secret,
+        ),
+    )
+    assert fluxer_adapter._fluxer_env("FLUXER_BOT_TOKEN") == "env-token"
+    assert fluxer_adapter._fluxer_env("FLUXER_UNSET", "dflt") == "dflt"
+    assert fluxer_adapter._fluxer_env("FLUXER_UNSET") is None
+
+
+def test_fluxer_env_older_host_falls_back_to_plain_os_getenv(monkeypatch):
+    """Hermes without either scope API: every env read is plain os.getenv."""
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "env-token")
+    monkeypatch.setitem(sys.modules, "gateway", None)
+    monkeypatch.setitem(sys.modules, "agent", None)
+    assert fluxer_adapter._fluxer_env("FLUXER_BOT_TOKEN") == "env-token"
+    assert fluxer_adapter._fluxer_env("FLUXER_UNSET", "dflt") == "dflt"
+
+
+class _RecordingWs:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, data) -> None:
+        self.sent.append(data)
+
+
+@pytest.mark.asyncio
+async def test_ready_asserts_presence_via_op3_update(monkeypatch):
+    """After a READY dispatch the adapter re-asserts the configured presence
+    with an opcode-3 update on the live websocket."""
+    monkeypatch.delenv("FLUXER_PRESENCE_STATUS", raising=False)
+    monkeypatch.delenv("FLUXER_PRESENCE_AFK", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "presence_status": "dnd"})
+    )
+    ws = _RecordingWs()
+    adapter._ws = ws
+    await adapter._handle_gateway_dispatch({"op": 0, "t": "READY", "d": {"user": {"id": "bot-1"}}})
+    assert adapter.bot_user_id == "bot-1"
+    assert adapter._gateway_ready_event.is_set()
+    assert len(ws.sent) == 1
+    sent = json.loads(ws.sent[0])
+    assert sent["op"] == 3
+    assert sent["d"]["status"] == "dnd"
+    assert sent["d"]["afk"] is False
+
+
+@pytest.mark.asyncio
+async def test_ready_presence_send_failure_is_tolerated():
+    """Presence is best-effort: a failing websocket send on READY must not
+    break the gateway session (warning + continue)."""
+    class _FailingWs:
+        async def send(self, data) -> None:
+            raise RuntimeError("boom")
+
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+    adapter._ws = _FailingWs()
+    await adapter._handle_gateway_dispatch({"op": 0, "t": "READY", "d": {"user": {"id": "bot-1"}}})
+    assert adapter._gateway_ready_event.is_set()
 
 
 def test_multiplexed_voice_child_env_drops_primary_fluxer_values_and_uses_profile_extras(monkeypatch):
@@ -2438,3 +2559,77 @@ def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():
     assert "async def publish_pcm16" in source
     assert "def pcm16_publisher" in source
     assert "AsyncIterator[bytes]" in source
+
+
+def test_identify_payload_includes_online_presence_by_default():
+    payload = fluxer_adapter._build_identify_payload("app.secret")
+
+    assert payload["op"] == 2
+    assert payload["d"]["presence"] == {"status": "online", "afk": False}
+
+
+def test_identify_payload_respects_custom_presence():
+    payload = fluxer_adapter._build_identify_payload(
+        "app.secret", presence_status="dnd", presence_afk=True
+    )
+
+    assert payload["d"]["presence"] == {"status": "dnd", "afk": True}
+
+
+def test_presence_update_payload_shape():
+    payload = fluxer_adapter._build_presence_update_payload("idle")
+
+    assert payload == {"op": 3, "d": {"status": "idle", "afk": False, "mobile": False}}
+
+
+def test_presence_update_payload_custom_flags():
+    payload = fluxer_adapter._build_presence_update_payload("online", afk=True, mobile=True)
+
+    assert payload["d"] == {"status": "online", "afk": True, "mobile": True}
+
+
+def test_presence_status_normalization():
+    assert fluxer_adapter._coerce_presence_status("DND") == "dnd"
+    assert fluxer_adapter._coerce_presence_status("offline") == "invisible"
+    assert fluxer_adapter._coerce_presence_status("bogus") == "online"
+    assert fluxer_adapter._coerce_presence_status(None) == "online"
+    assert fluxer_adapter._coerce_presence_status("") == "online"
+    assert fluxer_adapter._coerce_presence_status(" invisible ") == "invisible"
+
+
+def test_presence_settings_parse_from_env(monkeypatch):
+    monkeypatch.setenv("FLUXER_PRESENCE_STATUS", "dnd")
+    monkeypatch.setenv("FLUXER_PRESENCE_AFK", "true")
+
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+
+    assert adapter._presence_status == "dnd"
+    assert adapter._presence_afk is True
+
+
+def test_presence_settings_parse_from_extra_config(monkeypatch):
+    monkeypatch.delenv("FLUXER_PRESENCE_STATUS", raising=False)
+    monkeypatch.delenv("FLUXER_PRESENCE_AFK", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "presence_status": "idle", "presence_afk": "true"},
+        )
+    )
+
+    assert adapter._presence_status == "idle"
+    assert adapter._presence_afk is True
+
+
+def test_presence_settings_default_to_online(monkeypatch):
+    monkeypatch.delenv("FLUXER_PRESENCE_STATUS", raising=False)
+    monkeypatch.delenv("FLUXER_PRESENCE_AFK", raising=False)
+
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+
+    assert adapter._presence_status == "online"
+    assert adapter._presence_afk is False

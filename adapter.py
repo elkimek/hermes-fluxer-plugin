@@ -86,6 +86,8 @@ _RECONNECT_MAX_DELAY = 60.0
 _HEARTBEAT_ACK_TIMEOUT_FACTOR = 2.5
 _REST_RATE_LIMIT_MAX_ATTEMPTS = 3
 _REST_RATE_LIMIT_MAX_DELAY = 60.0
+_PRESENCE_STATUSES = frozenset({"online", "idle", "dnd", "invisible", "offline"})
+_DEFAULT_PRESENCE_STATUS = "online"
 _DEFAULT_BACKLOG_LIMIT = 25
 _DEFAULT_BACKLOG_BOOTSTRAP_SECONDS = 120
 _MENTION_EVERYONE_RE = re.compile(r"@(everyone|here)\b", re.IGNORECASE)
@@ -112,12 +114,28 @@ def _fluxer_env(name: str, default: Any = None) -> Any:
     Newer Hermes releases keep each multiplexed profile's ``.env`` in a
     context-local secret scope. Falling back to raw ``os.getenv`` is safe only
     on older Hermes versions that do not provide that scope API.
+
+    Under multiplexing, the DEFAULT profile is constructed and validated
+    *unscoped* (``agent.secret_scope.get_secret`` raises
+    ``UnscopedSecretError`` there), so prefer Hermes' own
+    ``gateway.platforms._shared.get_scoped_secret`` helper, which mirrors the
+    default-profile fallback: scoped miss -> ``os.environ`` (that profile's
+    own value), unscoped read -> ``os.environ`` instead of raising.
     """
     try:
-        from agent.secret_scope import get_secret
+        from gateway.platforms._shared import get_scoped_secret
+    except ImportError:
+        get_scoped_secret = None
+    if get_scoped_secret is not None:
+        return get_scoped_secret(name, default)
+    try:
+        from agent.secret_scope import UnscopedSecretError, get_secret
     except ImportError:
         return os.getenv(name, default)
-    return get_secret(name, default)
+    try:
+        return get_secret(name, default)
+    except UnscopedSecretError:
+        return os.getenv(name, default)
 
 
 def _voice_child_process_env() -> dict[str, str]:
@@ -196,7 +214,30 @@ def _api_base(base_url: str) -> str:
     return f"{base}/api"
 
 
-def _build_identify_payload(bot_token: str) -> Dict[str, Any]:
+def _coerce_presence_status(value: Any, default: str = _DEFAULT_PRESENCE_STATUS) -> str:
+    """Normalize a presence status string; unknown values fall back to default.
+
+    Fluxer converts ``offline`` to ``invisible`` server-side, so accepting it
+    here keeps the payload canonical while still honoring explicit config.
+    """
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in _PRESENCE_STATUSES:
+        return "invisible" if text == "offline" else text
+    return default
+
+
+def _build_identify_payload(
+    bot_token: str,
+    presence_status: str = _DEFAULT_PRESENCE_STATUS,
+    presence_afk: bool = False,
+) -> Dict[str, Any]:
+    """Build Fluxer's opcode-2 identify payload, including initial presence.
+
+    Opcode 2 optionally carries a ``presence`` object (status + afk) so the
+    gateway shows the bot as online/idle/dnd/invisible immediately.
+    """
     return {
         "op": 2,
         "d": {
@@ -206,6 +247,29 @@ def _build_identify_payload(bot_token: str) -> Dict[str, Any]:
                 "browser": "hermes",
                 "device": "hermes",
             },
+            "presence": {
+                "status": _coerce_presence_status(presence_status),
+                "afk": bool(presence_afk),
+            },
+        },
+    }
+
+
+def _build_presence_update_payload(
+    status: str,
+    afk: bool = False,
+    mobile: bool = False,
+) -> Dict[str, Any]:
+    """Build Fluxer's opcode-3 presence update payload.
+
+    Sent after READY to (re)assert the bot status on every gateway session.
+    """
+    return {
+        "op": 3,
+        "d": {
+            "status": _coerce_presence_status(status),
+            "afk": bool(afk),
+            "mobile": bool(mobile),
         },
     }
 
@@ -987,6 +1051,13 @@ class FluxerAdapter(BasePlatformAdapter):
             _fluxer_env("FLUXER_GATEWAY_URL") or extra.get("gateway_url") or ""
         )
         self.bot_user_id: Optional[str] = str(extra.get("bot_user_id")) if extra.get("bot_user_id") else None
+        self._presence_status = _coerce_presence_status(
+            _fluxer_env("FLUXER_PRESENCE_STATUS") or extra.get("presence_status")
+        )
+        self._presence_afk = _coerce_bool(
+            _fluxer_env("FLUXER_PRESENCE_AFK", extra.get("presence_afk")),
+            False,
+        )
         self._allowed_user_ids = _split_ids(_fluxer_env("FLUXER_ALLOWED_USERS") or extra.get("allowed_users"))
         self._allow_all_users = _coerce_bool(_fluxer_env("FLUXER_ALLOW_ALL_USERS", extra.get("allow_all_users")), False)
         self._backlog_enabled = str(
@@ -2427,6 +2498,26 @@ class FluxerAdapter(BasePlatformAdapter):
         await self._ws.send(json.dumps(payload))
         return True
 
+    async def _send_presence_update(self) -> None:
+        """Assert bot presence via opcode 3 after a successful READY.
+
+        Identify already carries the initial presence; this re-sends it on
+        every session so reconnects cannot leave the bot stuck as offline.
+        Failure is logged and tolerated — presence is best-effort.
+        """
+        payload = _build_presence_update_payload(
+            self._presence_status,
+            afk=self._presence_afk,
+        )
+        try:
+            success = await self._send_gateway_payload(payload)
+            if success:
+                logger.info("Fluxer presence update sent: status=%s", self._presence_status)
+            else:
+                logger.debug("Fluxer presence update skipped: websocket unavailable")
+        except Exception as exc:
+            logger.warning("Fluxer presence update failed (continuing): %s", exc)
+
     async def wait_until_gateway_ready(self, timeout: float = 10.0) -> bool:
         """Wait until Fluxer gateway identification has completed with READY."""
         if self._gateway_ready_event.is_set():
@@ -2756,7 +2847,15 @@ class FluxerAdapter(BasePlatformAdapter):
         if op == 10:  # HELLO
             interval = int(((payload.get("d") or {}).get("heartbeat_interval") or 41250))
             if self._ws is not None:
-                await self._ws.send(json.dumps(_build_identify_payload(self.bot_token)))
+                await self._ws.send(
+                    json.dumps(
+                        _build_identify_payload(
+                            self.bot_token,
+                            presence_status=self._presence_status,
+                            presence_afk=self._presence_afk,
+                        )
+                    )
+                )
                 # Fluxer's hosted gateway also tolerates/expects an
                 # immediate heartbeat; waiting a full interval can trip hosted
                 # gateway 4009 heartbeat-timeout closes during dogfood sessions.
@@ -2785,6 +2884,7 @@ class FluxerAdapter(BasePlatformAdapter):
             if user.get("id"):
                 self.bot_user_id = str(user["id"])
             self._gateway_ready_event.set()
+            await self._send_presence_update()
             return
         if event_name == "INTERACTION_CREATE":
             await self._handle_interaction_create(data)

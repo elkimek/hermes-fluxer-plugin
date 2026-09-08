@@ -9,6 +9,25 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.4.0] - 2026-09-08
+
+### Added
+
+- Bot presence: the Identify (opcode 2) payload now announces `FLUXER_PRESENCE_STATUS` (`online`, `idle`, `dnd`, `invisible`; default `online`) and `FLUXER_PRESENCE_AFK` (default `false`), and an opcode-3 presence update re-asserts it after every READY so reconnect loops cannot leave the bot stuck as offline. The Hermes bot now shows as online (or the configured status) in the Fluxer UI instead of appearing offline while connected; `FLUXER_PRESENCE_STATUS=invisible` restores the old appear-offline behavior.
+
+### Fixed
+
+- `_fluxer_env` now reads settings through Hermes' `gateway.platforms._shared.get_scoped_secret` helper (falling back to `agent.secret_scope.get_secret` and raw `os.getenv` on older hosts). On Hermes gateways running with `gateway.multiplex_profiles` enabled (v0.21+), the default profile's adapter is validated and constructed outside any `set_secret_scope(...)` block, where `get_secret` fails closed with `UnscopedSecretError`; the old helper raised there and the platform failed to start with "No adapter available for fluxer".
+
+### Notes
+
+- Fluxer delivers presence only to clients that hold a presence subscription (friendship, group DM, or shared guild membership). A 1:1 DM does not subscribe, so DM partners must add the bot as a friend for the status to appear (bot flags `FRIENDLY_BOT` / `FRIENDLY_BOT_MANUAL_APPROVAL` govern auto-accept).
+
+### Verification
+
+- 13 new unit tests cover identify presence, opcode-3 payload shape, status normalization, config parsing, deterministic env-helper branch coverage (shared `get_scoped_secret` helper, legacy `UnscopedSecretError` fallback, plain `os.getenv` older hosts — via controlled module stubs, no Hermes install required), and the READY→opcode-3 lifecycle including send-failure tolerance (full suite: 245 passed).
+- Live-verified against Fluxer: presence updates are accepted by the gateway (SESSIONS_REPLACE broadcast) and cached as online, and the adapter reconnects on a multiplexed Hermes host.
+
 ## [0.3.3] - 2026-08-30
 
 ### Fixed
@@ -107,6 +126,7 @@ This project uses simple semantic versioning while the plugin is young:
 - `python -m py_compile adapter.py` → clean.
 - `pytest -q` → 200 passed locally.
 - Regression coverage verifies UTF-16-safe long-message chunking, non-racy intermediate verification, and exact final verification.
+
 
 ## [0.2.4] - 2026-07-01
 

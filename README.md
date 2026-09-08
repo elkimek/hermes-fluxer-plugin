@@ -82,6 +82,7 @@ Implemented:
 - home-channel delivery for cron jobs and notifications
 - mention-gated group-chat behavior
 - reconnect handling, heartbeat tracking, and recent-message backlog recovery
+- bot presence status (`online`/`idle`/`dnd`/`invisible`) announced at Identify and re-asserted after every READY
 - optional native Fluxer slash-command registration
 
 Deployment-dependent / best-effort:
@@ -274,6 +275,17 @@ Gateway discovery normally happens through `/gateway/bot`. If your deployment ne
 ```bash
 FLUXER_GATEWAY_URL=wss://your-fluxer.example/gateway
 ```
+
+### Bot presence
+
+The bot announces its presence to the Fluxer gateway in the Identify handshake (opcode 2) and re-asserts it with a presence update (opcode 3) after every READY, so reconnect loops cannot leave the bot stuck as offline.
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `FLUXER_PRESENCE_STATUS` | `online` | Bot status: `online`, `idle`, `dnd`, or `invisible`. `offline` is accepted and converted to `invisible` by the gateway. |
+| `FLUXER_PRESENCE_AFK` | `false` | Whether the bot is marked AFK while connected. |
+
+**Known delivery caveat:** Fluxer dispatches presence only to clients that hold a presence subscription for the user (friendship, group DM, or shared guild membership). A 1:1 DM does **not** create a subscription, so a user who merely DMs the bot still sees it as offline. To show the bot online to a user, ensure a FRIEND relationship (bot flags `FRIENDLY_BOT` / `FRIENDLY_BOT_MANUAL_APPROVAL` govern auto-accept) or share a guild.
 
 ### Group-chat response behavior
 
