@@ -3691,9 +3691,10 @@ class FluxerAdapter(BasePlatformAdapter):
         safe_update = _sanitize_voice_server_update(data, matched_pending_join=matched)
         self._last_voice_server_update = safe_update
         logger.info(
-            "Fluxer voice server update captured endpoint=%s has_token=%s matched_pending_join=%s channel=%s guild=%s connection=%s",
+            "Fluxer voice server update captured endpoint=%s has_token=%s has_e2ee_key=%s matched_pending_join=%s channel=%s guild=%s connection=%s",
             safe_url_for_log(str(safe_update.get("endpoint") or "")),
             safe_update.get("has_token"),
+            safe_update.get("has_e2ee_key"),
             matched,
             safe_update.get("channel_id") or "<none>",
             safe_update.get("guild_id") or "<dm>",
