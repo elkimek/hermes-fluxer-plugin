@@ -33,6 +33,7 @@ from scripts.fluxer_stt_voice_loop import (
     safe_stt_summary,
     transcribe_with_provider,
     voice_mode_ack,
+    voice_output_requires_xai,
     voice_recall_time_window,
     write_pcm16_wav,
 )
@@ -350,6 +351,11 @@ def test_parse_args_defaults_to_realtime_voice_stack(monkeypatch):
         "FLUXER_VOICE_SAMPLE_RATE",
         "FLUXER_VOICE_FRAME_MS",
         "FLUXER_VOICE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_STT_PROVIDER",
+        "FLUXER_VOICE_STT_MODEL",
+        "FLUXER_VOICE_BRAIN_PROVIDER",
+        "FLUXER_VOICE_HERMES_URL",
+        "FLUXER_VOICE_HERMES_MODEL",
     ):
         monkeypatch.delenv(key, raising=False)
     args = parse_args(["--channel-id", "voice-room"])
@@ -1454,3 +1460,11 @@ def test_stt_voice_loop_interrupts_publisher_during_cancellation_cleanup():
     assert "raise" in cancellation_block
     assert "await publisher.close(wait_for_playout=False, flush_remainder=False)" not in cancellation_block
     assert "shutdown_requested.set()\n        finished.set()" not in source
+
+
+def test_voice_output_requires_xai_only_for_xai_providers():
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="local", brain_provider="hermes")) is False
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="elevenlabs", brain_provider="hermes")) is False
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="xai", brain_provider="hermes")) is True
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="local", brain_provider="xai-fast")) is True
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="local", brain_provider="auto")) is True

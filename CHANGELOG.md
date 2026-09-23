@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased] — deployment compatibility repair
+
+- Import the ElevenLabs STT URL from Hermes transcription_common before the legacy export expires; preserve standalone operation. Verified with Python parsing and Hermes plugin compatibility checks.
+- Voice auto-join: replay the guild's initial voice states from GUILD_CREATE to the voice-state handler, so the supervisor still joins when the target user is already in an allowed voice channel after a restart or reconnect (a missed live event no longer strands the bot outside the room).
+- Voice loop: no longer requires an xAI API key when the configured STT/brain providers do not use xAI. Without a key, replies are voiced through an OpenAI-compatible Kokoro TTS endpoint (`FLUXER_VOICE_KOKORO_URL`, `FLUXER_VOICE_KOKORO_MODEL`, `FLUXER_VOICE_KOKORO_VOICE`), streaming raw PCM16 into the same sink the xAI Realtime client uses.
+- Voice scripts (auto-join supervisor, STT loop): log to stdout so process supervisors capture them; stderr output was previously discarded in the containerized deployment.
+
+
 All notable changes to the Hermes Fluxer plugin are recorded here.
 
 This project uses simple semantic versioning while the plugin is young:

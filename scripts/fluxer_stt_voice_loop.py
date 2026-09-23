@@ -53,17 +53,29 @@ from scripts.fluxer_xai_room_loop import (  # noqa: E402
     _redact_exception_message,
     _wait_for_barge_in,
 )
-from tools.transcription_common import ELEVENLABS_STT_BASE_URL  # noqa: E402
+try:
+    from tools.transcription_common import ELEVENLABS_STT_BASE_URL  # noqa: E402
+except ModuleNotFoundError as exc:
+    if exc.name != "tools.transcription_common":
+        raise
+    # The standalone plugin has no Hermes transcription_common module.
+    ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
+
 from tools.transcription_tools import (  # noqa: E402
     _extract_transcript_text,
     _load_stt_config,
     _transcribe_elevenlabs,
     _transcribe_groq,
     _transcribe_xai,
-    get_env_value,
     is_truthy_value,
     transcribe_audio,
 )
+try:  # Moved out of transcription_tools in the Sep-2026 Hermes decomposition.
+    from hermes_cli.config import get_env_value  # noqa: E402
+    from tools.transcription_cloud import _extract_transcript_text  # noqa: E402
+except ImportError:  # Standalone plugin surface: the local shim ships both.
+    from tools.transcription_tools import _extract_transcript_text, get_env_value  # noqa: E402
+from kokoro_tts import KokoroSpeechClient  # noqa: E402
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 logger = logging.getLogger("fluxer_stt_voice_loop")
@@ -683,13 +695,20 @@ def append_jsonl(path: str | None, item: dict[str, Any]) -> None:
         handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
+def voice_output_requires_xai(args: argparse.Namespace) -> bool:
+    """True when the configured providers still need xAI Realtime up front."""
+
+    return args.stt_provider == "xai" or args.brain_provider in {"xai", "xai-fast", "auto"}
+
+
 async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     load_env_file(Path(args.env_file).expanduser())
     bot_token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
     if not bot_token:
         raise RuntimeError("FLUXER_BOT_TOKEN is required")
-    if not os.getenv("XAI_API_KEY", "").strip():
-        raise RuntimeError("XAI_API_KEY is required")
+    xai_api_key = os.getenv("XAI_API_KEY", "").strip()
+    if not xai_api_key and voice_output_requires_xai(args):
+        raise RuntimeError("XAI_API_KEY is required for the configured xAI providers")
 
     voice_context_cache = load_voice_context_cache(args.voice_context_file)
     args.voice_system_prompt = compose_system_prompt(voice_context_cache=voice_context_cache)
@@ -838,11 +857,14 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     reply_text = ""
                 brain_seconds = time.monotonic() - brain_started
 
-                voice = XAIRealtimeVoiceClient(
-                    sample_rate=args.sample_rate,
-                    voice=args.voice,
-                    instructions="Speak the assistant's answer naturally and without extra preamble. Keep operational replies short, but allow 2-4 spoken sentences when the user asks for depth, introspection, or something personal. Do not add generic follow-up questions. Use subtle xAI speech effects sparingly, like <soft>, [breath], or [chuckle], only when they improve the feeling.",
-                )
+                if xai_api_key:
+                    voice = XAIRealtimeVoiceClient(
+                        sample_rate=args.sample_rate,
+                        voice=args.voice,
+                        instructions="Speak the assistant's answer naturally and without extra preamble. Keep operational replies short, but allow 2-4 spoken sentences when the user asks for depth, introspection, or something personal. Do not add generic follow-up questions. Use subtle xAI speech effects sparingly, like <soft>, [breath], or [chuckle], only when they improve the feeling.",
+                    )
+                else:
+                    voice = KokoroSpeechClient(sample_rate=args.sample_rate)
                 xai_started = time.monotonic()
                 first_audio_seconds: float | None = None
                 barge_in_seconds: float | None = None
@@ -1342,7 +1364,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     _preload_env_file(argv)
     args = parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, stream=sys.stdout)
     # Avoid leaking Authorization/Cookie headers from websocket/http debug logs.
     # Keep our script/adapter diagnostics verbose, but force dependency transport
     # loggers back down to INFO where they do not dump handshake headers.

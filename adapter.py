@@ -3660,6 +3660,22 @@ class FluxerAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("Fluxer voice-state update handler failed")
 
+    async def _handle_guild_voice_states(self, data: Dict[str, Any]) -> None:
+        """Replay the guild's initial voice states to the voice-state handler.
+
+        Fluxer includes current voice states in GUILD_CREATE on a fresh
+        session. Forwarding them lets the auto-join supervisor act on a target
+        user who is already in an allowed channel (a join missed while the
+        supervisor was down or restarting) instead of waiting for the next
+        live VOICE_STATE_UPDATE.
+        """
+        states = data.get("voice_states")
+        if not isinstance(states, list) or self._voice_state_update_handler is None:
+            return
+        for state in states:
+            if isinstance(state, dict):
+                await self._handle_voice_state_update(state)
+
     async def _handle_voice_server_update(self, data: Dict[str, Any]) -> None:
         """Capture Fluxer LiveKit server metadata without retaining the token."""
         guild_id = data.get("guild_id")
@@ -3748,6 +3764,9 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         if event_name == "VOICE_STATE_UPDATE":
             await self._handle_voice_state_update(data)
+            return
+        if event_name == "GUILD_CREATE":
+            await self._handle_guild_voice_states(data)
             return
         if event_name in {"MESSAGE_REACTION_ADD", "REACTION_ADD", "MESSAGE_REACTION_CREATE"}:
             await self._handle_reaction_add(data)

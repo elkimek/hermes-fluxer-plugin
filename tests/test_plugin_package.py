@@ -2336,6 +2336,58 @@ async def test_voice_server_update_bridge_handler_receives_raw_token_safely(monk
 
 
 @pytest.mark.asyncio
+async def test_guild_create_replays_voice_states_to_voice_handler(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    received = []
+    adapter.set_voice_state_update_handler(lambda data: received.append(data))
+
+    await adapter._handle_gateway_dispatch(
+        {
+            "op": 0,
+            "t": "GUILD_CREATE",
+            "d": {
+                "id": "guild-1",
+                "voice_states": [
+                    {
+                        "guild_id": "guild-1",
+                        "channel_id": "voice-1",
+                        "member": {"user": {"id": "user-1"}},
+                    },
+                    "not-a-state",
+                    {
+                        "guild_id": "guild-1",
+                        "channel_id": None,
+                        "member": {"user": {"id": "user-2"}},
+                    },
+                ],
+            },
+        }
+    )
+
+    assert [entry.get("channel_id") for entry in received] == ["voice-1", None]
+    assert [entry["member"]["user"]["id"] for entry in received] == ["user-1", "user-2"]
+
+
+@pytest.mark.asyncio
+async def test_guild_create_without_voice_handler_is_safe():
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+
+    await adapter._handle_gateway_dispatch(
+        {
+            "op": 0,
+            "t": "GUILD_CREATE",
+            "d": {"id": "guild-1", "voice_states": [{"guild_id": "guild-1", "channel_id": "voice-1"}]},
+        }
+    )
+
+
+@pytest.mark.asyncio
 async def test_voice_leave_clears_pending_join_before_delayed_voice_server_update(monkeypatch):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
