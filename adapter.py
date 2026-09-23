@@ -249,6 +249,7 @@ def _build_identify_payload(
                 "os": "linux",
                 "browser": "hermes",
                 "device": "hermes",
+                "e2ee_capable": True,
             },
             "presence": {
                 "status": _coerce_presence_status(presence_status),
@@ -322,6 +323,7 @@ def _sanitize_voice_server_update(data: Dict[str, Any], *, matched_pending_join:
         "connection_id": data.get("connection_id"),
         "endpoint": data.get("endpoint"),
         "has_token": bool(data.get("token")),
+        "has_e2ee_key": bool(data.get("e2ee_key")),
         "matched_pending_join": matched_pending_join,
     }
 

@@ -72,6 +72,18 @@ def _load_livekit_audio_helpers() -> Any:
     return rtc
 
 
+def _livekit_options_with_e2ee(options: Any, e2ee_key: str) -> Any:
+    """Attach FrameCryptor options for an end-to-end encrypted Fluxer voice grant."""
+
+    rtc = _load_livekit_audio_helpers()
+    if options is None:
+        options = rtc.RoomOptions()
+    options.encryption = rtc.E2EEOptions(
+        key_provider_options=rtc.KeyProviderOptions(shared_key=e2ee_key.encode("utf-8"))
+    )
+    return options
+
+
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -309,11 +321,13 @@ class FluxerLiveKitSmokeBridge:
 
         The input may contain the ephemeral LiveKit token. The token is used only
         as a local argument to `Room.connect(...)`; it is never stored on `self`,
-        returned, or logged.
+        returned, or logged. A `e2ee_key` (end-to-end encrypted channels) is used
+        only to configure FrameCryptor locally, with the same guarantees.
         """
 
         endpoint = _string_or_none(update.get("endpoint"))
         token = _string_or_none(update.get("token"))
+        e2ee_key = _string_or_none(update.get("e2ee_key"))
         if not endpoint:
             raise ValueError("Fluxer VOICE_SERVER_UPDATE did not include a LiveKit endpoint")
         if not token:
@@ -326,6 +340,9 @@ class FluxerLiveKitSmokeBridge:
         if room_factory is None:
             room_factory, room_options_factory = _load_livekit_room_factory()
             options = room_options_factory(auto_subscribe=self._auto_subscribe)
+
+        if e2ee_key:
+            options = _livekit_options_with_e2ee(options, e2ee_key)
 
         room = room_factory()
         try:
@@ -349,11 +366,12 @@ class FluxerLiveKitSmokeBridge:
         self._room = room
         self.last_connection = info
         logger.info(
-            "Fluxer LiveKit smoke bridge connected endpoint=%s channel=%s guild=%s connection=%s",
+            "Fluxer LiveKit smoke bridge connected endpoint=%s channel=%s guild=%s connection=%s e2ee=%s",
             info.endpoint,
             info.channel_id or "<none>",
             info.guild_id or "<dm>",
             info.connection_id or "<none>",
+            bool(e2ee_key),
         )
         return info
 

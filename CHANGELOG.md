@@ -2,6 +2,7 @@
 
 ## [Unreleased] — deployment compatibility repair
 
+- Voice E2EE: sessions advertise `e2ee_capable` in the Identify properties and the LiveKit bridge builds FrameCryptor options from the grant's `e2ee_key`, so the bot can hear and speak in end-to-end encrypted voice channels (fml128.ch enables voice E2EE instance-wide; without this the bot received ciphertext noise and produced empty STT transcripts). The `e2ee_key` is used only to build local crypto options — it is never stored, returned, or logged; safe voice updates expose `has_e2ee_key` only.
 - Import the ElevenLabs STT URL from Hermes transcription_common before the legacy export expires; preserve standalone operation. Verified with Python parsing and Hermes plugin compatibility checks.
 - Voice auto-join: replay the guild's initial voice states from GUILD_CREATE to the voice-state handler, so the supervisor still joins when the target user is already in an allowed voice channel after a restart or reconnect (a missed live event no longer strands the bot outside the room).
 - Voice loop: no longer requires an xAI API key when the configured STT/brain providers do not use xAI. Without a key, replies are voiced through an OpenAI-compatible Kokoro TTS endpoint (`FLUXER_VOICE_KOKORO_URL`, `FLUXER_VOICE_KOKORO_MODEL`, `FLUXER_VOICE_KOKORO_VOICE`), streaming raw PCM16 into the same sink the xAI Realtime client uses.

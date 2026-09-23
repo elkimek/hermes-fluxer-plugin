@@ -101,6 +101,19 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Publish assistant audio back to the Fluxer LiveKit room.
 - Add controls: join, leave, mute, listen-only, push-to-talk / wake-word mode.
 
+## Voice E2EE (end-to-end encrypted channels)
+
+Verified against Fluxer docs/source and the live fml128.ch deployment on 2026-09-23:
+
+- Fluxer voice channels use **LiveKit FrameCryptor** E2EE. A guild counts as E2EE-enabled when the instance rollout scope is `platform_wide` or the guild carries the `VOICE_E2EE` feature; fml128.ch is enabled instance-wide.
+- A channel is *E2EE-active* while it has participants and **all** of them are `e2ee_capable`; clients then encrypt their published audio.
+- A session declares its capability in the **Identify properties** (`e2ee_capable: true`) — the gateway reads it from the session context only, never from the opcode-4 join payload. Sessions without it are refused from E2EE-active channels with `VOICE_E2EE_REQUIRED` (bot sessions are always allowed to join).
+- The `VOICE_SERVER_UPDATE` grant for a capable session carries **`e2ee_key`** when the channel is E2EE-active: 32 random bytes, URL-safe base64 without padding. Joining an E2EE-active channel without capability is logged server-side as `voice_e2ee_downgrade` (warning only — clients keep encrypting), and the bot then receives undecryptable frames: noise bursts with DTX gaps that Whisper transcribes as empty.
+- The bridge feeds the key string's UTF-8 bytes into `livekit.rtc` as `RoomOptions.encryption = E2EEOptions(key_provider_options=KeyProviderOptions(shared_key=...))`, mirroring the web client (`ExternalE2EEKeyProvider.setKey` → PBKDF2 over the key string, salt `LKFrameEncryptionKey`, matching the Python SDK defaults). This covers both decryption of remote tracks and encryption of the bot's own published audio.
+- Key lifecycle: the room key is created on demand and attached to the *joiner's* reply (join/move). It is kept while the channel has any voice state or pending capable join and forgotten only when the channel is fully idle, so a capable participant (including the bot) keeps the key stable across later joins. A session already in the room when a key is first created does not receive it retroactively.
+
+Debug recipe when the bot seems deaf on an encrypted instance: check the loop's `has_e2ee_key` flag in the voice-server safe update, the bridge `connected ... e2ee=True` log line, and the gateway pod logs for `voice_e2ee_downgrade` / `has_e2ee_key=false`.
+
 ## Open questions
 
 - Does hosted Fluxer allow bot accounts to join voice with the same gateway flow as users, or does it require additional bot permissions/intents?

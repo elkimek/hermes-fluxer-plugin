@@ -2315,6 +2315,7 @@ async def test_voice_server_update_bridge_handler_receives_raw_token_safely(monk
                 "connection_id": "conn-1",
                 "endpoint": "wss://voice.example.test",
                 "token": "livekit-secret-token",
+                "e2ee_key": "e2ee-super-secret-key",
             },
         }
     )
@@ -2322,17 +2323,20 @@ async def test_voice_server_update_bridge_handler_receives_raw_token_safely(monk
     assert len(received) == 1
     raw, safe = received[0]
     assert raw["token"] == "livekit-secret-token"
+    assert raw["e2ee_key"] == "e2ee-super-secret-key"
     assert safe == {
         "guild_id": "guild-1",
         "channel_id": "voice-1",
         "connection_id": "conn-1",
         "endpoint": "wss://voice.example.test",
         "has_token": True,
+        "has_e2ee_key": True,
         "matched_pending_join": True,
     }
     assert adapter._last_voice_server_update == safe
     assert adapter._last_voice_server_update is not None
     assert "token" not in adapter._last_voice_server_update
+    assert "e2ee_key" not in adapter._last_voice_server_update
 
 
 @pytest.mark.asyncio
@@ -3357,6 +3361,7 @@ def test_identify_payload_includes_online_presence_by_default():
 
     assert payload["op"] == 2
     assert payload["d"]["presence"] == {"status": "online", "afk": False}
+    assert payload["d"]["properties"]["e2ee_capable"] is True
 
 
 def test_identify_payload_respects_custom_presence():
