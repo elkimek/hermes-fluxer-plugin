@@ -3429,3 +3429,202 @@ def test_presence_settings_default_to_online(monkeypatch):
 
     assert adapter._presence_status == "online"
     assert adapter._presence_afk is False
+
+
+def test_reaction_answer_constants_normalize_keycaps():
+    assert fluxer_adapter._REACTION_ANSWER_DIGITS == {
+        "1\u20e3": "1",
+        "2\u20e3": "2",
+        "3\u20e3": "3",
+        "4\u20e3": "4",
+    }
+    assert len(fluxer_adapter._CLARIFY_REACTION_EMOJIS) == 4
+    for emoji, digit in zip(fluxer_adapter._CLARIFY_REACTION_EMOJIS, "1234"):
+        assert fluxer_adapter._normalize_reaction_emoji(emoji) == digit + "\u20e3"
+    assert (
+        fluxer_adapter._normalize_reaction_emoji("2\ufe0f\u20e3")
+        in fluxer_adapter._REACTION_ANSWER_DIGITS
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_clarify_registers_keycap_reactions(monkeypatch):
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+    sent = {}
+
+    async def fake_send(chat_id, content, reply_to=None, metadata=None):
+        sent["chat_id"] = chat_id
+        sent["content"] = content
+        return fluxer_adapter.SendResult(success=True, message_id="m-1")
+
+    reacted = []
+
+    async def fake_add_reaction(chat_id, message_id, emoji):
+        reacted.append((chat_id, message_id, emoji))
+
+    monkeypatch.setattr(adapter, "send", fake_send)
+    monkeypatch.setattr(adapter, "_add_reaction", fake_add_reaction)
+
+    class NullContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    awaiting = []
+    stub = type(sys)("tools.clarify_gateway")
+    stub.mark_awaiting_text = awaiting.append
+    stub._entries = {}
+    stub._lock = NullContext()
+    tools_pkg = type(sys)("tools")
+    tools_pkg.__path__ = []
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.clarify_gateway", stub)
+
+    result = await adapter.send_clarify(
+        chat_id="chan-1",
+        question="Which way?",
+        choices=["dig", "you take it"],
+        clarify_id="c-1",
+        session_key="sess-1",
+        metadata=None,
+    )
+
+    assert result.success is True
+    assert result.message_id == "m-1"
+    assert "❓ Which way?" in sent["content"]
+    assert "dig" in sent["content"] and "you take it" in sent["content"]
+    assert awaiting == ["c-1"]
+    actions = adapter._pending_reaction_actions
+    assert set(actions) == {"m-1:1\u20e3", "m-1:2\u20e3"}
+    assert actions["m-1:1\u20e3"]["kind"] == "clarify"
+    assert actions["m-1:1\u20e3"]["choice"] == "dig"
+    assert actions["m-1:2\u20e3"]["choice"] == "you take it"
+    assert actions["m-1:1\u20e3"]["session_key"] == "sess-1"
+    assert len([r for r in reacted if r[0] == "chan-1"]) == 2
+    assert adapter._pending_clarify_cards["c-1"]["message_id"] == "m-1"
+
+
+@pytest.mark.asyncio
+async def test_retire_clarify_card_cleans_reactions(monkeypatch):
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+    adapter._pending_clarify_cards["c-1"] = {
+        "message_id": "m-1",
+        "chat_id": "chan-1",
+        "content": "❓ q",
+        "emojis": ["1\u20e3", "2\u20e3"],
+        "created_at": 0.0,
+    }
+    adapter._pending_reaction_actions["m-1:1\u20e3"] = {"kind": "clarify", "clarify_id": "c-1"}
+    adapter._pending_reaction_actions["m-9:1\u20e3"] = {"kind": "clarify", "clarify_id": "other"}
+
+    edits = []
+    requests = []
+
+    async def fake_edit(chat_id, message_id, content, **kwargs):
+        edits.append((chat_id, message_id, content))
+        return fluxer_adapter.SendResult(success=True, message_id=message_id)
+
+    async def fake_request(method, path, **kwargs):
+        requests.append((method, path))
+        return {}
+
+    monkeypatch.setattr(adapter, "edit_message", fake_edit)
+    monkeypatch.setattr(adapter, "_request", fake_request)
+
+    await adapter.retire_clarify_card("c-1", "⌛ no response")
+
+    assert "c-1" not in adapter._pending_clarify_cards
+    assert "m-1:1\u20e3" not in adapter._pending_reaction_actions
+    assert "m-9:1\u20e3" in adapter._pending_reaction_actions
+    assert edits and edits[0][0] == "chan-1" and edits[0][1] == "m-1"
+    assert "no response" in edits[0][2]
+    assert len(requests) == 2 and all(method == "DELETE" for method, _ in requests)
+
+
+@pytest.mark.asyncio
+async def test_keycap_reaction_on_bot_dm_message_is_forwarded(monkeypatch):
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+    adapter.bot_user_id = "bot-1"
+    adapter._allow_all_users = False
+    adapter._allowed_user_ids = {"u-1"}
+    adapter._known_channel_ids.add("dm-1")
+
+    fetches = []
+
+    async def fake_request(method, path, **kwargs):
+        fetches.append((method, path))
+        return {"author": {"id": "bot-1", "bot": True}, "content": "Choose: dig or take it"}
+
+    forwarded = []
+
+    async def fake_handle(event):
+        forwarded.append(event)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+    monkeypatch.setattr(adapter, "handle_message", fake_handle, raising=False)
+
+    data = {"user_id": "u-1", "user": {"id": "u-1", "username": "merlin"}}
+    await adapter._maybe_forward_reaction_answer(
+        data, message_id="m-9", channel_id="dm-1", emoji="2\u20e3"
+    )
+    await adapter._maybe_forward_reaction_answer(
+        data, message_id="m-9", channel_id="dm-1", emoji="2\u20e3"
+    )
+
+    assert len(forwarded) == 1
+    event = forwarded[0]
+    assert "[reaction answer]" in event.text
+    assert "merlin" in event.text and "2\u20e3" in event.text
+    assert "Choose: dig or take it" in event.text
+    assert event.source.chat_id == "dm-1"
+    assert event.source.chat_type == "dm"
+    assert len([f for f in fetches if f[0] == "GET"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_reaction_forward_guards(monkeypatch):
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+    adapter.bot_user_id = "bot-1"
+    adapter._allow_all_users = False
+    adapter._allowed_user_ids = {"u-1"}
+    adapter._known_channel_ids.add("dm-1")
+
+    async def fake_request(method, path, **kwargs):
+        return {"author": {"id": "bot-1", "bot": True}, "content": "prompt"}
+
+    forwarded = []
+
+    async def fake_handle(event):
+        forwarded.append(event)
+
+    monkeypatch.setattr(adapter, "_request", fake_request)
+    monkeypatch.setattr(adapter, "handle_message", fake_handle, raising=False)
+
+    data = {"user_id": "u-1", "user": {"id": "u-1", "username": "merlin"}}
+    await adapter._maybe_forward_reaction_answer(
+        {**data, "guild_id": "g-1"}, message_id="m-9", channel_id="dm-1", emoji="2\u20e3"
+    )
+    await adapter._maybe_forward_reaction_answer(
+        data, message_id="m-9", channel_id="dm-1", emoji="\u2705"
+    )
+    await adapter._maybe_forward_reaction_answer(
+        {"user_id": "u-9", "user": {"id": "u-9", "username": "stranger"}},
+        message_id="m-9",
+        channel_id="dm-1",
+        emoji="1\u20e3",
+    )
+    await adapter._maybe_forward_reaction_answer(
+        data, message_id="m-9", channel_id="chan-unknown", emoji="1\u20e3"
+    )
+
+    assert forwarded == []
