@@ -9,6 +9,48 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.5.0] - 2026-10-10
+
+### Added
+
+- Thread replies are now named in two phases, matching the Discord adapter and without requiring any Hermes core change. A thread opened from a triggering message is named from that message (mention markup stripped, whitespace collapsed, capped to the 80 UTF-16-unit name budget), and is renamed to the session title as soon as the session has one — usually it is born with its final name, since the titler runs before the reply is sent. Previously every thread was called "Hermes reply", so a channel with two threads was unreadable.
+- `rename_thread(thread_id, name, only_if_current_name=None)`. `only_if_current_name` declines the rename when the server's current name no longer matches the placeholder this adapter created, which protects a thread a human renamed by hand.
+- `auto_thread_info_for_chat()`, returning `(thread_id, initial_name)` for the last thread this adapter opened underneath a channel.
+- `/title` now renames the thread as well as the session record, via the plugin's `pre_command` hook.
+- The session title is read back from the Hermes session store rather than pushed by the host, so the naming half lives entirely in this plugin. The read goes through the host's own `SessionDB(read_only=True)` handle instead of a hand-rolled `sqlite3` connection: that is the sanctioned path (the shipped `session-lens` plugin reads profiles through it), it builds the read-only URI correctly where a raw `file:` URI would truncate at a `?` or `#` in the home path, and it pools read descriptors rather than opening one per lookup. Only `llm` and `user` titles are used: `derived` is just a slice of the triggering message, i.e. what the placeholder already says. A missing or unreadable store degrades to the placeholder — it never costs a reply.
+
+### Fixed
+
+- `/title` no longer renames another person's thread. Threads are now remembered per participant as well as per chat: the per-chat entry only knows which thread was opened last, so in a channel where two people each had a thread, one person's `/title` renamed the other's — and the placeholder guard did not catch it, because it compared that thread's own cached name. The rename now requires a match on the session's own participant, and declines rather than guessing whenever the target is ambiguous.
+- A title check evicted by the pending-work cap is now cancelled, not merely dropped. The dropped reference left the task polling for the rest of its window, and `disconnect()` could not cancel what the pending set no longer held, so an evicted task could outlive shutdown and rename a thread through a reopened store.
+
+## [0.4.0] - 2026-10-09
+
+### Added
+
+- Reply references now follow the shared `off` / `first` / `all` contract through `FLUXER_REPLY_TO_MODE` and the shared `PlatformConfig.reply_to_mode` field, matching the Discord adapter's `reply_to_mode`. `first` stays the default, so existing installs behave exactly as before; `all` repeats the reference on every split chunk and `off` suppresses it entirely.
+- Opt-in thread replies through `FLUXER_THREAD_REPLIES` and `FLUXER_THREAD_REPLY_CHANNELS`. When enabled, a reply starts a thread from the triggering message and is posted inside it, so a busy channel keeps its main timeline clean. Thread creation is best-effort: if the server refuses, the reply still lands in the parent channel.
+- `create_handoff_thread()`, implementing the shared `BasePlatformAdapter` contract that `/branch` and CLI-to-platform handoffs already call. Those sessions now get their own thread instead of being delivered into the home channel.
+
+### Changed
+
+- `send()` resolves its destination before sending: an explicit `metadata["thread_id"]` still wins, then thread replies, then the channel. The reply reference is placed according to `FLUXER_REPLY_TO_MODE` rather than always landing on the first split chunk.
+
+### Fixed
+
+- One turn's replies stay in one thread. The thread anchor was re-read from the channel's latest inbound message on every send, and the live listener runs alongside backlog recovery, so a message accepted while a reply was being produced could move the rest of that turn into a different thread. The anchor is now pinned when the turn starts (`send_typing`, which Hermes calls at turn start) and released by `stop_typing`, so the progress bubble, the final reply, and any trailing upload share one thread. The pin carries a timestamp so a missed `stop_typing` cannot strand a channel in an old thread.
+- A deleted thread no longer swallows the reply. If the thread this adapter chose is removed while a turn is running, the send now posts to the parent channel instead of failing, for text and uploads alike. The dead thread is dropped from every cache, and auto-threading is disabled for the rest of that turn so the fallback sticks rather than re-creating a thread per send. Only a missing-channel error triggers this: any other failure still surfaces as a delivery error rather than silently landing in the channel.
+- Thread replies actually trigger on the live gateway. The gateway sets `reply_to` only for Feishu/Mattermost/Buzz (and relayed Discord), and supplies no thread id for Fluxer, so an implementation that waited for `reply_to` would never open a thread. When no `reply_to` is present, the adapter now anchors the thread on the most recent inbound message for that channel. A thread opened for a given (channel, message) pair is reused, so one turn's progress bubble and its final reply share a single thread rather than opening one each.
+- Edits and deletes now follow the message into its thread. `edit_message()` and `delete_message()` are given the originating channel, so a message sent into a thread could not be updated or removed, which broke tool-progress bubbles and the partial-delivery cleanup in `_standalone_send()` when an upload failed after text had already been posted to a thread.
+- File, image, video, and voice uploads now honour the same destination and reference rules as text. They previously always posted to the original channel and always attached a reply reference, so a delivery targeting a thread split its text and its media across two places and `FLUXER_REPLY_TO_MODE=off` was ignored for media.
+- Follow-ups in a thread the adapter created are no longer dropped. The thread now records its parent, so it inherits the parent's `FLUXER_ALLOWED_CHANNELS` and `FLUXER_FREE_RESPONSE_CHANNELS` status, and threaded replies seed the mentioned-thread memory so ordinary follow-ups reach the bot under the default mention rules. `FLUXER_STRICT_MENTION` still requires a fresh mention.
+- Forgetting a deleted thread no longer releases another channel's anchor. `_forget_thread()` treated "no cached thread for this anchor" as "this anchor pointed at the thread that died", so a second channel still producing its reply lost its pinned trigger and could anchor on a later message. Only anchors that map to the thread being dropped are released now.
+- A fallback inside a split reply keeps its references on the remaining chunks. The deleted-thread path restored `message_reference` on the current chunk only, but later chunks are rebuilt from the shared payload, so with `FLUXER_REPLY_TO_MODE=all` every continuation arrived unlinked. The reference goes back on the payload and the mode still decides where it lands.
+
+### Verification
+
+- Regression tests cover reply-reference placement in all three modes, thread replies from a channel list and install-wide, fallback to the parent channel when thread creation fails, explicit thread targeting, handoff thread creation including its failure path, edits and deletes routing into a thread (with fallback for messages the adapter did not send), uploads targeting a thread and honouring `FLUXER_REPLY_TO_MODE=off`, thread-to-parent allowlist and free-response inheritance, strict-mention opt-out for created threads, per-channel anchor isolation when a thread is forgotten, and reference placement on the later chunks of a split reply that fell back out of a deleted thread.
+
 ## [0.3.3] - 2026-08-30
 
 ### Fixed

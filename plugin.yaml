@@ -1,15 +1,18 @@
 name: fluxer-platform
 label: Fluxer
 kind: platform
-version: 0.3.3
+version: 0.5.0
 description: >
   Fluxer gateway adapter for Hermes Agent. Native Fluxer integration using
   Fluxer's bot REST API for outbound messages, Gateway WebSocket events for
   inbound dispatches, message edits, agent-requested reactions, pins, reply references,
-  media delivery, and channel-directory enumeration. Component buttons are
-  deployment-dependent and approval prompts include visible slash-command
-  fallback text; native slash commands and Discord-style threads are also
-  deployment-dependent.
+  media delivery, and channel-directory enumeration. Reply references follow the
+  shared off/first/all contract, replies can opt into a thread started from the
+  triggering message, and CLI and /branch handoffs get their own thread. Auto-started
+  threads are named from the triggering message and renamed to the session title once
+  Hermes titles the session, matching the Discord adapter. Component
+  buttons are deployment-dependent and approval prompts include visible slash-command
+  fallback text; native slash commands are also deployment-dependent.
 author: Hermes Fluxer Plugin Contributors
 requires_env:
   - name: FLUXER_BOT_TOKEN
@@ -64,6 +67,18 @@ optional_env:
   - name: FLUXER_FREE_RESPONSE_CHANNELS
     description: "Comma-separated channel IDs where Fluxer responds without mention"
     prompt: "Free-response channel IDs"
+    password: false
+  - name: FLUXER_REPLY_TO_MODE
+    description: "Reply-reference placement: off, first (default; first split chunk only), or all (every chunk). Matches the Discord adapter's reply_to_mode"
+    prompt: "Reply reference mode (off/first/all)"
+    password: false
+  - name: FLUXER_THREAD_REPLIES
+    description: "Post replies in a thread started from the triggering message, in every channel (true/false)"
+    prompt: "Reply in threads everywhere?"
+    password: false
+  - name: FLUXER_THREAD_REPLY_CHANNELS
+    description: "Comma-separated channel IDs where replies are posted in a thread started from the triggering message"
+    prompt: "Thread-reply channel IDs"
     password: false
   - name: FLUXER_HOME_GUILD_ID
     description: "Fluxer guild/community ID treated as the user's home Hermes workspace"
