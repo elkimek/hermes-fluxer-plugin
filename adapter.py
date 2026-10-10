@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import weakref
@@ -544,6 +545,31 @@ def _state_db_path() -> Optional[Path]:
             home = str(Path.home() / ".hermes")
     path = Path(home) / "state.db"
     return path if path.exists() else None
+
+
+def _open_session_store() -> Optional[Any]:
+    """Hermes' own session store, opened read-only, or ``None`` when unavailable.
+
+    Reads the session title back out of ``state.db`` through core's ``SessionDB``
+    rather than a hand-rolled ``sqlite3`` connection. ``SessionDB`` owns the
+    read-only URI construction (a raw ``file:`` URI assembled with an f-string
+    truncates at a ``?`` or ``#`` in the home path and silently opens the wrong
+    database), pools a bounded set of read descriptors instead of opening one per
+    lookup, and retries the transient ``SQLITE_IOERR`` a warm read-only reader can
+    hit during a sibling process's WAL checkpoint.
+
+    Every failure — no store yet, no Hermes runtime, a store this build cannot
+    read — is a missing name, never a broken turn.
+    """
+    if _state_db_path() is None:
+        return None
+    try:
+        from hermes_state import SessionDB  # type: ignore
+
+        return SessionDB(read_only=True)
+    except Exception as exc:
+        logger.debug("Fluxer session store unavailable: %s", exc)
+        return None
 
 
 def _is_missing_channel_error(exc: BaseException) -> bool:
@@ -1236,6 +1262,11 @@ class FluxerAdapter(BasePlatformAdapter):
         # Text of the most recent inbound messages, keyed by message id: the thread
         # a turn opens is named from the message that triggered it.
         self._inbound_text_by_message: OrderedDict[str, str] = OrderedDict()
+        # Author of those same messages, keyed the same way. A channel can hold one
+        # session per participant, so naming a thread from the *triggering* user's
+        # session is what keeps a busy channel's threads correctly named; core's
+        # lookup refuses to guess between several live users.
+        self._inbound_author_by_message: OrderedDict[str, str] = OrderedDict()
         self._inbound_text_by_message_max = 2000
         # ``chat_id`` -> ``(thread_id, initial_name)`` for the thread this adapter
         # most recently opened underneath that chat: the /title command renames it
@@ -1243,6 +1274,12 @@ class FluxerAdapter(BasePlatformAdapter):
         self._auto_thread_by_chat: OrderedDict[str, tuple[str, str]] = OrderedDict()
         # Live lookups for a thread that is still waiting for its session title.
         self._title_tasks: Dict[str, asyncio.Task] = {}
+        # Hermes' session store, opened lazily and read-only (see
+        # ``_open_session_store``). Opened on first use rather than in ``connect``
+        # because the store may not exist yet when the gateway starts.
+        self._session_db: Optional[Any] = None
+        self._session_db_lock = threading.Lock()
+        self._session_db_off = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._pending_exec_approvals: Dict[str, Dict[str, Any]] = {}
@@ -1298,6 +1335,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._closing = True
         self._running = False
         _LIVE_ADAPTERS.discard(self)
+        self._close_session_store()
         for task in list(self._title_tasks.values()):
             if task and not task.done():
                 task.cancel()
@@ -2039,7 +2077,8 @@ class FluxerAdapter(BasePlatformAdapter):
         # titler runs early in the turn, the thread is opened at send time), in
         # which case the thread is born with its final name and no rename follows.
         placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
-        title = await asyncio.to_thread(self._session_title_for_chat, str(chat_id))
+        author_id = self._inbound_author_by_message.get(str(message_id)) or None
+        title = await asyncio.to_thread(self._session_title_for_chat, str(chat_id), author_id)
         thread_name = _collapse_thread_name(title or "") or placeholder
         try:
             data = await self.create_thread(
@@ -2059,7 +2098,7 @@ class FluxerAdapter(BasePlatformAdapter):
             if created_name != placeholder:
                 self._note_renamed_thread(thread_id, created_name)
             if not title:
-                self._schedule_title_rename(chat_id, thread_id, created_name)
+                self._schedule_title_rename(chat_id, thread_id, created_name, author_id)
         return thread_id
 
     # ── session-title naming for a thread this adapter opened ───────────────────
@@ -2076,61 +2115,85 @@ class FluxerAdapter(BasePlatformAdapter):
         """``(thread_id, name)`` of the thread this adapter opened for ``chat_id``, if any."""
         return self._auto_thread_by_chat.get(str(chat_id))
 
-    def _session_title_for_chat(self, chat_id: str) -> Optional[str]:
-        """Newest ``llm``/``user`` session title for a chat, or ``None``.
+    def _session_title_for_chat(self, chat_id: str, user_id: Optional[str] = None) -> Optional[str]:
+        """The triggering session's title for a chat, or ``None``.
 
-        Reads the Hermes session store read-only: the gateway's auto-title runs in
-        its own thread and is not surfaced to platform plugins, so the title is read
-        back rather than pushed. Any failure is a missing name, never a broken turn.
+        Reads the title back through Hermes' own session store: the gateway's
+        auto-title runs in its own thread and is not surfaced to platform plugins,
+        so the title is read rather than pushed. ``user_id`` narrows the lookup to
+        the participant whose message opened the thread, which is what a channel
+        with several live sessions needs.
+
+        Only a title the model wrote or the user set counts. ``derived`` is skipped
+        deliberately: it is a slice of the triggering message, i.e. what the
+        placeholder already says.
         """
-        path = _state_db_path()
+        store = self._session_store()
         chat_key = str(chat_id or "")
-        if path is None or not chat_key:
+        if store is None or not chat_key:
             return None
-        placeholders = ",".join("?" for _ in _TITLE_RENAME_SOURCES)
         try:
-            import sqlite3
-
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
-            try:
-                row = conn.execute(
-                    "SELECT title FROM sessions WHERE source = ? AND chat_id = ? "
-                    f"AND title IS NOT NULL AND title_source IN ({placeholders}) "
-                    "ORDER BY last_activity_at DESC LIMIT 1",
-                    (str(self.platform.value), chat_key, *_TITLE_RENAME_SOURCES),
-                ).fetchone()
-            finally:
-                conn.close()
+            session_id = store.find_session_by_origin(
+                platform=str(self.platform.value), chat_id=chat_key,
+                user_id=str(user_id) if user_id else None,
+            )
+            if not session_id:
+                return None
+            if store.get_session_title_source(session_id) not in _TITLE_RENAME_SOURCES:
+                return None
+            title = store.get_session_title(session_id)
         except Exception as exc:
             logger.debug("Fluxer session title lookup failed for %s: %s", chat_key, exc)
             return None
-        title = str(row[0]).strip() if row and row[0] else ""
-        return title or None
+        return str(title).strip() or None
 
     def _chat_id_for_session(self, session_key: str) -> Optional[str]:
         """Chat id of the newest session row for a ``session_key``, or ``None``."""
-        path = _state_db_path()
+        store = self._session_store()
         key = str(session_key or "").strip()
-        if path is None or not key:
+        if store is None or not key:
             return None
         try:
-            import sqlite3
-
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
-            try:
-                row = conn.execute(
-                    "SELECT chat_id FROM sessions WHERE session_key = ? AND chat_id IS NOT NULL "
-                    "ORDER BY last_activity_at DESC LIMIT 1",
-                    (key,),
-                ).fetchone()
-            finally:
-                conn.close()
+            rows = store.list_sessions_rich(
+                source=str(self.platform.value), session_key=key, limit=1
+            )
         except Exception as exc:
             logger.debug("Fluxer session lookup failed for %s: %s", key[:64], exc)
             return None
-        return str(row[0]) if row and row[0] else None
+        if not rows:
+            return None
+        chat_id = rows[0].get("chat_id") if isinstance(rows[0], Mapping) else None
+        return str(chat_id) if chat_id else None
 
-    def _schedule_title_rename(self, chat_id: str, thread_id: str, placeholder: str) -> None:
+    def _session_store(self) -> Optional[Any]:
+        """The read-only session store, opened on first use. ``None`` when absent."""
+        if self._session_db is not None or self._session_db_off:
+            return self._session_db
+        with self._session_db_lock:
+            if self._session_db is None and not self._session_db_off:
+                store = _open_session_store()
+                if store is None:
+                    # No store yet (or no runtime): stop retrying, and let a
+                    # reconnect try again — see ``_open_session_store``.
+                    self._session_db_off = True
+                self._session_db = store
+        return self._session_db
+
+    def _close_session_store(self) -> None:
+        """Release the session store handle; a later use reopens it."""
+        store = self._session_db
+        self._session_db = None
+        self._session_db_off = False
+        if store is None:
+            return
+        try:
+            store.close()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Fluxer session store close failed: %s", exc)
+
+    def _schedule_title_rename(
+        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None
+    ) -> None:
         """Watch for this session's title and rename ``thread_id`` when it appears."""
         key = str(thread_id)
         pending = self._title_tasks.get(key)
@@ -2141,13 +2204,17 @@ class FluxerAdapter(BasePlatformAdapter):
         except RuntimeError:
             return
         self._loop = loop
-        task = loop.create_task(self._rename_thread_when_titled(str(chat_id), key, str(placeholder)))
+        task = loop.create_task(
+            self._rename_thread_when_titled(str(chat_id), key, str(placeholder), user_id)
+        )
         self._title_tasks[key] = task
         task.add_done_callback(lambda _t, k=key: self._title_tasks.pop(k, None))
         while len(self._title_tasks) > _TITLE_RENAME_MAX_PENDING:
             self._title_tasks.pop(next(iter(self._title_tasks)))
 
-    async def _rename_thread_when_titled(self, chat_id: str, thread_id: str, placeholder: str) -> None:
+    async def _rename_thread_when_titled(
+        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None
+    ) -> None:
         """Rename a thread to its session title, bounded by a wall-clock window.
 
         Best-effort by design: a session that never gets a title, or a thread a
@@ -2156,7 +2223,7 @@ class FluxerAdapter(BasePlatformAdapter):
         """
         deadline = time.monotonic() + _TITLE_RENAME_WINDOW_SECONDS
         while True:
-            title = await asyncio.to_thread(self._session_title_for_chat, chat_id)
+            title = await asyncio.to_thread(self._session_title_for_chat, chat_id, user_id)
             if title and title != placeholder:
                 try:
                     applied = await self.rename_thread(
@@ -3566,11 +3633,17 @@ class FluxerAdapter(BasePlatformAdapter):
             while len(self._last_inbound_by_chat) > 1000:
                 self._last_inbound_by_chat.popitem(last=False)
             # Keep the trigger text so the thread this turn opens can be named
-            # from the user's own words (mention already stripped above).
+            # from the user's own words (mention already stripped above), and the
+            # trigger's author so the title is read from that participant's session
+            # rather than guessed out of a channel's several.
             self._inbound_text_by_message[msg_id] = text or ""
             self._inbound_text_by_message.move_to_end(msg_id)
+            self._inbound_author_by_message[msg_id] = str(author_id or "")
+            self._inbound_author_by_message.move_to_end(msg_id)
             while len(self._inbound_text_by_message) > self._inbound_text_by_message_max:
                 self._inbound_text_by_message.popitem(last=False)
+            while len(self._inbound_author_by_message) > self._inbound_text_by_message_max:
+                self._inbound_author_by_message.popitem(last=False)
         source = self.build_source(
             chat_id=channel_id,
             chat_name=(data.get("channel") or {}).get("name"),

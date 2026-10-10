@@ -17,7 +17,7 @@ This project uses simple semantic versioning while the plugin is young:
 - `rename_thread(thread_id, name, only_if_current_name=None)`. `only_if_current_name` declines the rename when the server's current name no longer matches the placeholder this adapter created, which protects a thread a human renamed by hand.
 - `auto_thread_info_for_chat()`, returning `(thread_id, initial_name)` for the last thread this adapter opened underneath a channel.
 - `/title` now renames the thread as well as the session record, via the plugin's `pre_command` hook.
-- The session title is read back from the Hermes session store rather than pushed by the host, so the naming half lives entirely in this plugin. Only `llm` and `user` titles are used: `derived` is just a slice of the triggering message, i.e. what the placeholder already says. A missing or unreadable store degrades to the placeholder — it never costs a reply.
+- The session title is read back from the Hermes session store rather than pushed by the host, so the naming half lives entirely in this plugin. The read goes through the host's own `SessionDB(read_only=True)` handle instead of a hand-rolled `sqlite3` connection: that is the sanctioned path (the shipped `session-lens` plugin reads profiles through it), it builds the read-only URI correctly where a raw `file:` URI would truncate at a `?` or `#` in the home path, and it pools read descriptors rather than opening one per lookup. Only `llm` and `user` titles are used: `derived` is just a slice of the triggering message, i.e. what the placeholder already says. A missing or unreadable store degrades to the placeholder — it never costs a reply.
 
 ## [0.4.0] - 2026-10-09
 

@@ -1,16 +1,23 @@
 """Auto-thread naming: placeholder from the trigger, session title when there is one.
 
 Mirrors the Discord adapter's two-phase thread naming, but self-contained in the
-plugin: the gateway's session title is read back from the Hermes session store
-rather than pushed by the host, so no Hermes core change is involved.
+plugin: the gateway's session title is read back through Hermes' own read-only
+``SessionDB`` rather than pushed by the host, so no Hermes core change is involved.
+
+``FakeSessionStore`` below deliberately stands in for that store. It reimplements
+the semantics the plugin depends on — including core's refusal to guess between
+several live participants — against a temp database, so these tests run in the
+standalone plugin repository where the Hermes tree is not importable.
+``test_the_real_store_exposes_what_the_plugin_calls`` covers the same seam in the
+other direction and skips when the runtime is absent.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sqlite3
 import tempfile
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -26,8 +33,12 @@ CREATE TABLE sessions (
     source TEXT,
     chat_id TEXT,
     chat_type TEXT,
+    thread_id TEXT,
+    user_id TEXT,
     title TEXT,
     title_source TEXT,
+    started_at REAL,
+    ended_at REAL,
     last_activity_at REAL
 )
 """
@@ -39,9 +50,75 @@ def _adapter(**extra) -> fluxer_adapter.FluxerAdapter:
     return fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra=options))
 
 
+class FakeSessionStore:
+    """Stand-in for core's ``SessionDB(read_only=True)``, over a temp store.
+
+    Only the calls the plugin makes, with their documented semantics: live sessions
+    only, and a lookup with several distinct participants returns ``None`` rather
+    than handing back another participant's session.
+    """
+
+    def __init__(self, db: Path, *, explode: bool = False) -> None:
+        self.db = db
+        self.explode = explode
+        self.closed = False
+
+    def _rows(self, sql: str, params: tuple = ()) -> list[dict]:
+        if self.explode:
+            raise sqlite3.DatabaseError("store unreadable")
+        conn = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True)
+        try:
+            cursor = conn.execute(sql, params)
+            names = [col[0] for col in cursor.description]
+            return [dict(zip(names, row)) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def find_session_by_origin(self, *, platform, chat_id, thread_id=None, user_id=None):
+        rows = self._rows(
+            "SELECT id, user_id, started_at FROM sessions WHERE LOWER(source) = LOWER(?) "
+            "AND session_key IS NOT NULL AND chat_id = ? AND ended_at IS NULL "
+            "ORDER BY started_at DESC",
+            (platform, str(chat_id)),
+        )
+        if not rows:
+            return None
+        if user_id:
+            exact = [r for r in rows if str(r.get("user_id") or "") == str(user_id)]
+            if exact:
+                return str(exact[0]["id"])
+            if len(rows) > 1:
+                return None
+        elif len({u for u in (str(r.get("user_id") or "").strip() for r in rows) if u}) > 1:
+            return None
+        return str(rows[0]["id"])
+
+    def get_session_title(self, session_id):
+        rows = self._rows("SELECT title FROM sessions WHERE id = ?", (session_id,))
+        return rows[0]["title"] if rows else None
+
+    def get_session_title_source(self, session_id):
+        rows = self._rows("SELECT title, title_source FROM sessions WHERE id = ?", (session_id,))
+        return rows[0]["title_source"] if rows and rows[0]["title"] is not None else None
+
+    def list_sessions_rich(self, *, source=None, session_key=None, limit=20, **_kw):
+        rows = self._rows(
+            "SELECT * FROM sessions WHERE source = ? AND session_key = ?", (source, session_key)
+        )
+        return rows[:limit]
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture
 def state_db(monkeypatch):
-    """A stand-in Hermes session store, reached through HERMES_HOME."""
+    """A stand-in Hermes session store, reached through HERMES_HOME.
+
+    Also installs the fake store as the opener, so an adapter built inside the test
+    reads through it — and, being ``monkeypatch``-scoped, uninstalls it afterwards
+    instead of leaking a global into the next test.
+    """
     home = tempfile.mkdtemp(prefix="fluxer-title-home-")
     db = Path(home) / "state.db"
     conn = sqlite3.connect(db)
@@ -49,21 +126,31 @@ def state_db(monkeypatch):
     conn.commit()
     conn.close()
     monkeypatch.setenv("HERMES_HOME", home)
+    store = FakeSessionStore(db)
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", lambda: store)
     return db
+
+
+@pytest.fixture
+def store(state_db):
+    """The fake store the adapter under test will open (the same instance)."""
+    return fluxer_adapter._open_session_store()
 
 
 def _add_session(db: Path, **row) -> None:
     values = {
         "id": "sess-1", "session_key": "agent:main:fluxer:channel:chan-1:user-1",
         "source": "fluxer", "chat_id": "chan-1", "chat_type": "channel",
-        "title": None, "title_source": None, "last_activity_at": 1.0,
+        "thread_id": None, "user_id": "user-1", "title": None, "title_source": None,
+        "started_at": 1.0, "ended_at": None, "last_activity_at": 1.0,
     }
     values.update(row)
     conn = sqlite3.connect(db)
     conn.execute(
-        "INSERT INTO sessions (id, session_key, source, chat_id, chat_type, title, title_source, "
-        "last_activity_at) VALUES (:id, :session_key, :source, :chat_id, :chat_type, :title, "
-        ":title_source, :last_activity_at)",
+        "INSERT INTO sessions (id, session_key, source, chat_id, chat_type, thread_id, user_id, "
+        "title, title_source, started_at, ended_at, last_activity_at) VALUES (:id, :session_key, "
+        ":source, :chat_id, :chat_type, :thread_id, :user_id, :title, :title_source, :started_at, "
+        ":ended_at, :last_activity_at)",
         values,
     )
     conn.commit()
@@ -97,6 +184,146 @@ def test_derive_auto_thread_name_caps_to_the_name_budget_in_utf16_units():
     assert fluxer_adapter.utf16_len(emoji_name) <= fluxer_adapter._THREAD_NAME_LIMIT
 
 
+# ── the store seam ──────────────────────────────────────────────────────────────
+
+
+def test_no_raw_sqlite_read_is_shipped():
+    """The plugin must not hand-roll a read-only URI: a raw f-string truncates at a
+    '?' or '#' in the home path and silently opens the wrong database. Core's store
+    owns that construction, so adapter.py must not reach for sqlite3 at all."""
+    source = Path(fluxer_adapter.__file__).read_text()
+
+    assert "sqlite3.connect" not in source
+    assert "?mode=ro" not in source
+
+
+def test_the_store_is_opened_lazily_once(monkeypatch):
+    opened: list = []
+
+    def fake_open():
+        opened.append(1)
+        return FakeSessionStore(Path("/nonexistent"))
+
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", fake_open)
+    adapter = _adapter()
+
+    assert adapter._session_store() is not None
+    assert adapter._session_store() is not None
+    assert len(opened) == 1
+
+
+def test_an_absent_store_is_not_retried(monkeypatch):
+    opened: list = []
+
+    def fake_open():
+        opened.append(1)
+        return None
+
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", fake_open)
+    adapter = _adapter()
+
+    assert adapter._session_store() is None
+    assert adapter._session_store() is None
+    assert len(opened) == 1
+
+
+def test_closing_the_store_releases_it_and_allows_a_reopen(monkeypatch):
+    opened: list = []
+
+    def fake_open():
+        store = FakeSessionStore(Path("/nonexistent"))
+        opened.append(store)
+        return store
+
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", fake_open)
+    adapter = _adapter()
+    first = adapter._session_store()
+
+    adapter._close_session_store()
+
+    assert first.closed is True
+    assert adapter._session_db is None
+    assert adapter._session_store() is not first
+    assert len(opened) == 2
+
+
+@pytest.fixture
+def real_read_only_store(tmp_path):
+    """A genuine ``SessionDB`` (core's, not the fake) over a freshly built store.
+
+    Built writable first so core creates its own schema, then reopened read-only —
+    the same handle shape the plugin opens at runtime. Skips where the Hermes
+    runtime is not importable (the standalone plugin CI), which is why the fake
+    above mirrors the semantics instead of us having no coverage at all there.
+    """
+    hermes_state = pytest.importorskip("hermes_state", reason="Hermes runtime not importable")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    writer = hermes_state.SessionDB(db_path=home / "state.db")
+    writer.create_session(
+        session_id="s1", source="fluxer", chat_id="chan-1",
+        session_key="agent:main:fluxer:channel:chan-1:user-1", user_id="user-1",
+    )
+    writer.set_auto_title("s1", "Deploy the thing", source="llm")
+    writer.close()
+
+    store = hermes_state.SessionDB(db_path=home / "state.db", read_only=True)
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+def test_the_real_store_exposes_what_the_plugin_calls(real_read_only_store):
+    """The seam in the other direction: core's real ``SessionDB`` must carry the
+    calls the adapter makes, with the parameters it passes."""
+    store = real_read_only_store
+
+    assert store.read_only is True
+    for name, expected in (
+        ("find_session_by_origin", {"platform", "chat_id", "thread_id", "user_id"}),
+        ("get_session_title", {"session_id"}),
+        ("get_session_title_source", {"session_id"}),
+        ("list_sessions_rich", {"source", "session_key", "limit"}),
+    ):
+        assert hasattr(store, name), f"SessionDB lost {name}"
+        params = set(inspect.signature(getattr(store, name)).parameters)
+        assert expected <= params, f"{name} no longer accepts {expected - params}"
+    assert callable(store.close)
+
+
+def test_the_plugin_reads_a_real_store(monkeypatch, real_read_only_store):
+    """End to end against core's own store: no fake anywhere in the read path."""
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", lambda: real_read_only_store)
+    adapter = _adapter()
+
+    assert adapter._session_title_for_chat("chan-1") == "Deploy the thing"
+    assert adapter._session_title_for_chat("chan-1", "user-1") == "Deploy the thing"
+    assert adapter._session_title_for_chat("no-such-chat") is None
+    assert (
+        adapter._chat_id_for_session("agent:main:fluxer:channel:chan-1:user-1") == "chan-1"
+    )
+
+
+def test_a_write_through_the_store_is_refused(tmp_path):
+    """The handle must be genuinely read-only, not merely treated as such."""
+    hermes_state = pytest.importorskip("hermes_state", reason="Hermes runtime not importable")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    writable = hermes_state.SessionDB(db_path=home / "state.db")
+    writable.create_session(session_id="s1", source="fluxer", chat_id="c1", session_key="k1")
+    writable.close()
+
+    store = hermes_state.SessionDB(db_path=home / "state.db", read_only=True)
+    try:
+        with pytest.raises(Exception):
+            store.set_session_title("s1", "nope")
+    finally:
+        store.close()
+
+
 # ── session title lookup ────────────────────────────────────────────────────────
 
 
@@ -115,24 +342,62 @@ def test_session_title_ignores_derived_titles_and_other_chats(state_db):
     assert adapter._session_title_for_chat("chan-1") is None
 
 
-def test_session_title_prefers_the_most_recent_row(state_db):
+def test_session_title_prefers_the_most_recently_started_session(state_db):
     adapter = _adapter()
-    _add_session(state_db, id="old", title="Older", title_source="llm", last_activity_at=1.0)
-    _add_session(state_db, id="new", title="Newer", title_source="llm", last_activity_at=9.0)
+    _add_session(state_db, id="old", title="Older", title_source="llm", started_at=1.0)
+    _add_session(state_db, id="new", title="Newer", title_source="llm", started_at=9.0)
 
     assert adapter._session_title_for_chat("chan-1") == "Newer"
+
+
+def test_session_title_uses_the_triggering_participants_session(state_db):
+    """A channel holds one session per participant; the caller names which one."""
+    adapter = _adapter()
+    _add_session(state_db, id="a", user_id="user-a", title="A's work", title_source="llm")
+    _add_session(state_db, id="b", user_id="user-b", title="B's work", title_source="llm")
+
+    assert adapter._session_title_for_chat("chan-1", "user-b") == "B's work"
+    assert adapter._session_title_for_chat("chan-1", "user-a") == "A's work"
+
+
+def test_session_title_is_none_when_several_participants_are_live_and_none_is_named(state_db):
+    """Core refuses to guess between participants; the plugin must not either."""
+    adapter = _adapter()
+    _add_session(state_db, id="a", user_id="user-a", title="A's work", title_source="llm")
+    _add_session(state_db, id="b", user_id="user-b", title="B's work", title_source="llm")
+
+    assert adapter._session_title_for_chat("chan-1") is None
+
+
+def test_session_title_ignores_an_ended_session(state_db):
+    adapter = _adapter()
+    _add_session(state_db, title="Finished", title_source="llm", ended_at=5.0)
+
+    assert adapter._session_title_for_chat("chan-1") is None
 
 
 def test_session_title_is_none_without_a_store(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _adapter()
 
+    assert adapter._session_store() is None
     assert adapter._session_title_for_chat("chan-1") is None
 
 
-def test_session_title_survives_an_unreadable_store(state_db):
-    state_db.write_bytes(b"not a database")
+def test_session_title_survives_an_unreadable_store(store):
+    store.explode = True
     adapter = _adapter()
+
+    assert adapter._session_title_for_chat("chan-1") is None
+
+
+def test_session_title_survives_a_store_that_raises_unexpectedly(state_db):
+    adapter = _adapter()
+
+    def boom(**_kw):
+        raise RuntimeError("boom")
+
+    adapter._session_store().find_session_by_origin = boom
 
     assert adapter._session_title_for_chat("chan-1") is None
 
@@ -177,6 +442,29 @@ async def test_thread_is_born_with_the_session_title_when_one_exists(state_db):
 
 
 @pytest.mark.asyncio
+async def test_thread_creation_looks_up_the_triggering_author(store, state_db):
+    adapter = _adapter()
+    _add_session(state_db, user_id="user-b", title="B's work", title_source="llm")
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._inbound_author_by_message["msg-1"] = "user-b"
+    adapter.create_thread = AsyncMock(return_value={"id": "th-1", "name": "B's work"})
+    adapter._schedule_title_rename = lambda *args: None
+    seen: list = []
+    original = store.find_session_by_origin
+
+    def spy(**kwargs):
+        seen.append(kwargs)
+        return original(**kwargs)
+
+    store.find_session_by_origin = spy
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+
+    assert seen and seen[0]["user_id"] == "user-b"
+    assert adapter.create_thread.await_args.args[:2] == ("chan-1", "B's work")
+
+
+@pytest.mark.asyncio
 async def test_thread_without_a_title_yet_is_watched(state_db):
     adapter = _adapter()
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
@@ -186,7 +474,7 @@ async def test_thread_without_a_title_yet_is_watched(state_db):
 
     await adapter._start_thread_from_message("chan-1", "msg-1")
 
-    assert watched == [("chan-1", "th-1", "deploy the thing")]
+    assert watched == [("chan-1", "th-1", "deploy the thing", None)]
 
 
 @pytest.mark.asyncio
@@ -247,14 +535,25 @@ async def test_the_title_is_waited_for_until_it_appears(state_db):
     adapter.rename_thread = AsyncMock(return_value=True)
     results = iter([None, None, "Deploy the thing"])
 
-    def fake_lookup(chat_id):
-        return next(results, "Deploy the thing")
-
-    adapter._session_title_for_chat = fake_lookup
+    adapter._session_title_for_chat = lambda chat_id, user_id=None: next(results, "Deploy the thing")
     with patch.object(fluxer_adapter, "_TITLE_RENAME_POLL_INTERVAL", 0.01):
         await adapter._rename_thread_when_titled("chan-1", "th-1", "deploy the thing")
 
     adapter.rename_thread.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_poller_carries_the_triggering_user(state_db):
+    adapter = _adapter()
+    _add_session(state_db, user_id="user-b", title="B's work", title_source="llm")
+    adapter.rename_thread = AsyncMock(return_value=True)
+
+    with patch.object(fluxer_adapter, "_TITLE_RENAME_POLL_INTERVAL", 0.01):
+        await adapter._rename_thread_when_titled("chan-1", "th-1", "deploy the thing", "user-b")
+
+    adapter.rename_thread.assert_awaited_once_with(
+        "th-1", "B's work", only_if_current_name="deploy the thing"
+    )
 
 
 @pytest.mark.asyncio
