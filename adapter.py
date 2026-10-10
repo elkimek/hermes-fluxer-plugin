@@ -1076,6 +1076,11 @@ class FluxerAdapter(BasePlatformAdapter):
         # message actually landed (bounded like the other per-adapter caches).
         self._message_destinations: OrderedDict[str, str] = OrderedDict()
         self._message_destinations_max = 5000
+        # Threads already opened for a given (chat, anchor message) pair, so one
+        # turn's progress bubble and final reply share a single thread instead of
+        # each creating its own.
+        self._threads_by_anchor: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._threads_by_anchor_max = 1000
         # Parent channel of every thread this adapter created, so a thread
         # inherits its parent's allowlist status and can seed mention memory.
         self._thread_parents: Dict[str, str] = {}
@@ -1822,8 +1827,14 @@ class FluxerAdapter(BasePlatformAdapter):
         """Best-effort thread start from ``message_id``; ``None`` keeps the channel.
 
         Thread creation must never cost a reply, so any failure falls back to the
-        parent channel and the message still lands.
+        parent channel and the message still lands. A thread already opened for
+        this (chat, message) pair is reused, so one turn's progress bubble and its
+        final reply share a thread rather than creating two.
         """
+        key = (str(chat_id), str(message_id))
+        existing = self._threads_by_anchor.get(key)
+        if existing:
+            return existing
         try:
             data = await self.create_thread(
                 str(chat_id), _DEFAULT_THREAD_NAME, message_id=str(message_id)
@@ -1831,7 +1842,13 @@ class FluxerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
             return None
-        return self._remember_thread_id(data, chat_id)
+        thread_id = self._remember_thread_id(data, chat_id)
+        if thread_id:
+            self._threads_by_anchor[key] = thread_id
+            self._threads_by_anchor.move_to_end(key)
+            while len(self._threads_by_anchor) > self._threads_by_anchor_max:
+                self._threads_by_anchor.popitem(last=False)
+        return thread_id
 
     async def _resolve_outbound_target(
         self,
@@ -1853,11 +1870,19 @@ class FluxerAdapter(BasePlatformAdapter):
         started_thread = False
         if explicit_thread_id:
             target_chat_id = explicit_thread_id
-        elif reply_to and self._thread_replies_enabled_for(chat_id):
-            new_thread_id = await self._start_thread_from_message(chat_id, reply_to)
-            if new_thread_id:
-                target_chat_id = new_thread_id
-                started_thread = True
+        elif self._thread_replies_enabled_for(chat_id):
+            # The gateway only sets ``reply_to`` for a few platforms, and supplies
+            # no thread id for Fluxer, so fall back to the most recent inbound
+            # message in this channel as the thread anchor -- otherwise nothing
+            # would ever trigger a thread here.
+            anchor = str(reply_to or "").strip() or str(
+                self._last_inbound_by_chat.get(str(chat_id)) or ""
+            )
+            if anchor:
+                new_thread_id = await self._start_thread_from_message(chat_id, anchor)
+                if new_thread_id:
+                    target_chat_id = new_thread_id
+                    started_thread = True
         # A thread started from the triggering message already carries the parent
         # context, so a second reference inside it is redundant.
         if reply_to and self._reply_to_mode != "off" and not started_thread:

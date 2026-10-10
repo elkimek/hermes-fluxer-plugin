@@ -2676,6 +2676,73 @@ async def test_edit_and_delete_fall_back_to_the_given_channel_for_unknown_messag
 
 
 @pytest.mark.asyncio
+async def test_thread_reply_uses_the_last_inbound_message_when_reply_to_is_absent(monkeypatch):
+    """The gateway supplies no reply_to and no thread id for Fluxer, so the
+    adapter anchors the thread on the most recent inbound message itself."""
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-7"
+    adapter._request = AsyncMock(side_effect=[{"id": "thread-9"}, {"id": "reply-1"}])
+
+    result = await adapter.send("chan-1", "threaded reply")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    assert calls[0].args == ("POST", "/channels/chan-1/messages/user-msg-7/threads")
+    assert calls[1].args == ("POST", "/channels/thread-9/messages")
+
+
+@pytest.mark.asyncio
+async def test_thread_reply_without_reply_to_or_inbound_history_stays_in_the_channel(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._request = AsyncMock(return_value={"id": "reply-1"})
+
+    result = await adapter.send("chan-1", "no anchor available")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    assert len(calls) == 1
+    assert calls[0].args == ("POST", "/channels/chan-1/messages")
+
+
+@pytest.mark.asyncio
+async def test_progress_and_final_reply_share_one_thread(monkeypatch):
+    """Two sends for the same triggering message must not open two threads."""
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-7"
+    adapter._request = AsyncMock(side_effect=[{"id": "thread-9"}, {"id": "p-1"}, {"id": "f-1"}])
+
+    await adapter.send("chan-1", "working…")
+    await adapter.send("chan-1", "done")
+
+    posts = [c.args for c in adapter._request.await_args_list]
+    # Exactly one thread creation, then both messages inside it.
+    assert posts.count(("POST", "/channels/chan-1/messages/user-msg-7/threads")) == 1
+    assert posts[-2:] == [
+        ("POST", "/channels/thread-9/messages"),
+        ("POST", "/channels/thread-9/messages"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_thread_anchor_is_reused_from_an_explicit_reply_to(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "older-msg"
+    adapter._request = AsyncMock(side_effect=[{"id": "thread-9"}, {"id": "reply-1"}])
+
+    await adapter.send("chan-1", "threaded", reply_to="user-msg-1")
+
+    # The explicit reply_to wins over the remembered inbound message.
+    assert adapter._request.await_args_list[0].args == (
+        "POST",
+        "/channels/chan-1/messages/user-msg-1/threads",
+    )
+
+
+@pytest.mark.asyncio
 async def test_upload_targets_an_explicit_thread(monkeypatch, tmp_path):
     monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
     document = tmp_path / "report.pdf"
