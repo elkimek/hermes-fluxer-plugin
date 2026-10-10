@@ -1,14 +1,16 @@
 name: fluxer-platform
 label: Fluxer
 kind: platform
-version: 0.4.0
+version: 0.5.0
 description: >
   Fluxer gateway adapter for Hermes Agent. Native Fluxer integration using
   Fluxer's bot REST API for outbound messages, Gateway WebSocket events for
   inbound dispatches, message edits, agent-requested reactions, pins, reply references,
   media delivery, and channel-directory enumeration. Reply references follow the
   shared off/first/all contract, replies can opt into a thread started from the
-  triggering message, and CLI and /branch handoffs get their own thread. Component
+  triggering message, and CLI and /branch handoffs get their own thread. Auto-started
+  threads are named from the triggering message and renamed to the session title once
+  Hermes titles the session, matching the Discord adapter. Component
   buttons are deployment-dependent and approval prompts include visible slash-command
   fallback text; native slash commands are also deployment-dependent.
 author: Hermes Fluxer Plugin Contributors

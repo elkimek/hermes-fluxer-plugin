@@ -9,6 +9,14 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.5.0] - 2026-10-10
+
+### Added
+
+- Thread replies are now named in two phases, matching the Discord adapter. A thread opened from a triggering message is named from that message (mention markup stripped, whitespace collapsed, capped to the 80 UTF-16-unit name budget), and the gateway's session-title lane renames it to the session title once the first turn is titled. Previously every thread was called "Hermes reply", so a channel with two threads was unreadable.
+- `rename_thread(thread_id, name, only_if_current_name=None)`, so the gateway can rename a Fluxer thread exactly as it renames a Discord one. `only_if_current_name` declines the rename when the server's current name no longer matches the placeholder this adapter created, which protects a thread a human renamed by hand.
+- `auto_thread_info_for_chat()` and `wait_for_auto_thread_info()`, the reporting half of the shared contract the gateway's rename lane drives generically. `auto_thread_info_for_chat("channel")` returns ``(thread_id, initial_name)`` for the last thread this adapter opened underneath that channel; the async form waits (bounded) for this turn's send so the title, which is generated before the reply is sent, still lands on the thread.
+
 ## [0.4.0] - 2026-10-09
 
 ### Added

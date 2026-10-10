@@ -479,6 +479,38 @@ def _split_ids(value: Any) -> set[str]:
 _REPLY_TO_MODES = ("off", "first", "all")
 _DEFAULT_REPLY_TO_MODE = "first"
 _DEFAULT_THREAD_NAME = "Hermes reply"
+# Thread names are budgeted in UTF-16 code units (an astral emoji counts two), the
+# same way the Discord adapter budgets them, so an emoji-heavy title is truncated
+# here rather than rejected by the server.
+_THREAD_NAME_LIMIT = 80
+# Mention markup renders as a pill in the client, never as text a human reads in a
+# thread list: <@123>, <@!123>, <@&123>, <#123>.
+_MENTION_MARKUP_RE = re.compile(r"<@[!&]?\d+>|<#\d+>")
+
+
+def _collapse_thread_name(name: str) -> str:
+    """Platform-safe thread name: mention markup stripped, single line, name-budget capped."""
+    cleaned = _MENTION_MARKUP_RE.sub("", str(name or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+    if utf16_len(cleaned) > _THREAD_NAME_LIMIT:
+        cleaned = cleaned[: _THREAD_NAME_LIMIT - 3].rstrip() + "..."
+        while utf16_len(cleaned) > _THREAD_NAME_LIMIT:
+            cleaned = cleaned[:-4].rstrip() + "..."
+    return cleaned
+
+
+def _derive_auto_thread_name(content: str) -> str:
+    """Placeholder thread name derived from the message that triggered the turn.
+
+    Mirrors the Discord adapter's first phase: the name comes from the user's own
+    words (mention markup stripped, whitespace collapsed, capped to the platform's
+    name budget) so the thread is identifiable the moment it appears. The
+    semantic rename replaces it with the session title once the first turn is
+    titled.
+    """
+    return _collapse_thread_name(content) or _DEFAULT_THREAD_NAME
 
 
 def _is_missing_channel_error(exc: BaseException) -> bool:
@@ -1168,6 +1200,17 @@ class FluxerAdapter(BasePlatformAdapter):
         self._closing = False
         self._seen_message_ids: OrderedDict[str, None] = OrderedDict()
         self._last_inbound_by_chat: OrderedDict[str, str] = OrderedDict()
+        # Text of the most recent inbound messages, keyed by message id: the thread
+        # a turn opens is named from the message that triggered it.
+        self._inbound_text_by_message: OrderedDict[str, str] = OrderedDict()
+        self._inbound_text_by_message_max = 2000
+        # ``chat_id`` -> ``(thread_id, initial_name)`` for the thread this adapter
+        # most recently opened underneath that chat, so the gateway's semantic
+        # rename lane can find it (``auto_thread_info_for_chat``) without the
+        # gateway having to know how threads are addressed here.
+        self._auto_thread_by_chat: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        # Rename-lane waiters, woken by every thread this adapter opens.
+        self._auto_thread_waiters: Dict[str, asyncio.Event] = {}
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._pending_exec_approvals: Dict[str, Dict[str, Any]] = {}
         self._pending_component_actions: Dict[str, Dict[str, Any]] = {}
@@ -1894,6 +1937,8 @@ class FluxerAdapter(BasePlatformAdapter):
         self._mentioned_threads.pop(tid, None)
         for key in [k for k, v in self._threads_by_anchor.items() if v == tid]:
             self._threads_by_anchor.pop(key, None)
+        for chat_key in [k for k, v in self._auto_thread_by_chat.items() if v[0] == tid]:
+            self._auto_thread_by_chat.pop(chat_key, None)
 
     def _pinned_turn_anchor(self, chat_id: str) -> str:
         """Anchor message pinned when the current turn started, else ``""``."""
@@ -1943,9 +1988,13 @@ class FluxerAdapter(BasePlatformAdapter):
         existing = self._threads_by_anchor.get(key)
         if existing:
             return existing
+        # Two-phase naming, same as Discord: the placeholder comes from the message
+        # that triggered the turn, the gateway's rename lane replaces it with the
+        # session title once the first turn is titled.
+        thread_name = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
         try:
             data = await self.create_thread(
-                str(chat_id), _DEFAULT_THREAD_NAME, message_id=str(message_id)
+                str(chat_id), thread_name, message_id=str(message_id)
             )
         except Exception as exc:
             logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
@@ -1956,7 +2005,78 @@ class FluxerAdapter(BasePlatformAdapter):
             self._threads_by_anchor.move_to_end(key)
             while len(self._threads_by_anchor) > self._threads_by_anchor_max:
                 self._threads_by_anchor.popitem(last=False)
+            created_name = str((data or {}).get("name") or thread_name)
+            self._record_auto_thread(chat_id, thread_id, created_name)
         return thread_id
+
+    # ── auto-thread reporting for the gateway's semantic rename lane ────────────
+
+    def _record_auto_thread(self, chat_id: str, thread_id: str, name: str) -> None:
+        """Remember the thread opened for ``chat_id`` and wake the rename lane."""
+        chat_key = str(chat_id)
+        self._auto_thread_by_chat[chat_key] = (str(thread_id), str(name or ""))
+        self._auto_thread_by_chat.move_to_end(chat_key)
+        while len(self._auto_thread_by_chat) > 1000:
+            self._auto_thread_by_chat.popitem(last=False)
+        waiter = self._auto_thread_waiters.get(chat_key)
+        if waiter is not None:
+            waiter.set()
+
+    def auto_thread_info_for_chat(self, chat_id: str) -> Optional[tuple[str, str]]:
+        """``(thread_id, initial_name)`` of the thread this adapter opened for ``chat_id``, if any.
+
+        The semantic-rename lane reads this to find the thread a turn opened
+        underneath a channel without the gateway needing to know how Fluxer
+        addresses threads.
+        """
+        return self._auto_thread_by_chat.get(str(chat_id))
+
+    async def wait_for_auto_thread_info(self, chat_id: str, timeout: float) -> Optional[tuple[str, str]]:
+        """``auto_thread_info_for_chat``, but willing to wait for this turn's send.
+
+        The title lane asks as soon as the session is titled, which is usually a
+        whole send earlier than the thread exists. *timeout* is only a backstop
+        for a turn that never sends.
+        """
+        info = self.auto_thread_info_for_chat(chat_id)
+        if info is not None:
+            return info
+        chat_key = str(chat_id)
+        waiter = self._auto_thread_waiters.get(chat_key)
+        if waiter is None:
+            waiter = asyncio.Event()
+            self._auto_thread_waiters[chat_key] = waiter
+        try:
+            await asyncio.wait_for(waiter.wait(), timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            # Only the waiter we installed; a fired event must not make the next
+            # turn's wait return instantly.
+            if self._auto_thread_waiters.get(chat_key) is waiter:
+                self._auto_thread_waiters.pop(chat_key, None)
+        return self.auto_thread_info_for_chat(chat_id)
+
+    async def _fetch_channel_name(self, channel_id: str) -> Optional[str]:
+        """Current server-side name of a channel or thread, else ``None``."""
+        try:
+            data = await self._request(
+                "GET", f"/channels/{_quote_id(channel_id)}", warn_on_error=False
+            )
+        except Exception as exc:
+            logger.debug("Fluxer channel lookup failed for %s: %s", channel_id, exc)
+            return None
+        if isinstance(data, Mapping):
+            return str(data.get("name") or "")
+        return None
+
+    def _note_renamed_thread(self, thread_id: str, name: str) -> None:
+        """Keep the cached auto-thread name in step with a rename this adapter applied."""
+        tid = str(thread_id)
+        for chat_key, (cached_id, _cached_name) in list(self._auto_thread_by_chat.items()):
+            if cached_id == tid:
+                self._auto_thread_by_chat[chat_key] = (cached_id, name)
+
 
     async def _resolve_outbound_target(
         self,
@@ -2046,6 +2166,42 @@ class FluxerAdapter(BasePlatformAdapter):
             "invitable": True,
         }
         return await self._request("POST", f"/channels/{_quote_id(chat_id)}/threads", json=payload)
+
+    async def rename_thread(
+        self,
+        thread_id: str,
+        name: str,
+        *,
+        only_if_current_name: Optional[str] = None,
+        **_unused: Any,
+    ) -> bool:
+        """Rename a thread (or channel); ``True`` when the new name was applied.
+
+        ``only_if_current_name`` protects a thread a human already renamed: when
+        the server's current name no longer matches the placeholder this adapter
+        created, the rename is declined instead of clobbering the human's choice.
+        Extra keyword arguments are accepted and ignored so the gateway's rename
+        lanes can drive every platform adapter through one call shape.
+        """
+        tid = str(thread_id or "").strip()
+        cleaned = _collapse_thread_name(name)
+        if not tid or not cleaned:
+            return False
+        if only_if_current_name is not None:
+            current = await self._fetch_channel_name(tid)
+            if current is None or current.strip() != str(only_if_current_name).strip():
+                logger.debug(
+                    "Fluxer thread %s rename declined: current name %r does not match %r",
+                    tid, current, only_if_current_name,
+                )
+                return False
+        try:
+            await self._request("PATCH", f"/channels/{_quote_id(tid)}", json={"name": cleaned})
+        except Exception as exc:
+            logger.debug("Fluxer thread rename failed for %s: %s", tid, exc)
+            return False
+        self._note_renamed_thread(tid, cleaned)
+        return True
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent Fluxer typing indicator loop.
@@ -3257,6 +3413,12 @@ class FluxerAdapter(BasePlatformAdapter):
             self._last_inbound_by_chat.move_to_end(channel_id)
             while len(self._last_inbound_by_chat) > 1000:
                 self._last_inbound_by_chat.popitem(last=False)
+            # Keep the trigger text so the thread this turn opens can be named
+            # from the user's own words (mention already stripped above).
+            self._inbound_text_by_message[msg_id] = text or ""
+            self._inbound_text_by_message.move_to_end(msg_id)
+            while len(self._inbound_text_by_message) > self._inbound_text_by_message_max:
+                self._inbound_text_by_message.popitem(last=False)
         source = self.build_source(
             chat_id=channel_id,
             chat_name=(data.get("channel") or {}).get("name"),

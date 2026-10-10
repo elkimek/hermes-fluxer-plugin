@@ -622,15 +622,14 @@ def test_plugin_manifest_is_platform_plugin():
     }.issubset(optional)
 
 
-def test_release_metadata_matches_v040_changelog():
+def test_release_metadata_matches_changelog():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = tomllib.load(handle)["project"]
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert manifest["version"] == "0.4.0"
-    assert project["version"] == "0.4.0"
-    assert "## [0.4.0] - 2026-10-09" in changelog
+    assert project["version"] == manifest["version"]
+    assert f"## [{manifest['version']}]" in changelog
 
 
 def test_fluxer_adapter_advertises_markdown_code_blocks():

@@ -73,6 +73,7 @@ Implemented:
 - replies / referenced message context
 - reply references placed per the shared `off` / `first` / `all` contract, matching the Discord adapter's `reply_to_mode`
 - opt-in thread replies: a reply can start a thread from the triggering message and continue inside it
+- thread naming: an auto-started thread is named from its triggering message and renamed to the session title once Hermes titles the session, exactly as the Discord adapter does
 - CLI and `/branch` session handoffs into their own thread, through the shared `create_handoff_thread` contract
 - message edits and deletes
 - pins, when the Fluxer server supports pin routes
