@@ -19,11 +19,17 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Changed
 
-- `send()` resolves its destination before sending: an explicit `metadata["thread_id"]` still wins, then thread replies, then the channel itself. The reply reference is placed according to `FLUXER_REPLY_TO_MODE` rather than always landing on the first split chunk.
+- `send()` resolves its destination before sending: an explicit `metadata["thread_id"]` still wins, then thread replies, then the channel. The reply reference is placed according to `FLUXER_REPLY_TO_MODE` rather than always landing on the first split chunk.
+
+### Fixed
+
+- Edits and deletes now follow the message into its thread. `edit_message()` and `delete_message()` are given the originating channel, so a message sent into a thread could not be updated or removed, which broke tool-progress bubbles and the partial-delivery cleanup in `_standalone_send()` when an upload failed after text had already been posted to a thread.
+- File, image, video, and voice uploads now honour the same destination and reference rules as text. They previously always posted to the original channel and always attached a reply reference, so a delivery targeting a thread split its text and its media across two places and `FLUXER_REPLY_TO_MODE=off` was ignored for media.
+- Follow-ups in a thread the adapter created are no longer dropped. The thread now records its parent, so it inherits the parent's `FLUXER_ALLOWED_CHANNELS` and `FLUXER_FREE_RESPONSE_CHANNELS` status, and threaded replies seed the mentioned-thread memory so ordinary follow-ups reach the bot under the default mention rules. `FLUXER_STRICT_MENTION` still requires a fresh mention.
 
 ### Verification
 
-- Regression tests cover reply-reference placement in all three modes, thread replies from a channel list and install-wide, fallback to the parent channel when thread creation fails, explicit thread targeting, and handoff thread creation including its failure path.
+- Regression tests cover reply-reference placement in all three modes, thread replies from a channel list and install-wide, fallback to the parent channel when thread creation fails, explicit thread targeting, handoff thread creation including its failure path, edits and deletes routing into a thread (with fallback for messages the adapter did not send), uploads targeting a thread and honouring `FLUXER_REPLY_TO_MODE=off`, thread-to-parent allowlist and free-response inheritance, and strict-mention opt-out for created threads.
 
 ## [0.3.3] - 2026-08-30
 

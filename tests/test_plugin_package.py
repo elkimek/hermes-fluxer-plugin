@@ -2614,3 +2614,168 @@ async def test_create_handoff_thread_falls_back_to_a_default_name(monkeypatch):
     assert await adapter.create_handoff_thread("chan-1", "") == "thread-42"
     call = adapter._request.await_args_list[0]
     assert call.kwargs["json"]["name"] == fluxer_adapter._DEFAULT_THREAD_NAME
+
+
+# ── Thread follow-ups, edits, and uploads must stay inside the thread ────────
+
+
+@pytest.mark.asyncio
+async def test_edits_and_deletes_route_to_the_thread_that_received_the_message(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(side_effect=[{"id": "reply-1"}, {"id": "reply-1"}, {}])
+
+    await adapter.send("chan-1", "in-thread", metadata={"thread_id": "thread-7"})
+    edited = await adapter.edit_message("chan-1", "reply-1", "edited")
+    deleted = await adapter.delete_message("chan-1", "reply-1")
+
+    assert edited.success is True
+    assert deleted is True
+    calls = adapter._request.await_args_list
+    assert calls[0].args == ("POST", "/channels/thread-7/messages")
+    assert calls[1].args == ("PATCH", "/channels/thread-7/messages/reply-1")
+    assert calls[2].args == ("DELETE", "/channels/thread-7/messages/reply-1")
+
+
+@pytest.mark.asyncio
+async def test_edit_and_delete_fall_back_to_the_given_channel_for_unknown_messages(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(side_effect=[{"id": "some-id"}, {}])
+
+    await adapter.edit_message("chan-1", "restored-msg", "edited")
+    deleted = await adapter.delete_message("chan-1", "restored-msg")
+
+    assert deleted is True
+    calls = adapter._request.await_args_list
+    assert calls[0].args == ("PATCH", "/channels/chan-1/messages/restored-msg")
+    assert calls[1].args == ("DELETE", "/channels/chan-1/messages/restored-msg")
+
+
+@pytest.mark.asyncio
+async def test_upload_targets_an_explicit_thread(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    adapter = _send_adapter()
+    adapter._multipart_request = AsyncMock(return_value={"id": "file-1"})
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter._send_file_message(
+        "chan-1", str(document), metadata={"thread_id": "thread-7"}
+    )
+
+    assert result.success is True
+    assert adapter._multipart_request.await_args.args[1] == "/channels/thread-7/messages"
+    # The upload is recorded so a later edit/delete stays in the thread.
+    assert await adapter.delete_message("chan-1", "file-1") is True
+    assert adapter._request.await_args_list[0].args == (
+        "DELETE",
+        "/channels/thread-7/messages/file-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_honours_reply_mode_off(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    adapter = _send_adapter(reply_to_mode="off")
+    adapter._multipart_request = AsyncMock(return_value={"id": "file-1"})
+
+    await adapter._send_file_message("chan-1", str(document), reply_to="user-msg-1")
+
+    payload = adapter._multipart_request.await_args.kwargs["payload"]
+    assert "message_reference" not in payload
+
+
+@pytest.mark.asyncio
+async def test_upload_starts_a_thread_when_thread_replies_are_enabled(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._request = AsyncMock(return_value={"id": "thread-9"})
+    adapter._multipart_request = AsyncMock(return_value={"id": "file-1"})
+
+    result = await adapter._send_file_message("chan-1", str(document), reply_to="user-msg-1")
+
+    assert result.success is True
+    assert adapter._request.await_args_list[0].args == (
+        "POST",
+        "/channels/chan-1/messages/user-msg-1/threads",
+    )
+    assert adapter._multipart_request.await_args.args[1] == "/channels/thread-9/messages"
+
+
+@pytest.mark.asyncio
+async def test_created_thread_records_its_parent_and_seeds_mention_memory(monkeypatch):
+    monkeypatch.delenv("FLUXER_STRICT_MENTION", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(return_value={"id": "thread-42"})
+
+    await adapter.create_handoff_thread("chan-1", "CLI session")
+
+    assert adapter._thread_parents["thread-42"] == "chan-1"
+    # Follow-ups in a thread the bot opened are addressed to the bot.
+    assert "thread-42" in adapter._mentioned_threads
+
+
+@pytest.mark.asyncio
+async def test_strict_mention_does_not_seed_a_created_thread(monkeypatch):
+    monkeypatch.delenv("FLUXER_STRICT_MENTION", raising=False)
+    adapter = _send_adapter(strict_mention=True)
+    adapter._request = AsyncMock(return_value={"id": "thread-42"})
+
+    await adapter.create_handoff_thread("chan-1", "CLI session")
+
+    assert adapter._thread_parents["thread-42"] == "chan-1"
+    assert "thread-42" not in adapter._mentioned_threads
+
+
+def test_thread_inherits_the_parent_channel_allowlist(monkeypatch):
+    monkeypatch.delenv("FLUXER_STRICT_MENTION", raising=False)
+    adapter = _send_adapter(allowed_channels=["chan-1"], require_mention=True)
+    adapter._thread_parents["thread-7"] = "chan-1"
+    adapter._mentioned_threads["thread-7"] = None
+
+    allowed, _ = adapter._should_process_message(
+        channel_id="thread-7",
+        chat_type="thread",
+        text="follow up",
+        data={"channel_id": "thread-7"},
+        reply_to_message_id=None,
+    )
+
+    assert allowed is True
+
+
+def test_thread_outside_the_allowlist_is_still_rejected(monkeypatch):
+    monkeypatch.delenv("FLUXER_STRICT_MENTION", raising=False)
+    adapter = _send_adapter(allowed_channels=["chan-1"], require_mention=True)
+
+    allowed, _ = adapter._should_process_message(
+        channel_id="thread-9",
+        chat_type="thread",
+        text="follow up",
+        data={"channel_id": "thread-9"},
+        reply_to_message_id=None,
+    )
+
+    assert allowed is False
+
+
+def test_thread_inherits_free_response_from_its_parent(monkeypatch):
+    monkeypatch.delenv("FLUXER_STRICT_MENTION", raising=False)
+    adapter = _send_adapter(free_response_channels=["chan-1"], require_mention=True)
+    adapter._thread_parents["thread-7"] = "chan-1"
+
+    allowed, _ = adapter._should_process_message(
+        channel_id="thread-7",
+        chat_type="thread",
+        text="no mention here",
+        data={"channel_id": "thread-7"},
+        reply_to_message_id=None,
+    )
+
+    assert allowed is True

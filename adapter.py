@@ -1066,6 +1066,14 @@ class FluxerAdapter(BasePlatformAdapter):
         self._thread_reply_channels = _split_ids(
             _fluxer_env("FLUXER_THREAD_REPLY_CHANNELS") or extra.get("thread_reply_channels")
         )
+        # A message sent into a thread must be edited or deleted through that
+        # thread, not the channel the caller named, so remember where each sent
+        # message actually landed (bounded like the other per-adapter caches).
+        self._message_destinations: OrderedDict[str, str] = OrderedDict()
+        self._message_destinations_max = 5000
+        # Parent channel of every thread this adapter created, so a thread
+        # inherits its parent's allowlist status and can seed mention memory.
+        self._thread_parents: Dict[str, str] = {}
         self._auto_free_response_home_guild = _coerce_bool(
             _fluxer_env("FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD", extra.get("auto_free_response_home_guild")),
             False,
@@ -1398,6 +1406,8 @@ class FluxerAdapter(BasePlatformAdapter):
                 if data.get("id"):
                     message_id = str(data["id"])
                     message_ids.append(message_id)
+                    # Edits/deletes must target the thread, not the caller's channel.
+                    self._remember_message_destination(message_id, target_chat_id)
                     verified = await self._verify_delivery(
                         target_chat_id,
                         message_id,
@@ -1564,6 +1574,9 @@ class FluxerAdapter(BasePlatformAdapter):
         callbacks.
         """
         try:
+            # A message this adapter sent may live in a thread; route the edit
+            # there rather than the caller's channel.
+            target_chat_id = self._destination_for_message(message_id, chat_id)
             # Sanitize before measuring: neutralized mentions are one UTF-16
             # unit longer than their source syntax.
             formatted = self._sanitize_outbound_mentions(self.format_message(content))
@@ -1578,7 +1591,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 )[0]
             data = await self._request(
                 "PATCH",
-                f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(message_id)}",
+                f"/channels/{_quote_id(target_chat_id)}/messages/{_quote_id(message_id)}",
                 json=self._outbound_message_payload(formatted),
             )
             # Intermediate streaming edits are intentionally not content-checked:
@@ -1587,7 +1600,7 @@ class FluxerAdapter(BasePlatformAdapter):
             # The final edit is stable and still gets exact visible-content
             # verification; intermediate edits retain ID/author verification.
             verified = await self._verify_delivery(
-                chat_id,
+                target_chat_id,
                 str(data.get("id") or message_id),
                 expected_content=(self._sanitize_outbound_mentions(formatted) if finalize else None),
             )
@@ -1607,7 +1620,11 @@ class FluxerAdapter(BasePlatformAdapter):
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a Fluxer message when gateway cleanup/ephemeral flows ask."""
         try:
-            await self._request("DELETE", f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(message_id)}")
+            # Route through the thread when that is where the message landed.
+            target_chat_id = self._destination_for_message(message_id, chat_id)
+            await self._request(
+                "DELETE", f"/channels/{_quote_id(target_chat_id)}/messages/{_quote_id(message_id)}"
+            )
             return True
         except Exception as exc:
             logger.debug("Fluxer delete failed for message %s: %s", message_id, exc)
@@ -1763,13 +1780,38 @@ class FluxerAdapter(BasePlatformAdapter):
         """
         return bool(self._thread_replies_enabled or str(chat_id) in self._thread_reply_channels)
 
-    def _remember_thread_id(self, data: Any) -> Optional[str]:
+    def _remember_message_destination(self, message_id: Optional[str], chat_id: str) -> None:
+        """Remember which channel or thread a sent message actually landed in."""
+        if not message_id:
+            return
+        key = str(message_id)
+        self._message_destinations[key] = str(chat_id)
+        self._message_destinations.move_to_end(key)
+        while len(self._message_destinations) > self._message_destinations_max:
+            self._message_destinations.popitem(last=False)
+
+    def _destination_for_message(self, message_id: str, fallback: str) -> str:
+        """Channel/thread a previously sent message lives in.
+
+        Falls back to the caller's ``chat_id`` for messages this adapter did not
+        send (e.g. restored after a restart), so behaviour is unchanged there.
+        """
+        return self._message_destinations.get(str(message_id), str(fallback))
+
+    def _remember_thread_id(self, data: Any, parent_chat_id: Optional[str] = None) -> Optional[str]:
         """Record a thread returned by the API and return its id, else ``None``."""
         thread_id = str((data or {}).get("id") or "").strip()
-        if thread_id:
-            self._known_channel_ids.add(thread_id)
-            return thread_id
-        return None
+        if not thread_id:
+            return None
+        self._known_channel_ids.add(thread_id)
+        if parent_chat_id:
+            self._thread_parents[thread_id] = str(parent_chat_id)
+        # A thread this adapter created continues a conversation the bot was
+        # already addressed in, so ordinary follow-ups in it belong to the bot.
+        # Strict mention mode opts out and keeps requiring a fresh mention.
+        if not self._strict_mention:
+            self._remember_mentioned_thread(thread_id)
+        return thread_id
 
     async def _start_thread_from_message(self, chat_id: str, message_id: str) -> Optional[str]:
         """Best-effort thread start from ``message_id``; ``None`` keeps the channel.
@@ -1784,7 +1826,7 @@ class FluxerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
             return None
-        return self._remember_thread_id(data)
+        return self._remember_thread_id(data, chat_id)
 
     async def _resolve_outbound_target(
         self,
@@ -1831,7 +1873,7 @@ class FluxerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Fluxer handoff thread creation failed for %s: %s", parent_chat_id, exc)
             return None
-        return self._remember_thread_id(data)
+        return self._remember_thread_id(data, parent_chat_id)
 
     async def create_thread(
         self,
@@ -2014,21 +2056,20 @@ class FluxerAdapter(BasePlatformAdapter):
 
         path = Path(resolved)
         filename = file_name or path.name
+        # Uploads must honour the same destination and reference rules as text:
+        # an explicit thread_id wins, thread replies may start a thread, and
+        # FLUXER_REPLY_TO_MODE=off suppresses the reference here too.
+        target_chat_id, reference = await self._resolve_outbound_target(chat_id, reply_to, metadata)
         payload: Dict[str, Any] = {
             "nonce": str(int(time.time() * 1000)),
             "allowed_mentions": self._allowed_mentions_payload(),
         }
         if caption and not is_voice:
             payload["content"] = self._sanitize_outbound_mentions(caption)
-        if reply_to:
-            payload["message_reference"] = {"message_id": str(reply_to)}
-        if metadata:
-            thread_id = metadata.get("thread_id")
-            if thread_id and "message_reference" not in payload:
-                payload["message_reference"] = {"message_id": str(thread_id)}
+        payload.update(reference)
         if flags:
             payload["flags"] = flags
-        self._known_channel_ids.add(str(chat_id))
+        self._known_channel_ids.add(str(target_chat_id))
 
         attachment: Dict[str, Any] = {"id": 0, "filename": filename, "title": title or filename}
         if is_voice:
@@ -2040,13 +2081,15 @@ class FluxerAdapter(BasePlatformAdapter):
         try:
             data = await self._multipart_request(
                 "POST",
-                f"/channels/{_quote_id(chat_id)}/messages",
+                f"/channels/{_quote_id(target_chat_id)}/messages",
                 payload=payload,
                 files=[("files[0]", path, filename)],
             )
             message_id = str(data.get("id")) if data.get("id") else None
+            # Edits/deletes must target the thread, not the caller's channel.
+            self._remember_message_destination(message_id, target_chat_id)
             verified = await self._verify_delivery(
-                chat_id,
+                target_chat_id,
                 message_id,
                 expected_content=payload.get("content"),
                 expected_attachment_count=1,
@@ -2430,9 +2473,19 @@ class FluxerAdapter(BasePlatformAdapter):
         if chat_type == "dm":
             return True, text
         if self._allowed_channel_ids and channel_id not in self._allowed_channel_ids:
-            logger.debug("Fluxer ignoring message in a channel outside the allowed set")
-            return False, text
-        if channel_id in self._free_response_channels or channel_id in self._home_channel_ids:
+            # A thread this adapter created inherits its parent channel's
+            # allowlist status, so an allowlisted parent does not silently
+            # exclude the thread the bot just opened underneath it.
+            parent_id = self._thread_parents.get(str(channel_id))
+            if not (parent_id and parent_id in self._allowed_channel_ids):
+                logger.debug("Fluxer ignoring message in a channel outside the allowed set")
+                return False, text
+        parent_channel_id = self._thread_parents.get(str(channel_id))
+        if (
+            channel_id in self._free_response_channels
+            or channel_id in self._home_channel_ids
+            or (parent_channel_id and parent_channel_id in self._free_response_channels)
+        ):
             return True, text
         guild_id = str(
             data.get("guild_id")
