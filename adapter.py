@@ -481,6 +481,24 @@ _DEFAULT_REPLY_TO_MODE = "first"
 _DEFAULT_THREAD_NAME = "Hermes reply"
 
 
+def _is_missing_channel_error(exc: BaseException) -> bool:
+    """True when ``exc`` means the target channel or thread no longer exists.
+
+    A thread can be deleted underneath a running turn, so an automatically chosen
+    thread has to be abandoned rather than failing the send. The status is read
+    off the httpx error the REST helpers raise; any other failure is a real
+    delivery problem and must not be silently redirected to the parent channel.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 404:
+        return True
+    if status == 400:
+        body = str(getattr(response, "text", "") or "").lower()
+        return "unknown channel" in body or "unknown thread" in body
+    return False
+
+
 def _coerce_reply_to_mode(value: Any, default: str = _DEFAULT_REPLY_TO_MODE) -> str:
     """Normalize an outbound reply-reference mode; unknown values use ``default``."""
     mode = str(value or "").strip().lower()
@@ -1084,6 +1102,18 @@ class FluxerAdapter(BasePlatformAdapter):
         # Parent channel of every thread this adapter created, so a thread
         # inherits its parent's allowlist status and can seed mention memory.
         self._thread_parents: Dict[str, str] = {}
+        # Anchor message of the turn currently in flight, per channel. The live
+        # listener runs alongside backlog recovery, so the channel's latest
+        # inbound message can change while a reply is still being produced.
+        # Pinning the anchor when the turn starts keeps a progress bubble, its
+        # final reply, and any trailing upload in one thread. Entries carry a
+        # timestamp so a missed stop cannot strand a channel in an old thread.
+        self._turn_anchor: Dict[str, tuple] = {}
+        self._turn_anchor_ttl = 1800.0
+        # Channels where the automatically chosen thread turned out to be gone.
+        # Auto-threading is skipped for the rest of the turn so the fallback to
+        # the parent channel sticks instead of re-creating a thread per send.
+        self._turn_thread_disabled: set = set()
         self._auto_free_response_home_guild = _coerce_bool(
             _fluxer_env("FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD", extra.get("auto_free_response_home_guild")),
             False,
@@ -1387,7 +1417,7 @@ class FluxerAdapter(BasePlatformAdapter):
             # Resolve the destination before anything is sent: an explicit
             # thread_id wins, then opt-in thread replies may start a thread from
             # the triggering message, then the channel itself.
-            target_chat_id, payload = await self._resolve_outbound_target(chat_id, reply_to, metadata)
+            target_chat_id, payload, auto_thread_id = await self._resolve_outbound_target(chat_id, reply_to, metadata)
             self._known_channel_ids.add(str(target_chat_id))
 
             # Mention neutralization inserts zero-width characters. Apply it
@@ -1407,11 +1437,35 @@ class FluxerAdapter(BasePlatformAdapter):
                     # "all" mirrors the Discord adapter's every-chunk reference.
                     chunk_payload.pop("message_reference", None)
 
-                data = await self._request(
-                    "POST",
-                    f"/channels/{_quote_id(target_chat_id)}/messages",
-                    json=chunk_payload,
-                )
+                try:
+                    data = await self._request(
+                        "POST",
+                        f"/channels/{_quote_id(target_chat_id)}/messages",
+                        json=chunk_payload,
+                    )
+                except Exception as exc:
+                    # A thread this adapter chose can be deleted between the
+                    # progress bubble and the reply. Abandon it and post to the
+                    # parent channel rather than losing the message.
+                    if not (auto_thread_id and _is_missing_channel_error(exc)):
+                        raise
+                    logger.info(
+                        "Fluxer thread %s is gone; falling back to channel %s",
+                        auto_thread_id,
+                        chat_id,
+                    )
+                    self._forget_thread(auto_thread_id)
+                    self._turn_thread_disabled.add(str(chat_id))
+                    auto_thread_id = None
+                    target_chat_id = str(chat_id)
+                    self._known_channel_ids.add(target_chat_id)
+                    if reply_to and self._reply_to_mode != "off" and "message_reference" not in chunk_payload:
+                        chunk_payload["message_reference"] = {"message_id": str(reply_to)}
+                    data = await self._request(
+                        "POST",
+                        f"/channels/{_quote_id(target_chat_id)}/messages",
+                        json=chunk_payload,
+                    )
                 responses.append(data)
                 if data.get("id"):
                     message_id = str(data["id"])
@@ -1808,6 +1862,47 @@ class FluxerAdapter(BasePlatformAdapter):
         """
         return self._message_destinations.get(str(message_id), str(fallback))
 
+    def _forget_thread(self, thread_id: Optional[str]) -> None:
+        """Drop every trace of ``thread_id`` so it is never chosen again.
+
+        A thread can be deleted while a turn is running. The cached entry has to
+        go with it, otherwise a retry would keep targeting the thread that just
+        failed and reuse the same missing id forever.
+        """
+        tid = str(thread_id or "").strip()
+        if not tid:
+            return
+        self._known_channel_ids.discard(tid)
+        self._thread_parents.pop(tid, None)
+        self._mentioned_threads.pop(tid, None)
+        for key in [k for k, v in self._threads_by_anchor.items() if v == tid]:
+            self._threads_by_anchor.pop(key, None)
+        # Release any turn anchor that pointed at the thread just invalidated.
+        for chat_key, (anchor, _pinned_at) in list(self._turn_anchor.items()):
+            if (chat_key, anchor) not in self._threads_by_anchor:
+                self._turn_anchor.pop(chat_key, None)
+
+    def _pinned_turn_anchor(self, chat_id: str) -> str:
+        """Anchor message pinned when the current turn started, else ``""``."""
+        entry = self._turn_anchor.get(str(chat_id))
+        if not entry:
+            return ""
+        anchor, pinned_at = entry
+        if time.monotonic() - pinned_at > self._turn_anchor_ttl:
+            self._turn_anchor.pop(str(chat_id), None)
+            return ""
+        return str(anchor or "")
+
+    def _pin_turn_anchor(self, chat_id: str) -> None:
+        """Pin this turn's anchor once, at turn start."""
+        chat_key = str(chat_id)
+        if chat_key in self._turn_anchor:
+            return
+        self._turn_thread_disabled.discard(chat_key)
+        anchor = str(self._last_inbound_by_chat.get(chat_key) or "")
+        if anchor:
+            self._turn_anchor[chat_key] = (anchor, time.monotonic())
+
     def _remember_thread_id(self, data: Any, parent_chat_id: Optional[str] = None) -> Optional[str]:
         """Record a thread returned by the API and return its id, else ``None``."""
         thread_id = str((data or {}).get("id") or "").strip()
@@ -1855,39 +1950,47 @@ class FluxerAdapter(BasePlatformAdapter):
         chat_id: str,
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
-    ) -> tuple[str, Dict[str, Any]]:
-        """Resolve ``(target_chat_id, reference_payload)`` for one outbound send.
+    ) -> tuple[str, Dict[str, Any], Optional[str]]:
+        """Resolve ``(target_chat_id, reference_payload, auto_thread_id)`` for one send.
 
         Precedence mirrors the shared platform contract: an explicit
         ``metadata['thread_id']`` wins, then opt-in thread replies may start a
         thread from the triggering message, then the channel itself. The reply
         reference honours ``FLUXER_REPLY_TO_MODE`` (``off`` suppresses it;
         ``first``/``all`` place it on the first or every split chunk).
+        ``auto_thread_id`` names the thread this adapter chose for the turn (so a
+        caller can abandon it if it turns out to be gone); it is ``None`` when the
+        destination was explicit.
         """
         payload: Dict[str, Any] = {}
         target_chat_id = str(chat_id)
+        auto_thread_id: Optional[str] = None
         explicit_thread_id = str((metadata or {}).get("thread_id") or "").strip()
         started_thread = False
         if explicit_thread_id:
             target_chat_id = explicit_thread_id
-        elif self._thread_replies_enabled_for(chat_id):
-            # The gateway only sets ``reply_to`` for a few platforms, and supplies
-            # no thread id for Fluxer, so fall back to the most recent inbound
-            # message in this channel as the thread anchor -- otherwise nothing
-            # would ever trigger a thread here.
-            anchor = str(reply_to or "").strip() or str(
-                self._last_inbound_by_chat.get(str(chat_id)) or ""
+        elif self._thread_replies_enabled_for(chat_id) and str(chat_id) not in self._turn_thread_disabled:
+            # The gateway sets ``reply_to`` only for a few platforms and supplies
+            # no thread id for Fluxer. Prefer the trigger in hand, then the anchor
+            # pinned when this turn started -- the channel's latest inbound message
+            # can move while a reply is still being produced, and using it here
+            # would split one turn across two threads.
+            anchor = (
+                str(reply_to or "").strip()
+                or self._pinned_turn_anchor(chat_id)
+                or str(self._last_inbound_by_chat.get(str(chat_id)) or "")
             )
             if anchor:
                 new_thread_id = await self._start_thread_from_message(chat_id, anchor)
                 if new_thread_id:
                     target_chat_id = new_thread_id
+                    auto_thread_id = new_thread_id
                     started_thread = True
         # A thread started from the triggering message already carries the parent
         # context, so a second reference inside it is redundant.
         if reply_to and self._reply_to_mode != "off" and not started_thread:
             payload["message_reference"] = {"message_id": str(reply_to)}
-        return target_chat_id, payload
+        return target_chat_id, payload, auto_thread_id
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a fresh Fluxer thread for a CLI→platform handoff or ``/branch``.
@@ -1941,6 +2044,11 @@ class FluxerAdapter(BasePlatformAdapter):
         set to ``off``.
         """
         chat_key = str(chat_id)
+        # Hermes calls send_typing when a turn starts. Pin the triggering message
+        # now: the channel's latest inbound message can change while the reply is
+        # still being produced, and re-reading it later would split one turn's
+        # progress bubble and final reply across two threads.
+        self._pin_turn_anchor(chat_key)
         if chat_key in self._typing_tasks:
             return
 
@@ -1964,6 +2072,10 @@ class FluxerAdapter(BasePlatformAdapter):
 
     async def stop_typing(self, chat_id: str) -> None:
         chat_key = str(chat_id)
+        # The turn is over: release the pinned anchor and let the next turn pick
+        # its own trigger rather than inheriting this thread.
+        self._turn_anchor.pop(chat_key, None)
+        self._turn_thread_disabled.discard(chat_key)
         task = self._typing_tasks.pop(chat_key, None)
         if task and not task.done():
             task.cancel()
@@ -2089,7 +2201,7 @@ class FluxerAdapter(BasePlatformAdapter):
         # Uploads must honour the same destination and reference rules as text:
         # an explicit thread_id wins, thread replies may start a thread, and
         # FLUXER_REPLY_TO_MODE=off suppresses the reference here too.
-        target_chat_id, reference = await self._resolve_outbound_target(chat_id, reply_to, metadata)
+        target_chat_id, reference, auto_thread_id = await self._resolve_outbound_target(chat_id, reply_to, metadata)
         payload: Dict[str, Any] = {
             "nonce": str(int(time.time() * 1000)),
             "allowed_mentions": self._allowed_mentions_payload(),
@@ -2109,12 +2221,37 @@ class FluxerAdapter(BasePlatformAdapter):
         payload["attachments"] = [attachment]
 
         try:
-            data = await self._multipart_request(
-                "POST",
-                f"/channels/{_quote_id(target_chat_id)}/messages",
-                payload=payload,
-                files=[("files[0]", path, filename)],
-            )
+            try:
+                data = await self._multipart_request(
+                    "POST",
+                    f"/channels/{_quote_id(target_chat_id)}/messages",
+                    payload=payload,
+                    files=[("files[0]", path, filename)],
+                )
+            except Exception as exc:
+                # Same deleted-thread fallback as text sends: an upload must not
+                # fail just because the thread this adapter chose was removed.
+                if not (auto_thread_id and _is_missing_channel_error(exc)):
+                    raise
+                logger.info(
+                    "Fluxer thread %s is gone; uploading to channel %s instead",
+                    auto_thread_id,
+                    chat_id,
+                )
+                self._forget_thread(auto_thread_id)
+                self._turn_thread_disabled.add(str(chat_id))
+                auto_thread_id = None
+                target_chat_id = str(chat_id)
+                self._known_channel_ids.add(target_chat_id)
+                payload.pop("message_reference", None)
+                if reply_to and self._reply_to_mode != "off":
+                    payload["message_reference"] = {"message_id": str(reply_to)}
+                data = await self._multipart_request(
+                    "POST",
+                    f"/channels/{_quote_id(target_chat_id)}/messages",
+                    payload=payload,
+                    files=[("files[0]", path, filename)],
+                )
             message_id = str(data.get("id")) if data.get("id") else None
             # Edits/deletes must target the thread, not the caller's channel.
             self._remember_message_destination(message_id, target_chat_id)

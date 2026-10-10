@@ -2742,6 +2742,182 @@ async def test_thread_anchor_is_reused_from_an_explicit_reply_to(monkeypatch):
     )
 
 
+class _FakeHTTPResponse:
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+
+
+class _RestStatusError(Exception):
+    """Stands in for the httpx error the REST helpers raise on a bad status."""
+
+    def __init__(self, status, text=""):
+        super().__init__(f"HTTP {status}")
+        self.response = _FakeHTTPResponse(status, text)
+
+
+async def _noop() -> None:
+    return None
+
+
+def _completed_typing_task():
+    """A task that finishes at once, so send_typing pins the anchor without
+    starting a real typing loop against the mocked request layer."""
+    return asyncio.get_running_loop().create_task(_noop())
+
+
+@pytest.mark.asyncio
+async def test_typing_pins_the_turn_anchor_before_the_turn_can_drift(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._typing_tasks["chan-1"] = _completed_typing_task()
+
+    await adapter.send_typing("chan-1")
+    # Another accepted message arrives while this reply is still being produced.
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-2"
+    adapter._request = AsyncMock(side_effect=[{"id": "thread-1"}, {"id": "reply-1"}])
+
+    await adapter.send("chan-1", "the reply")
+
+    # The thread is anchored on the message that started the turn, not the newest.
+    assert adapter._request.await_args_list[0].args == (
+        "POST",
+        "/channels/chan-1/messages/user-msg-1/threads",
+    )
+
+
+@pytest.mark.asyncio
+async def test_typing_refreshes_do_not_move_the_turn_anchor(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._typing_tasks["chan-1"] = _completed_typing_task()
+    await adapter.send_typing("chan-1")
+
+    # A mid-turn resume (e.g. re-arming typing after a clarify prompt) must not
+    # re-pin against a message that arrived in the meantime.
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-2"
+    await adapter.send_typing("chan-1")
+
+    assert adapter._turn_anchor["chan-1"][0] == "user-msg-1"
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_releases_the_anchor_for_the_next_turn(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._typing_tasks["chan-1"] = _completed_typing_task()
+    await adapter.send_typing("chan-1")
+    await adapter.stop_typing("chan-1")
+
+    assert "chan-1" not in adapter._turn_anchor
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-2"
+    adapter._request = AsyncMock(side_effect=[{"id": "thread-2"}, {"id": "reply-2"}])
+
+    await adapter.send("chan-1", "next turn")
+
+    assert adapter._request.await_args_list[0].args == (
+        "POST",
+        "/channels/chan-1/messages/user-msg-2/threads",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_thread_falls_back_to_the_parent_channel(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._request = AsyncMock(
+        side_effect=[
+            {"id": "thread-1"},
+            _RestStatusError(404),
+            {"id": "fallback-1"},
+        ]
+    )
+
+    result = await adapter.send("chan-1", "the reply", reply_to="user-msg-1")
+
+    assert result.success is True
+    assert result.message_id == "fallback-1"
+    calls = adapter._request.await_args_list
+    assert calls[1].args == ("POST", "/channels/thread-1/messages")
+    assert calls[2].args == ("POST", "/channels/chan-1/messages")
+    # The reference was suppressed because the thread was chosen, so it is
+    # restored on the fallback rather than losing the reply link entirely.
+    assert calls[2].kwargs["json"]["message_reference"] == {"message_id": "user-msg-1"}
+    # The dead thread is gone from every cache, so it cannot be chosen again.
+    assert ("chan-1", "user-msg-1") not in adapter._threads_by_anchor
+    assert "thread-1" not in adapter._known_channel_ids
+    assert "thread-1" not in adapter._thread_parents
+
+
+@pytest.mark.asyncio
+async def test_a_dead_thread_is_not_reopened_within_the_same_turn(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._request = AsyncMock(
+        side_effect=[
+            {"id": "thread-1"},
+            _RestStatusError(404),
+            {"id": "fallback-1"},
+            {"id": "fallback-2"},
+        ]
+    )
+
+    await adapter.send("chan-1", "the reply", reply_to="user-msg-1")
+    await adapter.send("chan-1", "a trailing note")
+
+    posts = [c.args for c in adapter._request.await_args_list]
+    # A second thread is never created: the rest of the turn stays in the parent.
+    assert posts.count(("POST", "/channels/chan-1/messages/user-msg-1/threads")) == 1
+    assert posts[-1] == ("POST", "/channels/chan-1/messages")
+
+
+@pytest.mark.asyncio
+async def test_a_non_missing_failure_is_not_redirected_to_the_channel(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._request = AsyncMock(
+        side_effect=[
+            {"id": "thread-1"},
+            _RestStatusError(500),
+        ]
+    )
+
+    result = await adapter.send("chan-1", "the reply", reply_to="user-msg-1")
+
+    # A genuine delivery failure must surface, not silently land in the channel.
+    assert result.success is False
+    assert len(adapter._request.await_args_list) == 2
+    assert adapter._threads_by_anchor[("chan-1", "user-msg-1")] == "thread-1"
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_thread_during_an_upload_falls_back_to_the_channel(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._request = AsyncMock(return_value={"id": "thread-1"})
+    adapter._multipart_request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404),
+            {"id": "file-1"},
+        ]
+    )
+
+    result = await adapter._send_file_message("chan-1", str(document), reply_to="user-msg-1")
+
+    assert result.success is True
+    uploads = [c.args[1] for c in adapter._multipart_request.await_args_list]
+    assert uploads == ["/channels/thread-1/messages", "/channels/chan-1/messages"]
+
+
 @pytest.mark.asyncio
 async def test_upload_targets_an_explicit_thread(monkeypatch, tmp_path):
     monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
