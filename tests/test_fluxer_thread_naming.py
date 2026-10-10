@@ -139,12 +139,15 @@ def store(state_db):
 
 def _add_session(db: Path, **row) -> None:
     values = {
-        "id": "sess-1", "session_key": "agent:main:fluxer:channel:chan-1:user-1",
+        "session_key": "agent:main:fluxer:channel:chan-1:user-1",
         "source": "fluxer", "chat_id": "chan-1", "chat_type": "channel",
         "thread_id": None, "user_id": "user-1", "title": None, "title_source": None,
         "started_at": 1.0, "ended_at": None, "last_activity_at": 1.0,
     }
     values.update(row)
+    # Derived from the session key so one test can insert several sessions without
+    # colliding on a shared literal id.
+    values.setdefault("id", f"sess-{values['session_key']}")
     conn = sqlite3.connect(db)
     conn.execute(
         "INSERT INTO sessions (id, session_key, source, chat_id, chat_type, thread_id, user_id, "
@@ -621,6 +624,69 @@ async def test_the_title_command_ignores_a_chat_with_no_thread(state_db):
     adapter.rename_thread.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_the_title_command_renames_this_persons_thread_not_the_other_persons(state_db):
+    """One channel, two people, one thread each: /title must pick the right one.
+
+    The per-chat cache only knows the most recently opened thread, so the naive
+    lookup renames whichever was last — and the placeholder guard does not catch
+    it, because it compares that thread's own cached name.
+    """
+    adapter = _adapter()
+    _add_session(state_db, session_key="agent:main:fluxer:channel:chan-1:user-1", user_id="user-1")
+    _add_session(state_db, session_key="agent:main:fluxer:channel:chan-1:user-2", user_id="user-2")
+    adapter._record_auto_thread("chan-1", "th-alice", "alice placeholder", "user-1")
+    adapter._record_auto_thread("chan-1", "th-bob", "bob placeholder", "user-2")
+    adapter.rename_thread = AsyncMock(return_value=True)
+
+    await adapter._rename_thread_for_session("agent:main:fluxer:channel:chan-1:user-1", "Alice's title")
+
+    adapter.rename_thread.assert_awaited_once_with(
+        "th-alice", "Alice's title", only_if_current_name="alice placeholder"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_title_command_declines_when_several_threads_are_unattributable(state_db):
+    adapter = _adapter()
+    _add_session(state_db, session_key="agent:main:fluxer:channel:chan-1:user-9", user_id="user-9")
+    adapter._record_auto_thread("chan-1", "th-1", "one", "user-1")
+    adapter._record_auto_thread("chan-1", "th-2", "two", "user-2")
+    adapter.rename_thread = AsyncMock()
+
+    await adapter._rename_thread_for_session("agent:main:fluxer:channel:chan-1:user-9", "Title")
+
+    adapter.rename_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_title_command_declines_a_sole_thread_owned_by_someone_else(state_db):
+    """One thread, but someone else's: renaming it would be worse than doing nothing."""
+    adapter = _adapter()
+    _add_session(state_db, session_key="agent:main:fluxer:channel:chan-1:user-2", user_id="user-2")
+    adapter._record_auto_thread("chan-1", "th-alice", "alice placeholder", "user-1")
+    adapter.rename_thread = AsyncMock()
+
+    await adapter._rename_thread_for_session("agent:main:fluxer:channel:chan-1:user-2", "Bob's title")
+
+    adapter.rename_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_title_command_still_uses_an_unattributed_sole_thread(state_db):
+    """No author was ever recorded, so the chat's only thread stays the target."""
+    adapter = _adapter()
+    _add_session(state_db, session_key="agent:main:fluxer:channel:chan-1:user-1", user_id="user-1")
+    adapter._record_auto_thread("chan-1", "th-1", "placeholder")
+    adapter.rename_thread = AsyncMock(return_value=True)
+
+    await adapter._rename_thread_for_session("agent:main:fluxer:channel:chan-1:user-1", "Title")
+
+    adapter.rename_thread.assert_awaited_once_with(
+        "th-1", "Title", only_if_current_name="placeholder"
+    )
+
+
 def test_the_pre_command_hook_only_reacts_to_a_fluxer_title():
     adapter = _adapter()
     calls: list = []
@@ -771,3 +837,62 @@ async def test_rename_thread_keeps_the_cached_placeholder_in_step():
     await adapter.rename_thread("th-1", "Deploy the thing")
 
     assert adapter.auto_thread_info_for_chat("chan-1") == ("th-1", "Deploy the thing")
+
+
+@pytest.mark.asyncio
+async def test_an_evicted_title_check_is_cancelled_not_just_dropped():
+    """The pending cap must stop the task it evicts.
+
+    Dropping the reference leaves the task polling for the rest of its window, and
+    ``disconnect`` only cancels what ``_title_tasks`` still holds — so an evicted
+    task could outlive shutdown and rename a thread through a reopened store.
+    """
+    adapter = _adapter()
+    adapter._rename_thread_when_titled = AsyncMock()
+    started: list = []
+
+    loop = asyncio.get_running_loop()
+    original_create_task = loop.create_task
+
+    def _capture(coro, *args, **kwargs):
+        task = original_create_task(coro, *args, **kwargs)
+        started.append(task)
+        return task
+
+    loop.create_task = _capture  # type: ignore[method-assign]
+    try:
+        for index in range(fluxer_adapter._TITLE_RENAME_MAX_PENDING + 1):
+            adapter._schedule_title_rename("chan-1", f"th-{index}", "placeholder")
+    finally:
+        loop.create_task = original_create_task  # type: ignore[method-assign]
+
+    assert len(adapter._title_tasks) == fluxer_adapter._TITLE_RENAME_MAX_PENDING
+    assert started[0].cancelled() or started[0].cancelling()
+    assert started[-1] in adapter._title_tasks.values()
+    adapter._rename_thread_when_titled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forgetting_a_thread_clears_its_session_entry_too():
+    adapter = _adapter()
+    adapter._record_auto_thread("chan-1", "th-1", "placeholder", "user-1")
+    assert adapter._auto_thread_by_session
+
+    adapter._forget_thread("th-1")
+
+    assert adapter.auto_thread_info_for_chat("chan-1") is None
+    assert adapter._auto_thread_by_session.get(("chan-1", "user-1")) is None
+
+
+@pytest.mark.asyncio
+async def test_several_threads_in_one_channel_are_tracked_per_person():
+    adapter = _adapter()
+    adapter._record_auto_thread("chan-1", "th-alice", "alice", "user-1")
+    adapter._record_auto_thread("chan-1", "th-bob", "bob", "user-2")
+
+    # The shared contract still reports the chat's latest thread …
+    assert adapter.auto_thread_info_for_chat("chan-1") == ("th-bob", "bob")
+    # … while each participant keeps their own.
+    assert adapter._auto_thread_for_session("chan-1", "user-1") == ("th-alice", "alice")
+    assert adapter._auto_thread_for_session("chan-1", "user-2") == ("th-bob", "bob")
+    assert adapter._auto_thread_for_session("chan-2", "user-1") is None

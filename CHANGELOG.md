@@ -19,6 +19,11 @@ This project uses simple semantic versioning while the plugin is young:
 - `/title` now renames the thread as well as the session record, via the plugin's `pre_command` hook.
 - The session title is read back from the Hermes session store rather than pushed by the host, so the naming half lives entirely in this plugin. The read goes through the host's own `SessionDB(read_only=True)` handle instead of a hand-rolled `sqlite3` connection: that is the sanctioned path (the shipped `session-lens` plugin reads profiles through it), it builds the read-only URI correctly where a raw `file:` URI would truncate at a `?` or `#` in the home path, and it pools read descriptors rather than opening one per lookup. Only `llm` and `user` titles are used: `derived` is just a slice of the triggering message, i.e. what the placeholder already says. A missing or unreadable store degrades to the placeholder — it never costs a reply.
 
+### Fixed
+
+- `/title` no longer renames another person's thread. Threads are now remembered per participant as well as per chat: the per-chat entry only knows which thread was opened last, so in a channel where two people each had a thread, one person's `/title` renamed the other's — and the placeholder guard did not catch it, because it compared that thread's own cached name. The rename now requires a match on the session's own participant, and declines rather than guessing whenever the target is ambiguous.
+- A title check evicted by the pending-work cap is now cancelled, not merely dropped. The dropped reference left the task polling for the rest of its window, and `disconnect()` could not cancel what the pending set no longer held, so an evicted task could outlive shutdown and rename a thread through a reopened store.
+
 ## [0.4.0] - 2026-10-09
 
 ### Added

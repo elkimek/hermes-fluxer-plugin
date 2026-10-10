@@ -1272,6 +1272,11 @@ class FluxerAdapter(BasePlatformAdapter):
         # most recently opened underneath that chat: the /title command renames it
         # and the session-title poller keeps its guard name in step.
         self._auto_thread_by_chat: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        # The same threads keyed by ``(chat_id, user_id)``. A channel can hold one
+        # thread per participant, and the per-chat entry above only says which was
+        # opened last, so /title needs this to rename the session's own thread
+        # rather than whoever happened to post most recently.
+        self._auto_thread_by_session: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
         # Live lookups for a thread that is still waiting for its session title.
         self._title_tasks: Dict[str, asyncio.Task] = {}
         # Hermes' session store, opened lazily and read-only (see
@@ -2022,6 +2027,8 @@ class FluxerAdapter(BasePlatformAdapter):
             self._threads_by_anchor.pop(key, None)
         for chat_key in [k for k, v in self._auto_thread_by_chat.items() if v[0] == tid]:
             self._auto_thread_by_chat.pop(chat_key, None)
+        for session_key in [k for k, v in self._auto_thread_by_session.items() if v[0] == tid]:
+            self._auto_thread_by_session.pop(session_key, None)
 
     def _pinned_turn_anchor(self, chat_id: str) -> str:
         """Anchor message pinned when the current turn started, else ``""``."""
@@ -2094,7 +2101,7 @@ class FluxerAdapter(BasePlatformAdapter):
             while len(self._threads_by_anchor) > self._threads_by_anchor_max:
                 self._threads_by_anchor.popitem(last=False)
             created_name = str((data or {}).get("name") or thread_name)
-            self._record_auto_thread(chat_id, thread_id, created_name)
+            self._record_auto_thread(chat_id, thread_id, created_name, author_id)
             if created_name != placeholder:
                 self._note_renamed_thread(thread_id, created_name)
             if not title:
@@ -2103,17 +2110,71 @@ class FluxerAdapter(BasePlatformAdapter):
 
     # ── session-title naming for a thread this adapter opened ───────────────────
 
-    def _record_auto_thread(self, chat_id: str, thread_id: str, name: str) -> None:
-        """Remember the thread opened for ``chat_id`` (last one wins)."""
+    def _record_auto_thread(
+        self, chat_id: str, thread_id: str, name: str, user_id: Optional[str] = None
+    ) -> None:
+        """Remember the thread opened for ``chat_id`` (last one wins per chat)."""
         chat_key = str(chat_id)
-        self._auto_thread_by_chat[chat_key] = (str(thread_id), str(name or ""))
+        tid, label = str(thread_id), str(name or "")
+        self._auto_thread_by_chat[chat_key] = (tid, label)
         self._auto_thread_by_chat.move_to_end(chat_key)
         while len(self._auto_thread_by_chat) > 1000:
             self._auto_thread_by_chat.popitem(last=False)
+        session_key = (chat_key, str(user_id or ""))
+        self._auto_thread_by_session[session_key] = (tid, label)
+        self._auto_thread_by_session.move_to_end(session_key)
+        while len(self._auto_thread_by_session) > 1000:
+            self._auto_thread_by_session.popitem(last=False)
 
     def auto_thread_info_for_chat(self, chat_id: str) -> Optional[tuple[str, str]]:
         """``(thread_id, name)`` of the thread this adapter opened for ``chat_id``, if any."""
         return self._auto_thread_by_chat.get(str(chat_id))
+
+    def _auto_thread_for_session(
+        self, chat_id: str, user_id: Optional[str]
+    ) -> Optional[tuple[str, str]]:
+        """The thread this session owns, or ``None`` when the chat is ambiguous.
+
+        ``/title`` sets ONE session's title, so the rename target has to be that
+        session's thread. The per-chat entry is the shared "latest thread"
+        contract and carries no participant, so in a channel where two people each
+        have a thread it points at whichever was opened last — renaming the other
+        person's thread, with the placeholder guard still passing because it
+        compares that thread's own cached name. Trust the per-chat entry only when
+        it is the chat's sole auto-thread; otherwise require an exact
+        ``(chat, user)`` match, and decline rather than rename someone else's.
+        """
+        chat_key = str(chat_id)
+        user_key = str(user_id or "")
+        exact = self._auto_thread_by_session.get((chat_key, user_key))
+        if exact:
+            return exact
+        # No entry for this user: only rename the chat's sole auto-thread, and only
+        # when nothing records it as someone else's. An unattributed thread (the
+        # triggering author was never seen) stays eligible, which keeps the
+        # best-effort behavior; an attributed one must match.
+        candidates: Dict[str, tuple[tuple[str, str], str]] = {}
+        owners = {
+            entry[0]: entry_user
+            for (entry_chat, entry_user), entry in self._auto_thread_by_session.items()
+            if entry_chat == chat_key
+        }
+        latest = self._auto_thread_by_chat.get(chat_key)
+        if latest:
+            candidates[str(latest[0])] = (latest, owners.get(str(latest[0]), ""))
+        for (entry_chat, entry_user), entry in self._auto_thread_by_session.items():
+            if entry_chat == chat_key:
+                candidates[str(entry[0])] = (entry, entry_user)
+        if len(candidates) == 1:
+            entry, owner = next(iter(candidates.values()))
+            if not owner or owner == user_key:
+                return entry
+        if candidates:
+            logger.debug(
+                "Fluxer /title rename skipped: %d auto-thread(s) in channel %s and none for user %s",
+                len(candidates), chat_key, user_id,
+            )
+        return None
 
     def _session_title_for_chat(self, chat_id: str, user_id: Optional[str] = None) -> Optional[str]:
         """The triggering session's title for a chat, or ``None``.
@@ -2147,8 +2208,8 @@ class FluxerAdapter(BasePlatformAdapter):
             return None
         return str(title).strip() or None
 
-    def _chat_id_for_session(self, session_key: str) -> Optional[str]:
-        """Chat id of the newest session row for a ``session_key``, or ``None``."""
+    def _session_origin_for_key(self, session_key: str) -> Optional[tuple[str, str]]:
+        """``(chat_id, user_id)`` of the newest session row for ``session_key``."""
         store = self._session_store()
         key = str(session_key or "").strip()
         if store is None or not key:
@@ -2160,10 +2221,18 @@ class FluxerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("Fluxer session lookup failed for %s: %s", key[:64], exc)
             return None
-        if not rows:
+        if not rows or not isinstance(rows[0], Mapping):
             return None
-        chat_id = rows[0].get("chat_id") if isinstance(rows[0], Mapping) else None
-        return str(chat_id) if chat_id else None
+        chat_id = rows[0].get("chat_id")
+        if not chat_id:
+            return None
+        user_id = rows[0].get("user_id")
+        return str(chat_id), str(user_id) if user_id else ""
+
+    def _chat_id_for_session(self, session_key: str) -> Optional[str]:
+        """Chat id of the newest session row for a ``session_key``, or ``None``."""
+        origin = self._session_origin_for_key(session_key)
+        return origin[0] if origin else None
 
     def _session_store(self) -> Optional[Any]:
         """The read-only session store, opened on first use. ``None`` when absent."""
@@ -2210,7 +2279,13 @@ class FluxerAdapter(BasePlatformAdapter):
         self._title_tasks[key] = task
         task.add_done_callback(lambda _t, k=key: self._title_tasks.pop(k, None))
         while len(self._title_tasks) > _TITLE_RENAME_MAX_PENDING:
-            self._title_tasks.pop(next(iter(self._title_tasks)))
+            # Cancel the evicted task, don't merely drop the reference: an
+            # orphaned task keeps polling its lookup for the rest of the window,
+            # and ``disconnect`` cannot cancel what ``_title_tasks`` no longer
+            # holds, so it could reopen the session store and rename a thread
+            # after shutdown.
+            evicted = self._title_tasks.pop(next(iter(self._title_tasks)))
+            evicted.cancel()
 
     async def _rename_thread_when_titled(
         self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None
@@ -2261,10 +2336,10 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.debug("Fluxer /title rename could not be scheduled: %s", exc)
 
     async def _rename_thread_for_session(self, session_key: str, title: str) -> None:
-        chat_id = await asyncio.to_thread(self._chat_id_for_session, str(session_key))
-        if not chat_id:
+        origin = await asyncio.to_thread(self._session_origin_for_key, str(session_key))
+        if not origin:
             return
-        entry = self._auto_thread_by_chat.get(str(chat_id))
+        entry = self._auto_thread_for_session(origin[0], origin[1])
         if not entry:
             return
         thread_id, initial_name = entry
@@ -2295,6 +2370,9 @@ class FluxerAdapter(BasePlatformAdapter):
         for chat_key, (cached_id, _cached_name) in list(self._auto_thread_by_chat.items()):
             if cached_id == tid:
                 self._auto_thread_by_chat[chat_key] = (cached_id, name)
+        for session_key, (cached_id, _cached_name) in list(self._auto_thread_by_session.items()):
+            if cached_id == tid:
+                self._auto_thread_by_session[session_key] = (cached_id, name)
 
 
     async def _resolve_outbound_target(
