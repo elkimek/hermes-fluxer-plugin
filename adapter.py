@@ -472,6 +472,21 @@ def _split_ids(value: Any) -> set[str]:
     return {part.strip() for part in str(value).split(",") if part.strip()}
 
 
+# Outbound reply-reference placement, mirroring the Discord adapter's
+# ``reply_to_mode`` contract so Hermes-side expectations stay portable across
+# platforms: ``off`` never references, ``first`` references only the first split
+# chunk, ``all`` references every chunk.
+_REPLY_TO_MODES = ("off", "first", "all")
+_DEFAULT_REPLY_TO_MODE = "first"
+_DEFAULT_THREAD_NAME = "Hermes reply"
+
+
+def _coerce_reply_to_mode(value: Any, default: str = _DEFAULT_REPLY_TO_MODE) -> str:
+    """Normalize an outbound reply-reference mode; unknown values use ``default``."""
+    mode = str(value or "").strip().lower()
+    return mode if mode in _REPLY_TO_MODES else default
+
+
 def _voice_config_dict(extra: Dict[str, Any]) -> Dict[str, Any]:
     raw = extra.get("voice") if isinstance(extra, dict) else None
     return raw if isinstance(raw, dict) else {}
@@ -1036,6 +1051,21 @@ class FluxerAdapter(BasePlatformAdapter):
         self._mention_gated_channels = _split_ids(
             _fluxer_env("FLUXER_MENTION_GATED_CHANNELS") or extra.get("mention_gated_channels")
         )
+        # Outbound reply/thread behavior. ``reply_to_mode`` mirrors the Discord
+        # adapter's contract (off/first/all) so Hermes-side expectations --
+        # progress-reply placement, handoff threads, in-thread continuations --
+        # hold the same way on every platform. Thread replies are opt-in, per
+        # channel or install-wide, because they change where replies land.
+        self._reply_to_mode = _coerce_reply_to_mode(
+            _fluxer_env("FLUXER_REPLY_TO_MODE") or extra.get("reply_to_mode")
+        )
+        self._thread_replies_enabled = _coerce_bool(
+            _fluxer_env("FLUXER_THREAD_REPLIES", extra.get("thread_replies")),
+            False,
+        )
+        self._thread_reply_channels = _split_ids(
+            _fluxer_env("FLUXER_THREAD_REPLY_CHANNELS") or extra.get("thread_reply_channels")
+        )
         self._auto_free_response_home_guild = _coerce_bool(
             _fluxer_env("FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD", extra.get("auto_free_response_home_guild")),
             False,
@@ -1335,18 +1365,13 @@ class FluxerAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        payload: Dict[str, Any] = {}
-        if reply_to:
-            payload["message_reference"] = {"message_id": str(reply_to)}
-        if metadata:
-            thread_id = metadata.get("thread_id")
-            if thread_id and "message_reference" not in payload:
-                # Fluxer thread semantics are still stabilizing; keep this as
-                # metadata only when callers explicitly provide it.
-                payload["message_reference"] = {"message_id": str(thread_id)}
-        self._known_channel_ids.add(str(chat_id))
-
         try:
+            # Resolve the destination before anything is sent: an explicit
+            # thread_id wins, then opt-in thread replies may start a thread from
+            # the triggering message, then the channel itself.
+            target_chat_id, payload = await self._resolve_outbound_target(chat_id, reply_to, metadata)
+            self._known_channel_ids.add(str(target_chat_id))
+
             # Mention neutralization inserts zero-width characters. Apply it
             # before measuring so the final wire payload cannot cross Fluxer's
             # 4,000 UTF-16-unit limit after sanitization.
@@ -1357,15 +1382,16 @@ class FluxerAdapter(BasePlatformAdapter):
 
             for index, chunk in enumerate(chunks):
                 chunk_payload = self._outbound_message_payload(chunk, **payload)
-                if index > 0:
-                    # Reply/reference metadata only belongs on the first split
-                    # chunk; applying the same reference to every continuation
+                if index > 0 and self._reply_to_mode != "all":
+                    # "first" (default) and "off" keep the reference on the first
+                    # split chunk only; repeating it on every continuation
                     # creates noisy threads and can make partial retries nastier.
+                    # "all" mirrors the Discord adapter's every-chunk reference.
                     chunk_payload.pop("message_reference", None)
 
                 data = await self._request(
                     "POST",
-                    f"/channels/{_quote_id(chat_id)}/messages",
+                    f"/channels/{_quote_id(target_chat_id)}/messages",
                     json=chunk_payload,
                 )
                 responses.append(data)
@@ -1373,7 +1399,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     message_id = str(data["id"])
                     message_ids.append(message_id)
                     verified = await self._verify_delivery(
-                        chat_id,
+                        target_chat_id,
                         message_id,
                         expected_content=chunk_payload["content"],
                     )
@@ -1726,6 +1752,86 @@ class FluxerAdapter(BasePlatformAdapter):
             if channel_id not in seen:
                 channels.append({"id": channel_id, "name": channel_id, "type": "channel"})
         return channels
+
+    def _thread_replies_enabled_for(self, chat_id: str) -> bool:
+        """True when replies addressed to ``chat_id`` belong in a thread.
+
+        ``FLUXER_THREAD_REPLIES`` enables thread replies install-wide; an
+        explicit id in ``FLUXER_THREAD_REPLY_CHANNELS`` enables it for that
+        channel only (the same channel-list convention as
+        ``FLUXER_FREE_RESPONSE_CHANNELS``).
+        """
+        return bool(self._thread_replies_enabled or str(chat_id) in self._thread_reply_channels)
+
+    def _remember_thread_id(self, data: Any) -> Optional[str]:
+        """Record a thread returned by the API and return its id, else ``None``."""
+        thread_id = str((data or {}).get("id") or "").strip()
+        if thread_id:
+            self._known_channel_ids.add(thread_id)
+            return thread_id
+        return None
+
+    async def _start_thread_from_message(self, chat_id: str, message_id: str) -> Optional[str]:
+        """Best-effort thread start from ``message_id``; ``None`` keeps the channel.
+
+        Thread creation must never cost a reply, so any failure falls back to the
+        parent channel and the message still lands.
+        """
+        try:
+            data = await self.create_thread(
+                str(chat_id), _DEFAULT_THREAD_NAME, message_id=str(message_id)
+            )
+        except Exception as exc:
+            logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
+            return None
+        return self._remember_thread_id(data)
+
+    async def _resolve_outbound_target(
+        self,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[str, Dict[str, Any]]:
+        """Resolve ``(target_chat_id, reference_payload)`` for one outbound send.
+
+        Precedence mirrors the shared platform contract: an explicit
+        ``metadata['thread_id']`` wins, then opt-in thread replies may start a
+        thread from the triggering message, then the channel itself. The reply
+        reference honours ``FLUXER_REPLY_TO_MODE`` (``off`` suppresses it;
+        ``first``/``all`` place it on the first or every split chunk).
+        """
+        payload: Dict[str, Any] = {}
+        target_chat_id = str(chat_id)
+        explicit_thread_id = str((metadata or {}).get("thread_id") or "").strip()
+        started_thread = False
+        if explicit_thread_id:
+            target_chat_id = explicit_thread_id
+        elif reply_to and self._thread_replies_enabled_for(chat_id):
+            new_thread_id = await self._start_thread_from_message(chat_id, reply_to)
+            if new_thread_id:
+                target_chat_id = new_thread_id
+                started_thread = True
+        # A thread started from the triggering message already carries the parent
+        # context, so a second reference inside it is redundant.
+        if reply_to and self._reply_to_mode != "off" and not started_thread:
+            payload["message_reference"] = {"message_id": str(reply_to)}
+        return target_chat_id, payload
+
+    async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
+        """Create a fresh Fluxer thread for a CLI→platform handoff or ``/branch``.
+
+        Implements the shared ``BasePlatformAdapter.create_handoff_thread``
+        contract (the base returns ``None``), so a handoff's scrollback gets its
+        own thread instead of landing in the parent channel. Returns the new
+        thread id, or ``None`` when the server refuses -- callers then fall back
+        to ``parent_chat_id``.
+        """
+        try:
+            data = await self.create_thread(str(parent_chat_id), name or _DEFAULT_THREAD_NAME)
+        except Exception as exc:
+            logger.warning("Fluxer handoff thread creation failed for %s: %s", parent_chat_id, exc)
+            return None
+        return self._remember_thread_id(data)
 
     async def create_thread(
         self,

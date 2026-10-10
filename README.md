@@ -71,6 +71,9 @@ Implemented:
 - inbound `MESSAGE_CREATE` events through Fluxer Gateway WebSocket
 - direct messages, channels, groups, forums, and thread-like channel types where Fluxer exposes them
 - replies / referenced message context
+- reply references placed per the shared `off` / `first` / `all` contract, matching the Discord adapter's `reply_to_mode`
+- opt-in thread replies: a reply can start a thread from the triggering message and continue inside it
+- CLI and `/branch` session handoffs into their own thread, through the shared `create_handoff_thread` contract
 - message edits and deletes
 - pins, when the Fluxer server supports pin routes
 - media and document delivery from live Gateway tool calls, standalone sends, and scheduled delivery where Fluxer's API supports uploads or attachment URLs; a short message accompanying one image, video, document, or ordinary audio file is delivered as that attachment's native caption
@@ -88,7 +91,7 @@ Deployment-dependent / best-effort:
 
 - native slash commands
 - component buttons
-- thread behavior
+- server-side thread limits, archive windows, and event shapes on self-hosted Fluxer builds
 - media upload limits and supported content types
 - pin routes
 - exact gateway event shapes on self-hosted Fluxer builds
@@ -284,6 +287,9 @@ By default Hermes should not jump into every group conversation. Useful knobs:
 | `FLUXER_REQUIRE_MENTION` | `true` | Require a bot mention/direct address in normal channels. DMs do not need mentions. |
 | `FLUXER_STRICT_MENTION` | `false` | Require a fresh mention on every channel message instead of remembering mentioned threads. |
 | `FLUXER_FREE_RESPONSE_CHANNELS` | empty | Channels where Hermes may respond without a mention. |
+| `FLUXER_REPLY_TO_MODE` | `first` | Where the reply reference goes: `off`, `first` (first split chunk only), or `all` (every chunk). Matches the Discord adapter's `reply_to_mode`. |
+| `FLUXER_THREAD_REPLIES` | `false` | Post replies in a thread started from the triggering message, in every channel. |
+| `FLUXER_THREAD_REPLY_CHANNELS` | empty | Channel IDs where replies are posted in a thread started from the triggering message; other channels keep their normal behavior. |
 | `FLUXER_MENTION_PATTERNS` | empty | Extra comma-separated regexes that count as bot mentions/direct address patterns. |
 | `FLUXER_HOME_GUILD_ID` / `FLUXER_HOME_GUILDS` | empty | One or more trusted guild/community IDs used with `FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD`. |
 

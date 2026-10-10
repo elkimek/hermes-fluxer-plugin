@@ -622,15 +622,15 @@ def test_plugin_manifest_is_platform_plugin():
     }.issubset(optional)
 
 
-def test_release_metadata_matches_v033_changelog():
+def test_release_metadata_matches_v040_changelog():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = tomllib.load(handle)["project"]
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert manifest["version"] == "0.3.3"
-    assert project["version"] == "0.3.3"
-    assert "## [0.3.3] - 2026-08-30" in changelog
+    assert manifest["version"] == "0.4.0"
+    assert project["version"] == "0.4.0"
+    assert "## [0.4.0] - 2026-10-09" in changelog
 
 
 def test_fluxer_adapter_advertises_markdown_code_blocks():
@@ -2438,3 +2438,179 @@ def test_livekit_bridge_exposes_streaming_and_pcm_publish_helpers():
     assert "async def publish_pcm16" in source
     assert "def pcm16_publisher" in source
     assert "AsyncIterator[bytes]" in source
+
+
+# ── Outbound reply/thread contract ───────────────────────────────────────────
+# Mirrors the Discord adapter's reply_to_mode (off/first/all) and the shared
+# BasePlatformAdapter.create_handoff_thread contract, so Hermes-side
+# expectations hold the same way on Fluxer as on the built-in platforms.
+
+
+def _send_adapter(**extra_overrides):
+    extra = {
+        "bot_token": "app.secret",
+        "allow_all_users": True,
+        "delivery_verification": False,
+    }
+    extra.update(extra_overrides)
+    return fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra=extra))
+
+
+def test_reply_to_mode_is_exposed_for_the_shared_contract(monkeypatch):
+    monkeypatch.delenv("FLUXER_REPLY_TO_MODE", raising=False)
+
+    assert _send_adapter()._reply_to_mode == "first"
+    assert _send_adapter(reply_to_mode="all")._reply_to_mode == "all"
+    assert _send_adapter(reply_to_mode="off")._reply_to_mode == "off"
+    # Unknown values fall back to the default rather than disabling references.
+    assert _send_adapter(reply_to_mode="every")._reply_to_mode == "first"
+
+
+def test_reply_to_mode_reads_the_environment(monkeypatch):
+    monkeypatch.setenv("FLUXER_REPLY_TO_MODE", "all")
+
+    assert _send_adapter()._reply_to_mode == "all"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_mode_off_suppresses_the_reply_reference(monkeypatch):
+    monkeypatch.delenv("FLUXER_REPLY_TO_MODE", raising=False)
+    adapter = _send_adapter(reply_to_mode="off")
+    adapter._request = AsyncMock(return_value={"id": "msg-1"})
+
+    result = await adapter.send("chan-1", "hello", reply_to="user-msg-1")
+
+    assert result.success is True
+    payloads = [call.kwargs["json"] for call in adapter._request.await_args_list]
+    assert all("message_reference" not in payload for payload in payloads)
+
+
+@pytest.mark.asyncio
+async def test_reply_to_mode_first_references_only_the_first_chunk(monkeypatch):
+    monkeypatch.delenv("FLUXER_REPLY_TO_MODE", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(return_value={"id": "msg-1"})
+
+    result = await adapter.send("chan-1", "line\n" * 2000, reply_to="user-msg-1")
+
+    assert result.success is True
+    payloads = [call.kwargs["json"] for call in adapter._request.await_args_list]
+    assert len(payloads) > 1
+    assert payloads[0]["message_reference"] == {"message_id": "user-msg-1"}
+    assert all("message_reference" not in payload for payload in payloads[1:])
+
+
+@pytest.mark.asyncio
+async def test_reply_to_mode_all_references_every_chunk(monkeypatch):
+    monkeypatch.delenv("FLUXER_REPLY_TO_MODE", raising=False)
+    adapter = _send_adapter(reply_to_mode="all")
+    adapter._request = AsyncMock(return_value={"id": "msg-1"})
+
+    result = await adapter.send("chan-1", "line\n" * 2000, reply_to="user-msg-1")
+
+    assert result.success is True
+    payloads = [call.kwargs["json"] for call in adapter._request.await_args_list]
+    assert len(payloads) > 1
+    assert all(
+        payload["message_reference"] == {"message_id": "user-msg-1"} for payload in payloads
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_thread_id_targets_the_thread_channel(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(return_value={"id": "reply-1"})
+
+    result = await adapter.send(
+        "chan-1", "in-thread", reply_to="user-msg-1", metadata={"thread_id": "thread-7"}
+    )
+
+    assert result.success is True
+    call = adapter._request.await_args_list[0]
+    assert call.args == ("POST", "/channels/thread-7/messages")
+
+
+@pytest.mark.asyncio
+async def test_thread_reply_channels_start_a_thread_from_the_message(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._request = AsyncMock(side_effect=[{"id": "thread-9"}, {"id": "reply-1"}])
+
+    result = await adapter.send("chan-1", "threaded reply", reply_to="user-msg-1")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    assert calls[0].args == ("POST", "/channels/chan-1/messages/user-msg-1/threads")
+    assert calls[1].args == ("POST", "/channels/thread-9/messages")
+    # The thread-starter message already carries the parent context.
+    assert "message_reference" not in calls[1].kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_thread_replies_wrap_every_channel_when_enabled_globally(monkeypatch):
+    monkeypatch.setenv("FLUXER_THREAD_REPLIES", "true")
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(side_effect=[{"id": "thread-9"}, {"id": "reply-1"}])
+
+    result = await adapter.send("chan-any", "threaded reply", reply_to="user-msg-1")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    assert calls[0].args == ("POST", "/channels/chan-any/messages/user-msg-1/threads")
+    assert calls[1].args == ("POST", "/channels/thread-9/messages")
+
+
+@pytest.mark.asyncio
+async def test_thread_reply_falls_back_to_the_channel_when_thread_creation_fails(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+
+    async def _request(method, path, **kwargs):
+        if path.endswith("/threads"):
+            raise RuntimeError("threads unavailable")
+        return {"id": "reply-1"}
+
+    adapter._request = AsyncMock(side_effect=_request)
+
+    result = await adapter.send("chan-1", "still delivered", reply_to="user-msg-1")
+
+    assert result.success is True
+    call = adapter._request.await_args_list[-1]
+    assert call.args == ("POST", "/channels/chan-1/messages")
+    assert call.kwargs["json"]["message_reference"] == {"message_id": "user-msg-1"}
+
+
+@pytest.mark.asyncio
+async def test_create_handoff_thread_returns_the_new_thread_id(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(return_value={"id": "thread-42"})
+
+    thread_id = await adapter.create_handoff_thread("chan-1", "CLI session")
+
+    assert thread_id == "thread-42"
+    call = adapter._request.await_args_list[0]
+    assert call.args == ("POST", "/channels/chan-1/threads")
+    assert call.kwargs["json"]["name"] == "CLI session"
+    assert "thread-42" in adapter._known_channel_ids
+
+
+@pytest.mark.asyncio
+async def test_create_handoff_thread_returns_none_when_creation_fails(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(side_effect=RuntimeError("unsupported"))
+
+    assert await adapter.create_handoff_thread("chan-1", "CLI session") is None
+
+
+@pytest.mark.asyncio
+async def test_create_handoff_thread_falls_back_to_a_default_name(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(return_value={"id": "thread-42"})
+
+    assert await adapter.create_handoff_thread("chan-1", "") == "thread-42"
+    call = adapter._request.await_args_list[0]
+    assert call.kwargs["json"]["name"] == fluxer_adapter._DEFAULT_THREAD_NAME
