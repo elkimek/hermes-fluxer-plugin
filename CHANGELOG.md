@@ -13,7 +13,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Added
 
-- Reply references now follow the shared `off` / `first` / `all` contract through `FLUXER_REPLY_TO_MODE`, matching the Discord adapter's `reply_to_mode`. `first` stays the default, so existing installs behave exactly as before; `all` repeats the reference on every split chunk and `off` suppresses it entirely.
+- Reply references now follow the shared `off` / `first` / `all` contract through `FLUXER_REPLY_TO_MODE` and the shared `PlatformConfig.reply_to_mode` field, matching the Discord adapter's `reply_to_mode`. `first` stays the default, so existing installs behave exactly as before; `all` repeats the reference on every split chunk and `off` suppresses it entirely.
 - Opt-in thread replies through `FLUXER_THREAD_REPLIES` and `FLUXER_THREAD_REPLY_CHANNELS`. When enabled, a reply starts a thread from the triggering message and is posted inside it, so a busy channel keeps its main timeline clean. Thread creation is best-effort: if the server refuses, the reply still lands in the parent channel.
 - `create_handoff_thread()`, implementing the shared `BasePlatformAdapter` contract that `/branch` and CLI-to-platform handoffs already call. Those sessions now get their own thread instead of being delivered into the home channel.
 

@@ -1054,10 +1054,15 @@ class FluxerAdapter(BasePlatformAdapter):
         # Outbound reply/thread behavior. ``reply_to_mode`` mirrors the Discord
         # adapter's contract (off/first/all) so Hermes-side expectations --
         # progress-reply placement, handoff threads, in-thread continuations --
-        # hold the same way on every platform. Thread replies are opt-in, per
-        # channel or install-wide, because they change where replies land.
+        # hold the same way on every platform. The shared ``PlatformConfig``
+        # field is the canonical source, matching how the Discord adapter reads
+        # it; env/extra stay supported for installs that configure per platform.
+        # Thread replies are opt-in, per channel or install-wide, because they
+        # change where replies land.
         self._reply_to_mode = _coerce_reply_to_mode(
-            _fluxer_env("FLUXER_REPLY_TO_MODE") or extra.get("reply_to_mode")
+            _fluxer_env("FLUXER_REPLY_TO_MODE")
+            or extra.get("reply_to_mode")
+            or getattr(config, "reply_to_mode", None)
         )
         self._thread_replies_enabled = _coerce_bool(
             _fluxer_env("FLUXER_THREAD_REPLIES", extra.get("thread_replies")),

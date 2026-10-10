@@ -287,7 +287,7 @@ By default Hermes should not jump into every group conversation. Useful knobs:
 | `FLUXER_REQUIRE_MENTION` | `true` | Require a bot mention/direct address in normal channels. DMs do not need mentions. |
 | `FLUXER_STRICT_MENTION` | `false` | Require a fresh mention on every channel message instead of remembering mentioned threads. |
 | `FLUXER_FREE_RESPONSE_CHANNELS` | empty | Channels where Hermes may respond without a mention. |
-| `FLUXER_REPLY_TO_MODE` | `first` | Where the reply reference goes: `off`, `first` (first split chunk only), or `all` (every chunk). Matches the Discord adapter's `reply_to_mode`. |
+| `FLUXER_REPLY_TO_MODE` | `first` | Where the reply reference goes: `off`, `first` (first split chunk only), or `all` (every chunk). Defaults to the shared `PlatformConfig.reply_to_mode`, matching the Discord adapter; set it here to override per install. |
 | `FLUXER_THREAD_REPLIES` | `false` | Post replies in a thread started from the triggering message, in every channel. |
 | `FLUXER_THREAD_REPLY_CHANNELS` | empty | Channel IDs where replies are posted in a thread started from the triggering message; other channels keep their normal behavior. |
 | `FLUXER_MENTION_PATTERNS` | empty | Extra comma-separated regexes that count as bot mentions/direct address patterns. |

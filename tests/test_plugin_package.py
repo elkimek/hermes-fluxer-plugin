@@ -2472,6 +2472,29 @@ def test_reply_to_mode_reads_the_environment(monkeypatch):
     assert _send_adapter()._reply_to_mode == "all"
 
 
+def test_reply_to_mode_reads_the_shared_platform_config_field(monkeypatch):
+    """The canonical source is the shared PlatformConfig field, as on Discord.
+
+    ``tests/conftest.py`` substitutes a minimal ``gateway`` stub when the Hermes
+    tree is absent (as in CI), and that stub predates ``reply_to_mode``, so the
+    attribute is set directly. Both the stub and the real ``PlatformConfig``
+    resolve it the same way.
+    """
+    monkeypatch.delenv("FLUXER_REPLY_TO_MODE", raising=False)
+    config = PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    config.reply_to_mode = "all"
+
+    assert fluxer_adapter.FluxerAdapter(config)._reply_to_mode == "all"
+
+
+def test_reply_to_mode_precedence_favours_env_over_platform_config(monkeypatch):
+    monkeypatch.setenv("FLUXER_REPLY_TO_MODE", "off")
+    config = PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    config.reply_to_mode = "all"
+
+    assert fluxer_adapter.FluxerAdapter(config)._reply_to_mode == "off"
+
+
 @pytest.mark.asyncio
 async def test_reply_to_mode_off_suppresses_the_reply_reference(monkeypatch):
     monkeypatch.delenv("FLUXER_REPLY_TO_MODE", raising=False)
