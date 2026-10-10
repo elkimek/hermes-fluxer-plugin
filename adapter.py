@@ -1459,8 +1459,16 @@ class FluxerAdapter(BasePlatformAdapter):
                     auto_thread_id = None
                     target_chat_id = str(chat_id)
                     self._known_channel_ids.add(target_chat_id)
-                    if reply_to and self._reply_to_mode != "off" and "message_reference" not in chunk_payload:
+                    if reply_to and self._reply_to_mode != "off":
+                        # Restore the reference in the shared payload as well: the
+                        # remaining chunks of a split reply are rebuilt from it, so
+                        # patching only this chunk would leave every later one
+                        # unlinked after a fallback. The mode still decides where
+                        # the reference lands.
+                        payload["message_reference"] = {"message_id": str(reply_to)}
                         chunk_payload["message_reference"] = {"message_id": str(reply_to)}
+                        if index > 0 and self._reply_to_mode != "all":
+                            chunk_payload.pop("message_reference", None)
                     data = await self._request(
                         "POST",
                         f"/channels/{_quote_id(target_chat_id)}/messages",
@@ -1872,15 +1880,20 @@ class FluxerAdapter(BasePlatformAdapter):
         tid = str(thread_id or "").strip()
         if not tid:
             return
+        # Release only the turn anchors that pointed at the thread being
+        # invalidated. A channel whose own thread has not been created yet has no
+        # entry in ``_threads_by_anchor`` either, so reading "no entry" as "this
+        # anchor pointed here" would drop an unrelated channel's anchor and let a
+        # later message become that channel's reply anchor. Run before the
+        # ``_threads_by_anchor`` cleanup, which is what the check reads.
+        for chat_key, (anchor, _pinned_at) in list(self._turn_anchor.items()):
+            if self._threads_by_anchor.get((chat_key, str(anchor))) == tid:
+                self._turn_anchor.pop(chat_key, None)
         self._known_channel_ids.discard(tid)
         self._thread_parents.pop(tid, None)
         self._mentioned_threads.pop(tid, None)
         for key in [k for k, v in self._threads_by_anchor.items() if v == tid]:
             self._threads_by_anchor.pop(key, None)
-        # Release any turn anchor that pointed at the thread just invalidated.
-        for chat_key, (anchor, _pinned_at) in list(self._turn_anchor.items()):
-            if (chat_key, anchor) not in self._threads_by_anchor:
-                self._turn_anchor.pop(chat_key, None)
 
     def _pinned_turn_anchor(self, chat_id: str) -> str:
         """Anchor message pinned when the current turn started, else ``""``."""

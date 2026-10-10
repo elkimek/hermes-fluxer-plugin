@@ -3045,3 +3045,93 @@ def test_thread_inherits_free_response_from_its_parent(monkeypatch):
     )
 
     assert allowed is True
+
+
+@pytest.mark.asyncio
+async def test_forgetting_a_thread_leaves_other_channels_anchors_alone(monkeypatch):
+    """A deleted thread must not release a second channel's pinned anchor.
+
+    Two turns can run at once. When channel A abandons a thread that was
+    deleted, channel B is still producing its reply and its own thread has not
+    been created yet, so it has no ``_threads_by_anchor`` entry either.
+    """
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1", "chan-2"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._last_inbound_by_chat["chan-2"] = "user-msg-2"
+    adapter._typing_tasks["chan-1"] = _completed_typing_task()
+    adapter._typing_tasks["chan-2"] = _completed_typing_task()
+    await adapter.send_typing("chan-1")
+    await adapter.send_typing("chan-2")
+    adapter._request = AsyncMock(side_effect=[{"id": "thread-1"}])
+    await adapter._start_thread_from_message("chan-1", "user-msg-1")
+
+    adapter._forget_thread("thread-1")
+
+    # chan-1's anchor pointed at the dead thread; chan-2's never did.
+    assert "chan-1" not in adapter._turn_anchor
+    assert adapter._turn_anchor["chan-2"][0] == "user-msg-2"
+    assert ("chan-1", "user-msg-1") not in adapter._threads_by_anchor
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_thread_keeps_references_on_the_remaining_chunks(monkeypatch):
+    """With ``all``, a fallback mid-reply keeps every later chunk linked."""
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"], reply_to_mode="all")
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    state = {"thread_failed": False, "sent": 0}
+
+    async def _request(method, path, **kwargs):
+        if path.endswith("/threads"):
+            return {"id": "thread-1"}
+        if path == "/channels/thread-1/messages" and not state["thread_failed"]:
+            state["thread_failed"] = True
+            raise _RestStatusError(404)
+        state["sent"] += 1
+        return {"id": f"fallback-{state['sent']}"}
+
+    adapter._request = AsyncMock(side_effect=_request)
+
+    result = await adapter.send("chan-1", "line\n" * 2000, reply_to="user-msg-1")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    assert calls[0].args == ("POST", "/channels/chan-1/messages/user-msg-1/threads")
+    assert calls[1].args == ("POST", "/channels/thread-1/messages")
+    channel_posts = [c for c in calls[2:] if c.args == ("POST", "/channels/chan-1/messages")]
+    assert len(channel_posts) > 1
+    assert all(
+        c.kwargs["json"]["message_reference"] == {"message_id": "user-msg-1"}
+        for c in channel_posts
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_thread_keeps_first_only_references_on_one_chunk(monkeypatch):
+    """With ``first``, the fallback references the reply once, not per chunk."""
+    monkeypatch.delenv("FLUXER_REPLY_TO_MODE", raising=False)
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    state = {"thread_failed": False, "sent": 0}
+
+    async def _request(method, path, **kwargs):
+        if path.endswith("/threads"):
+            return {"id": "thread-1"}
+        if path == "/channels/thread-1/messages" and not state["thread_failed"]:
+            state["thread_failed"] = True
+            raise _RestStatusError(404)
+        state["sent"] += 1
+        return {"id": f"fallback-{state['sent']}"}
+
+    adapter._request = AsyncMock(side_effect=_request)
+
+    result = await adapter.send("chan-1", "line\n" * 2000, reply_to="user-msg-1")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    channel_posts = [c for c in calls[2:] if c.args == ("POST", "/channels/chan-1/messages")]
+    assert len(channel_posts) > 1
+    assert channel_posts[0].kwargs["json"]["message_reference"] == {"message_id": "user-msg-1"}
+    assert all("message_reference" not in c.kwargs["json"] for c in channel_posts[1:])
