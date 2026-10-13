@@ -90,6 +90,9 @@ except ModuleNotFoundError:
         def build_source(self, **kwargs: Any) -> SimpleNamespace:
             return SimpleNamespace(**kwargs)
 
+        def set_session_store(self, session_store: Any) -> None:
+            self._session_store = session_store
+
         def validate_media_delivery_path(self, file_path: str) -> Path:
             path = Path(file_path)
             if not path.exists():

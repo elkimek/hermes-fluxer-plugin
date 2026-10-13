@@ -127,7 +127,7 @@ def state_db(monkeypatch):
     conn.close()
     monkeypatch.setenv("HERMES_HOME", home)
     store = FakeSessionStore(db)
-    monkeypatch.setattr(fluxer_adapter, "_open_session_store", lambda: store)
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", lambda home=None: store)
     return db
 
 
@@ -203,50 +203,50 @@ def test_no_raw_sqlite_read_is_shipped():
 def test_the_store_is_opened_lazily_once(monkeypatch):
     opened: list = []
 
-    def fake_open():
+    def fake_open(home=None):
         opened.append(1)
         return FakeSessionStore(Path("/nonexistent"))
 
     monkeypatch.setattr(fluxer_adapter, "_open_session_store", fake_open)
     adapter = _adapter()
 
-    assert adapter._session_store() is not None
-    assert adapter._session_store() is not None
+    assert adapter._get_session_store() is not None
+    assert adapter._get_session_store() is not None
     assert len(opened) == 1
 
 
 def test_an_absent_store_is_not_retried(monkeypatch):
     opened: list = []
 
-    def fake_open():
+    def fake_open(home=None):
         opened.append(1)
         return None
 
     monkeypatch.setattr(fluxer_adapter, "_open_session_store", fake_open)
     adapter = _adapter()
 
-    assert adapter._session_store() is None
-    assert adapter._session_store() is None
+    assert adapter._get_session_store() is None
+    assert adapter._get_session_store() is None
     assert len(opened) == 1
 
 
 def test_closing_the_store_releases_it_and_allows_a_reopen(monkeypatch):
     opened: list = []
 
-    def fake_open():
+    def fake_open(home=None):
         store = FakeSessionStore(Path("/nonexistent"))
         opened.append(store)
         return store
 
     monkeypatch.setattr(fluxer_adapter, "_open_session_store", fake_open)
     adapter = _adapter()
-    first = adapter._session_store()
+    first = adapter._get_session_store()
 
     adapter._close_session_store()
 
     assert first.closed is True
     assert adapter._session_db is None
-    assert adapter._session_store() is not first
+    assert adapter._get_session_store() is not first
     assert len(opened) == 2
 
 
@@ -298,7 +298,7 @@ def test_the_real_store_exposes_what_the_plugin_calls(real_read_only_store):
 
 def test_the_plugin_reads_a_real_store(monkeypatch, real_read_only_store):
     """End to end against core's own store: no fake anywhere in the read path."""
-    monkeypatch.setattr(fluxer_adapter, "_open_session_store", lambda: real_read_only_store)
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", lambda home=None: real_read_only_store)
     adapter = _adapter()
 
     assert adapter._session_title_for_chat("chan-1") == "Deploy the thing"
@@ -383,7 +383,7 @@ def test_session_title_is_none_without_a_store(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _adapter()
 
-    assert adapter._session_store() is None
+    assert adapter._get_session_store() is None
     assert adapter._session_title_for_chat("chan-1") is None
 
 
@@ -400,7 +400,7 @@ def test_session_title_survives_a_store_that_raises_unexpectedly(state_db):
     def boom(**_kw):
         raise RuntimeError("boom")
 
-    adapter._session_store().find_session_by_origin = boom
+    adapter._get_session_store().find_session_by_origin = boom
 
     assert adapter._session_title_for_chat("chan-1") is None
 
@@ -867,9 +867,11 @@ async def test_an_evicted_title_check_is_cancelled_not_just_dropped():
         loop.create_task = original_create_task  # type: ignore[method-assign]
 
     assert len(adapter._title_tasks) == fluxer_adapter._TITLE_RENAME_MAX_PENDING
-    assert started[0].cancelled() or started[0].cancelling()
     assert started[-1] in adapter._title_tasks.values()
     adapter._rename_thread_when_titled.assert_not_awaited()
+    await asyncio.sleep(0)
+    assert started[0].cancelled()
+    await asyncio.gather(*started, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -597,21 +598,22 @@ _TITLE_RENAME_MAX_PENDING = 64
 _LIVE_ADAPTERS: "weakref.WeakSet[FluxerAdapter]" = weakref.WeakSet()
 
 
-def _state_db_path() -> Optional[Path]:
-    """Path of the Hermes session store, or ``None`` when it is not there yet."""
-    home = os.environ.get("HERMES_HOME") or ""
-    if not home:
-        try:  # Standalone plugin tests load no Hermes runtime.
-            from hermes_constants import get_hermes_home  # type: ignore
+def _current_session_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
 
-            home = str(get_hermes_home())
-        except Exception:
-            home = str(Path.home() / ".hermes")
-    path = Path(home) / "state.db"
+        return Path(get_hermes_home())
+    except ImportError:
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _state_db_path(home: Optional[Path] = None) -> Optional[Path]:
+    """Path of the Hermes session store, or ``None`` when it is not there yet."""
+    path = (Path(home) if home is not None else _current_session_home()) / "state.db"
     return path if path.exists() else None
 
 
-def _open_session_store() -> Optional[Any]:
+def _open_session_store(home: Optional[Path] = None) -> Optional[Any]:
     """Hermes' own session store, opened read-only, or ``None`` when unavailable.
 
     Reads the session title back out of ``state.db`` through core's ``SessionDB``
@@ -625,12 +627,13 @@ def _open_session_store() -> Optional[Any]:
     Every failure — no store yet, no Hermes runtime, a store this build cannot
     read — is a missing name, never a broken turn.
     """
-    if _state_db_path() is None:
+    path = _state_db_path(home)
+    if path is None:
         return None
     try:
         from hermes_state import SessionDB  # type: ignore
 
-        return SessionDB(read_only=True)
+        return SessionDB(db_path=path, read_only=True)
     except Exception as exc:
         logger.debug("Fluxer session store unavailable: %s", exc)
         return None
@@ -1264,13 +1267,11 @@ class FluxerAdapter(BasePlatformAdapter):
         # Parent channel of every thread this adapter created, so a thread
         # inherits its parent's allowlist status and can seed mention memory.
         self._thread_parents: Dict[str, str] = {}
-        # Anchor message of the turn currently in flight, per channel. The live
-        # listener runs alongside backlog recovery, so the channel's latest
-        # inbound message can change while a reply is still being produced.
-        # Pinning the anchor when the turn starts keeps a progress bubble, its
-        # final reply, and any trailing upload in one thread. Entries carry a
-        # timestamp so a missed stop cannot strand a channel in an old thread.
-        self._turn_anchor: Dict[str, tuple] = {}
+        # Routing belongs to the executing event, not the channel's newest
+        # message or the typing lifetime. Child tasks inherit the context;
+        # queued turns rebind it when their processing actually begins.
+        self._turn_context: ContextVar[Optional[tuple[Any, str]]] = ContextVar("fluxer_turn", default=None)
+        self._turn_anchor: Dict[tuple[str, str], tuple] = {}
         self._turn_anchor_ttl = 1800.0
         # Channels where the automatically chosen thread turned out to be gone.
         # Auto-threading is skipped for the rest of the turn so the fallback to
@@ -1354,10 +1355,13 @@ class FluxerAdapter(BasePlatformAdapter):
         # ``_open_session_store``). Opened on first use rather than in ``connect``
         # because the store may not exist yet when the gateway starts.
         self._session_db: Optional[Any] = None
+        self._title_home = _current_session_home()
+        self._session_readers: Dict[Path, Any] = {}
+        self._unavailable_session_homes: set[Path] = set()
         self._session_db_lock = threading.Lock()
         self._session_db_off = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._typing_tasks: Dict[str, asyncio.Task] = {}
+        self._typing_tasks: Dict[tuple[str, str], asyncio.Task] = {}
         self._pending_exec_approvals: Dict[str, Dict[str, Any]] = {}
         self._pending_component_actions: Dict[str, Dict[str, Any]] = {}
         self._pending_reaction_actions: Dict[str, Dict[str, Any]] = {}
@@ -1657,7 +1661,7 @@ class FluxerAdapter(BasePlatformAdapter):
                         chat_id,
                     )
                     self._forget_thread(auto_thread_id)
-                    self._turn_thread_disabled.add(str(chat_id))
+                    self._disable_turn_thread(chat_id, reply_to, metadata)
                     auto_thread_id = None
                     target_chat_id = str(chat_id)
                     self._known_channel_ids.add(target_chat_id)
@@ -2088,9 +2092,9 @@ class FluxerAdapter(BasePlatformAdapter):
         # anchor pointed here" would drop an unrelated channel's anchor and let a
         # later message become that channel's reply anchor. Run before the
         # ``_threads_by_anchor`` cleanup, which is what the check reads.
-        for chat_key, (anchor, _pinned_at) in list(self._turn_anchor.items()):
-            if self._threads_by_anchor.get((chat_key, str(anchor))) == tid:
-                self._turn_anchor.pop(chat_key, None)
+        for turn_key, (anchor, _pinned_at) in list(self._turn_anchor.items()):
+            if self._threads_by_anchor.get((turn_key[0], str(anchor))) == tid:
+                self._turn_anchor.pop(turn_key, None)
         self._known_channel_ids.discard(tid)
         self._thread_parents.pop(tid, None)
         self._mentioned_threads.pop(tid, None)
@@ -2103,24 +2107,65 @@ class FluxerAdapter(BasePlatformAdapter):
 
     def _pinned_turn_anchor(self, chat_id: str) -> str:
         """Anchor message pinned when the current turn started, else ``""``."""
-        entry = self._turn_anchor.get(str(chat_id))
+        key = self._turn_key(chat_id)
+        if key[1]:
+            return key[1]
+        entry = self._turn_anchor.get(key)
         if not entry:
             return ""
         anchor, pinned_at = entry
         if time.monotonic() - pinned_at > self._turn_anchor_ttl:
-            self._turn_anchor.pop(str(chat_id), None)
+            self._turn_anchor.pop(key, None)
             return ""
         return str(anchor or "")
 
-    def _pin_turn_anchor(self, chat_id: str) -> None:
-        """Pin this turn's anchor once, at turn start."""
-        chat_key = str(chat_id)
-        if chat_key in self._turn_anchor:
+    def _turn_key(self, chat_id: str, reply_to=None, metadata=None) -> tuple[str, str]:
+        """Only explicit anchors or the executing event can own a delivery."""
+        anchor = str(reply_to or (metadata or {}).get("reply_to_message_id") or "")
+        context = self._turn_context.get()
+        if not anchor and context and str(context[0].source.chat_id) == str(chat_id):
+            anchor = str(context[0].message_id or "")
+        return str(chat_id), anchor
+
+    def _disable_turn_thread(self, chat_id: str, reply_to=None, metadata=None) -> None:
+        key = self._turn_key(chat_id, reply_to, metadata)
+        if len(self._turn_thread_disabled) >= self._threads_by_anchor_max:
+            self._turn_thread_disabled.pop()
+        self._turn_thread_disabled.add(key)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        # Inline commands execute here; spawned work inherits the context.
+        marker = self._turn_context.set((event, ""))
+        try:
+            await super().handle_message(event)
+        finally:
+            self._turn_context.reset(marker)
+
+    async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+        # Pending drains can run in the previous turn's task. Rebind to their
+        # actual event, keeping ownership until final/footer/media delivery ends.
+        marker = self._turn_context.set((event, session_key))
+        key = self._turn_key(event.source.chat_id)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            try:
+                await self.stop_typing(event.source.chat_id)
+            finally:
+                self._turn_anchor.pop(key, None)
+                self._turn_thread_disabled.discard(key)
+                self._turn_context.reset(marker)
+
+    def _pin_turn_anchor(self, chat_id: str, metadata=None) -> None:
+        """Remember only the executing event or an explicit trigger."""
+        key = self._turn_key(chat_id, metadata=metadata)
+        if key in self._turn_anchor:
             return
-        self._turn_thread_disabled.discard(chat_key)
-        anchor = str(self._last_inbound_by_chat.get(chat_key) or "")
+        anchor = key[1]
         if anchor:
-            self._turn_anchor[chat_key] = (anchor, time.monotonic())
+            self._turn_anchor[key] = (anchor, time.monotonic())
+            if len(self._turn_anchor) > self._threads_by_anchor_max:
+                self._turn_anchor.pop(next(iter(self._turn_anchor)))
 
     def _remember_thread_id(self, data: Any, parent_chat_id: Optional[str] = None) -> Optional[str]:
         """Record a thread returned by the API and return its id, else ``None``."""
@@ -2260,7 +2305,7 @@ class FluxerAdapter(BasePlatformAdapter):
         deliberately: it is a slice of the triggering message, i.e. what the
         placeholder already says.
         """
-        store = self._session_store()
+        store = self._get_session_store()
         chat_key = str(chat_id or "")
         if store is None or not chat_key:
             return None
@@ -2281,7 +2326,9 @@ class FluxerAdapter(BasePlatformAdapter):
 
     def _session_origin_for_key(self, session_key: str) -> Optional[tuple[str, str]]:
         """``(chat_id, user_id)`` of the newest session row for ``session_key``."""
-        store = self._session_store()
+        parts = str(session_key or "").split(":", 2)
+        profile = parts[1] if len(parts) == 3 and parts[0] == "agent" else None
+        store = self._get_session_store(profile=None if profile == "main" else profile)
         key = str(session_key or "").strip()
         if store is None or not key:
             return None
@@ -2305,31 +2352,44 @@ class FluxerAdapter(BasePlatformAdapter):
         origin = self._session_origin_for_key(session_key)
         return origin[0] if origin else None
 
-    def _session_store(self) -> Optional[Any]:
-        """The read-only session store, opened on first use. ``None`` when absent."""
-        if self._session_db is not None or self._session_db_off:
-            return self._session_db
+    def _get_session_store(self, profile: Optional[str] = None) -> Optional[Any]:
+        """An owned reader for the routed profile, not the host-injected field."""
+        context = self._turn_context.get()
+        source = context[0].source if context else None
+        profile = profile or getattr(source, "profile", None) or getattr(self, "_owner_profile", None)
+        home = self._title_home
+        if profile:
+            try:
+                from hermes_cli.profiles import get_profile_dir
+
+                home = Path(get_profile_dir(profile))
+            except (ImportError, ValueError):
+                return None  # Never fall back to another profile's titles.
         with self._session_db_lock:
-            if self._session_db is None and not self._session_db_off:
-                store = _open_session_store()
+            if home in self._unavailable_session_homes:
+                return None
+            if home not in self._session_readers:
+                store = _open_session_store(home)
                 if store is None:
-                    # No store yet (or no runtime): stop retrying, and let a
-                    # reconnect try again — see ``_open_session_store``.
-                    self._session_db_off = True
-                self._session_db = store
-        return self._session_db
+                    self._unavailable_session_homes.add(home)
+                    return None
+                self._session_readers[home] = store
+            self._session_db = self._session_readers[home]
+            return self._session_db
 
     def _close_session_store(self) -> None:
         """Release the session store handle; a later use reopens it."""
-        store = self._session_db
-        self._session_db = None
-        self._session_db_off = False
-        if store is None:
-            return
-        try:
-            store.close()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("Fluxer session store close failed: %s", exc)
+        with self._session_db_lock:
+            stores = list(self._session_readers.values())
+            self._session_readers.clear()
+            self._unavailable_session_homes.clear()
+            self._session_db = None
+            self._session_db_off = False
+            for store in stores:
+                try:
+                    store.close()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("Fluxer session store close failed: %s", type(exc).__name__)
 
     def _schedule_title_rename(
         self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None
@@ -2470,17 +2530,13 @@ class FluxerAdapter(BasePlatformAdapter):
         started_thread = False
         if explicit_thread_id:
             target_chat_id = explicit_thread_id
-        elif self._thread_replies_enabled_for(chat_id) and str(chat_id) not in self._turn_thread_disabled:
+        elif self._thread_replies_enabled_for(chat_id) and self._turn_key(chat_id, reply_to, metadata) not in self._turn_thread_disabled:
             # The gateway sets ``reply_to`` only for a few platforms and supplies
             # no thread id for Fluxer. Prefer the trigger in hand, then the anchor
             # pinned when this turn started -- the channel's latest inbound message
             # can move while a reply is still being produced, and using it here
             # would split one turn across two threads.
-            anchor = (
-                str(reply_to or "").strip()
-                or self._pinned_turn_anchor(chat_id)
-                or str(self._last_inbound_by_chat.get(str(chat_id)) or "")
-            )
+            anchor = self._turn_key(chat_id, reply_to, metadata)[1]
             if anchor:
                 new_thread_id = await self._start_thread_from_message(chat_id, anchor)
                 if new_thread_id:
@@ -2580,12 +2636,8 @@ class FluxerAdapter(BasePlatformAdapter):
         clean typing-only "I am working" mode when ``display.tool_progress`` is
         set to ``off``.
         """
-        chat_key = str(chat_id)
-        # Hermes calls send_typing when a turn starts. Pin the triggering message
-        # now: the channel's latest inbound message can change while the reply is
-        # still being produced, and re-reading it later would split one turn's
-        # progress bubble and final reply across two threads.
-        self._pin_turn_anchor(chat_key)
+        chat_key = self._turn_key(chat_id, metadata=metadata)
+        self._pin_turn_anchor(chat_id, metadata)
         if chat_key in self._typing_tasks:
             return
 
@@ -2593,7 +2645,7 @@ class FluxerAdapter(BasePlatformAdapter):
             try:
                 while True:
                     try:
-                        await self._request("POST", f"/channels/{_quote_id(chat_key)}/typing", json={})
+                        await self._request("POST", f"/channels/{_quote_id(chat_id)}/typing", json={})
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -2607,12 +2659,10 @@ class FluxerAdapter(BasePlatformAdapter):
 
         self._typing_tasks[chat_key] = asyncio.create_task(_typing_loop(), name=f"fluxer-typing-{chat_key}")
 
-    async def stop_typing(self, chat_id: str) -> None:
-        chat_key = str(chat_id)
-        # The turn is over: release the pinned anchor and let the next turn pick
-        # its own trigger rather than inheriting this thread.
-        self._turn_anchor.pop(chat_key, None)
-        self._turn_thread_disabled.discard(chat_key)
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
+        chat_key = self._turn_key(chat_id, metadata=metadata)
+        # Typing can stop before trailing output; only delivery completion
+        # releases ownership. One user's stop cannot cancel another user's loop.
         task = self._typing_tasks.pop(chat_key, None)
         if task and not task.done():
             task.cancel()
@@ -2776,7 +2826,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     chat_id,
                 )
                 self._forget_thread(auto_thread_id)
-                self._turn_thread_disabled.add(str(chat_id))
+                self._disable_turn_thread(chat_id, reply_to, metadata)
                 auto_thread_id = None
                 target_chat_id = str(chat_id)
                 self._known_channel_ids.add(target_chat_id)

@@ -2797,15 +2797,14 @@ async def test_edit_and_delete_fall_back_to_the_given_channel_for_unknown_messag
 
 
 @pytest.mark.asyncio
-async def test_thread_reply_uses_the_last_inbound_message_when_reply_to_is_absent(monkeypatch):
-    """The gateway supplies no reply_to and no thread id for Fluxer, so the
-    adapter anchors the thread on the most recent inbound message itself."""
+async def test_thread_reply_accepts_explicit_anchor_metadata(monkeypatch):
+    """Standalone senders must supply an anchor rather than guessing history."""
     monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
     adapter = _send_adapter(thread_reply_channels=["chan-1"])
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-7"
     adapter._request = AsyncMock(side_effect=[{"id": "thread-9"}, {"id": "reply-1"}])
 
-    result = await adapter.send("chan-1", "threaded reply")
+    result = await adapter.send("chan-1", "threaded reply", metadata={"reply_to_message_id": "user-msg-7"})
 
     assert result.success is True
     calls = adapter._request.await_args_list
@@ -2835,8 +2834,8 @@ async def test_progress_and_final_reply_share_one_thread(monkeypatch):
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-7"
     adapter._request = AsyncMock(side_effect=[{"id": "thread-9"}, {"id": "p-1"}, {"id": "f-1"}])
 
-    await adapter.send("chan-1", "working…")
-    await adapter.send("chan-1", "done")
+    await adapter.send("chan-1", "working…", reply_to="user-msg-7")
+    await adapter.send("chan-1", "done", reply_to="user-msg-7")
 
     posts = [c.args for c in adapter._request.await_args_list]
     # Exactly one thread creation, then both messages inside it.
@@ -2892,14 +2891,14 @@ async def test_typing_pins_the_turn_anchor_before_the_turn_can_drift(monkeypatch
     monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
     adapter = _send_adapter(thread_reply_channels=["chan-1"])
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
-    adapter._typing_tasks["chan-1"] = _completed_typing_task()
+    adapter._typing_tasks[("chan-1", "user-msg-1")] = _completed_typing_task()
 
-    await adapter.send_typing("chan-1")
+    await adapter.send_typing("chan-1", metadata={"reply_to_message_id": "user-msg-1"})
     # Another accepted message arrives while this reply is still being produced.
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-2"
     adapter._request = AsyncMock(side_effect=[{"id": "thread-1"}, {"id": "reply-1"}])
 
-    await adapter.send("chan-1", "the reply")
+    await adapter.send("chan-1", "the reply", metadata={"reply_to_message_id": "user-msg-1"})
 
     # The thread is anchored on the message that started the turn, not the newest.
     assert adapter._request.await_args_list[0].args == (
@@ -2913,35 +2912,35 @@ async def test_typing_refreshes_do_not_move_the_turn_anchor(monkeypatch):
     monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
     adapter = _send_adapter(thread_reply_channels=["chan-1"])
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
-    adapter._typing_tasks["chan-1"] = _completed_typing_task()
-    await adapter.send_typing("chan-1")
+    adapter._typing_tasks[("chan-1", "user-msg-1")] = _completed_typing_task()
+    await adapter.send_typing("chan-1", metadata={"reply_to_message_id": "user-msg-1"})
 
     # A mid-turn resume (e.g. re-arming typing after a clarify prompt) must not
     # re-pin against a message that arrived in the meantime.
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-2"
-    await adapter.send_typing("chan-1")
+    await adapter.send_typing("chan-1", metadata={"reply_to_message_id": "user-msg-1"})
 
-    assert adapter._turn_anchor["chan-1"][0] == "user-msg-1"
+    assert adapter._turn_anchor[("chan-1", "user-msg-1")][0] == "user-msg-1"
 
 
 @pytest.mark.asyncio
-async def test_stop_typing_releases_the_anchor_for_the_next_turn(monkeypatch):
+async def test_stop_typing_retains_anchor_for_trailing_delivery(monkeypatch):
     monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
     adapter = _send_adapter(thread_reply_channels=["chan-1"])
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
-    adapter._typing_tasks["chan-1"] = _completed_typing_task()
-    await adapter.send_typing("chan-1")
-    await adapter.stop_typing("chan-1")
+    adapter._typing_tasks[("chan-1", "user-msg-1")] = _completed_typing_task()
+    await adapter.send_typing("chan-1", metadata={"reply_to_message_id": "user-msg-1"})
+    await adapter.stop_typing("chan-1", metadata={"reply_to_message_id": "user-msg-1"})
 
-    assert "chan-1" not in adapter._turn_anchor
+    assert ("chan-1", "user-msg-1") in adapter._turn_anchor
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-2"
     adapter._request = AsyncMock(side_effect=[{"id": "thread-2"}, {"id": "reply-2"}])
 
-    await adapter.send("chan-1", "next turn")
+    await adapter.send("chan-1", "trailing delivery", metadata={"reply_to_message_id": "user-msg-1"})
 
     assert adapter._request.await_args_list[0].args == (
         "POST",
-        "/channels/chan-1/messages/user-msg-2/threads",
+        "/channels/chan-1/messages/user-msg-1/threads",
     )
 
 
@@ -3180,18 +3179,18 @@ async def test_forgetting_a_thread_leaves_other_channels_anchors_alone(monkeypat
     adapter = _send_adapter(thread_reply_channels=["chan-1", "chan-2"])
     adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
     adapter._last_inbound_by_chat["chan-2"] = "user-msg-2"
-    adapter._typing_tasks["chan-1"] = _completed_typing_task()
-    adapter._typing_tasks["chan-2"] = _completed_typing_task()
-    await adapter.send_typing("chan-1")
-    await adapter.send_typing("chan-2")
+    adapter._typing_tasks[("chan-1", "user-msg-1")] = _completed_typing_task()
+    adapter._typing_tasks[("chan-2", "user-msg-2")] = _completed_typing_task()
+    await adapter.send_typing("chan-1", metadata={"reply_to_message_id": "user-msg-1"})
+    await adapter.send_typing("chan-2", metadata={"reply_to_message_id": "user-msg-2"})
     adapter._request = AsyncMock(side_effect=[{"id": "thread-1"}])
     await adapter._start_thread_from_message("chan-1", "user-msg-1")
 
     adapter._forget_thread("thread-1")
 
     # chan-1's anchor pointed at the dead thread; chan-2's never did.
-    assert "chan-1" not in adapter._turn_anchor
-    assert adapter._turn_anchor["chan-2"][0] == "user-msg-2"
+    assert ("chan-1", "user-msg-1") not in adapter._turn_anchor
+    assert adapter._turn_anchor[("chan-2", "user-msg-2")][0] == "user-msg-2"
     assert ("chan-1", "user-msg-1") not in adapter._threads_by_anchor
 
 

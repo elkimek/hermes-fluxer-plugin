@@ -74,7 +74,7 @@ Implemented:
 - reply references placed per the shared `off` / `first` / `all` contract, matching the Discord adapter's `reply_to_mode`
 - opt-in thread replies: a reply can start a thread from the triggering message and continue inside it
 - thread naming: an auto-started thread is named from its triggering message and renamed to the session title once Hermes titles the session, exactly as the Discord adapter does
-- CLI and `/branch` session handoffs into their own thread, through the shared `create_handoff_thread` contract
+- Session handoffs into their own thread through `create_handoff_thread`, when the host routes the request to plugin adapters; `/branch` eligibility remains host-dependent
 - message edits and deletes
 - pins, when the Fluxer server supports pin routes
 - media and document delivery from live Gateway tool calls, standalone sends, and scheduled delivery where Fluxer's API supports uploads or attachment URLs; a short message accompanying one image, video, document, or ordinary audio file is delivered as that attachment's native caption
@@ -305,6 +305,10 @@ By default Hermes should not jump into every group conversation. Useful knobs:
 | `FLUXER_THREAD_REPLY_CHANNELS` | empty | Channel IDs where replies are posted in a thread started from the triggering message; other channels keep their normal behavior. |
 | `FLUXER_MENTION_PATTERNS` | empty | Extra comma-separated regexes that count as bot mentions/direct address patterns. |
 | `FLUXER_HOME_GUILD_ID` / `FLUXER_HOME_GUILDS` | empty | One or more trusted guild/community IDs used with `FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD`. |
+
+Automatic threads follow the gateway turn that is actually executing, including progress, final replies and trailing attachments. Concurrent participants in one channel keep separate anchors. Standalone or scheduled sends without a gateway turn must supply `reply_to` or `metadata.reply_to_message_id` to start an automatic thread; otherwise they stay in the named channel rather than guessing from someone else's latest message. An explicit `metadata.thread_id` still takes precedence.
+
+Thread titles use a read-only store bound to the routed or owning Hermes profile. If that profile or its title store cannot be resolved, the thread keeps its message-derived placeholder instead of reading another profile's titles.
 
 For a trusted home guild/community where Hermes may respond naturally:
 
