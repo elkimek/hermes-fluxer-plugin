@@ -1,7 +1,7 @@
 name: fluxer-platform
 label: Fluxer
 kind: platform
-version: 0.3.3
+version: 0.4.0
 description: >
   Fluxer gateway adapter for Hermes Agent. Native Fluxer integration using
   Fluxer's bot REST API for outbound messages, Gateway WebSocket events for
@@ -40,6 +40,14 @@ optional_env:
   - name: FLUXER_GATEWAY_URL
     description: "Override Fluxer Gateway WebSocket URL; normally discovered via /gateway/bot"
     prompt: "Gateway WebSocket URL"
+    password: false
+  - name: FLUXER_PRESENCE_STATUS
+    description: "Bot presence status on Fluxer: online, idle, dnd, or invisible (default online)"
+    prompt: "Fluxer presence status"
+    password: false
+  - name: FLUXER_PRESENCE_AFK
+    description: "Mark the bot AFK while connected (true/false; default false)"
+    prompt: "Presence AFK?"
     password: false
   - name: FLUXER_BACKLOG_RECOVERY
     description: "Recover recent channel messages after reconnect/startup (true/false)"
