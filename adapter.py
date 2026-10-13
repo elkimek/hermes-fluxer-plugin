@@ -1357,7 +1357,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._session_db: Optional[Any] = None
         self._title_home = _current_session_home()
         self._session_readers: Dict[Path, Any] = {}
-        self._unavailable_session_homes: set[Path] = set()
+        self._session_retry_after: Dict[Path, float] = {}
         self._session_db_lock = threading.Lock()
         self._session_db_off = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2366,14 +2366,15 @@ class FluxerAdapter(BasePlatformAdapter):
             except (ImportError, ValueError):
                 return None  # Never fall back to another profile's titles.
         with self._session_db_lock:
-            if home in self._unavailable_session_homes:
+            if time.monotonic() < self._session_retry_after.get(home, 0.0):
                 return None
             if home not in self._session_readers:
                 store = _open_session_store(home)
                 if store is None:
-                    self._unavailable_session_homes.add(home)
+                    self._session_retry_after[home] = time.monotonic() + _TITLE_RENAME_POLL_INTERVAL
                     return None
                 self._session_readers[home] = store
+                self._session_retry_after.pop(home, None)
             self._session_db = self._session_readers[home]
             return self._session_db
 
@@ -2382,7 +2383,7 @@ class FluxerAdapter(BasePlatformAdapter):
         with self._session_db_lock:
             stores = list(self._session_readers.values())
             self._session_readers.clear()
-            self._unavailable_session_homes.clear()
+            self._session_retry_after.clear()
             self._session_db = None
             self._session_db_off = False
             for store in stores:
@@ -2543,6 +2544,10 @@ class FluxerAdapter(BasePlatformAdapter):
                     target_chat_id = new_thread_id
                     auto_thread_id = new_thread_id
                     started_thread = True
+                else:
+                    # Choosing the parent is a turn-level decision, including
+                    # a failed/empty creation response, not just deleted threads.
+                    self._disable_turn_thread(chat_id, reply_to, metadata)
         # A thread started from the triggering message already carries the parent
         # context, so a second reference inside it is redundant.
         if reply_to and self._reply_to_mode != "off" and not started_thread:
@@ -2559,7 +2564,9 @@ class FluxerAdapter(BasePlatformAdapter):
         to ``parent_chat_id``.
         """
         try:
-            data = await self.create_thread(str(parent_chat_id), name or _DEFAULT_THREAD_NAME)
+            data = await self.create_thread(
+                str(parent_chat_id), _collapse_thread_name(name) or _DEFAULT_THREAD_NAME
+            )
         except Exception as exc:
             logger.warning("Fluxer handoff thread creation failed for %s: %s", parent_chat_id, exc)
             return None
