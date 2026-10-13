@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -150,5 +151,29 @@ def test_lookup_diagnostics_omit_identifiers_and_exception_text(
         result = adapter._session_origin_for_key("agent:main:fluxer:synthetic-private-channel")
 
     assert result is None
+    assert "RuntimeError" in caplog.text
+    assert "synthetic-private" not in caplog.text
+
+
+@pytest.mark.parametrize("helper", ["title", "origin"])
+def test_store_opening_diagnostics_omit_exception_text(
+    adapter, monkeypatch, tmp_path, caplog, helper
+):
+    path = tmp_path / "state.db"
+    path.touch()
+    adapter._title_home = tmp_path
+    constructor = Mock(side_effect=RuntimeError("synthetic-private-detail"))
+    monkeypatch.setitem(sys.modules, "hermes_state", SimpleNamespace(SessionDB=constructor))
+    caplog.set_level(logging.DEBUG, logger=fluxer_adapter.logger.name)
+
+    # Do not replace the getter: exercise its real read-only opener and retry path.
+    if helper == "title":
+        result = adapter._session_title_for_chat("synthetic-private-channel")
+    else:
+        result = adapter._session_origin_for_key("agent:main:fluxer:synthetic-private-channel")
+
+    assert result is None
+    constructor.assert_called_once_with(db_path=path, read_only=True)
+    assert "Fluxer session store unavailable" in caplog.text
     assert "RuntimeError" in caplog.text
     assert "synthetic-private" not in caplog.text

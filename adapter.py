@@ -635,7 +635,7 @@ def _open_session_store(home: Optional[Path] = None) -> Optional[Any]:
 
         return SessionDB(db_path=path, read_only=True)
     except Exception as exc:
-        logger.debug("Fluxer session store unavailable: %s", exc)
+        logger.debug("Fluxer session store unavailable: %s", type(exc).__name__)
         return None
 
 
