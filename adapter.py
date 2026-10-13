@@ -2303,13 +2303,14 @@ class FluxerAdapter(BasePlatformAdapter):
 
         Only a title the model wrote or the user set counts. ``derived`` is skipped
         deliberately: it is a slice of the triggering message, i.e. what the
-        placeholder already says.
+        placeholder already says. Acquisition, reads and normalization are all
+        best-effort: optional naming must never prevent message delivery.
         """
-        store = self._get_session_store()
-        chat_key = str(chat_id or "")
-        if store is None or not chat_key:
-            return None
         try:
+            store = self._get_session_store()
+            chat_key = str(chat_id or "")
+            if store is None or not chat_key:
+                return None
             session_id = store.find_session_by_origin(
                 platform=str(self.platform.value), chat_id=chat_key,
                 user_id=str(user_id) if user_id else None,
@@ -2319,33 +2320,37 @@ class FluxerAdapter(BasePlatformAdapter):
             if store.get_session_title_source(session_id) not in _TITLE_RENAME_SOURCES:
                 return None
             title = store.get_session_title(session_id)
+            return str(title).strip() or None
         except Exception as exc:
-            logger.debug("Fluxer session title lookup failed for %s: %s", chat_key, exc)
+            logger.debug("Fluxer session title lookup failed (%s)", type(exc).__name__)
             return None
-        return str(title).strip() or None
 
     def _session_origin_for_key(self, session_key: str) -> Optional[tuple[str, str]]:
-        """``(chat_id, user_id)`` of the newest session row for ``session_key``."""
-        parts = str(session_key or "").split(":", 2)
-        profile = parts[1] if len(parts) == 3 and parts[0] == "agent" else None
-        store = self._get_session_store(profile=None if profile == "main" else profile)
-        key = str(session_key or "").strip()
-        if store is None or not key:
-            return None
+        """Newest session origin, or ``None`` when any part of lookup fails.
+
+        Keep optional ``/title`` thread renames best-effort, including reader
+        acquisition and conversion of the stored chat/participant identifiers.
+        """
         try:
+            parts = str(session_key or "").split(":", 2)
+            profile = parts[1] if len(parts) == 3 and parts[0] == "agent" else None
+            store = self._get_session_store(profile=None if profile == "main" else profile)
+            key = str(session_key or "").strip()
+            if store is None or not key:
+                return None
             rows = store.list_sessions_rich(
                 source=str(self.platform.value), session_key=key, limit=1
             )
+            if not rows or not isinstance(rows[0], Mapping):
+                return None
+            chat_id = rows[0].get("chat_id")
+            if not chat_id:
+                return None
+            user_id = rows[0].get("user_id")
+            return str(chat_id), str(user_id) if user_id else ""
         except Exception as exc:
-            logger.debug("Fluxer session lookup failed for %s: %s", key[:64], exc)
+            logger.debug("Fluxer session origin lookup failed (%s)", type(exc).__name__)
             return None
-        if not rows or not isinstance(rows[0], Mapping):
-            return None
-        chat_id = rows[0].get("chat_id")
-        if not chat_id:
-            return None
-        user_id = rows[0].get("user_id")
-        return str(chat_id), str(user_id) if user_id else ""
 
     def _chat_id_for_session(self, session_key: str) -> Optional[str]:
         """Chat id of the newest session row for a ``session_key``, or ``None``."""
