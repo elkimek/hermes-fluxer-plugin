@@ -17,7 +17,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Replies still arrive when a session title cannot be read. Threads keep their placeholder name, and `/title` safely skips a rename when the session cannot be identified.
 - Failed naming lookups no longer expose channel/session identifiers or raw error details in diagnostics.
 - The voice-loop helper uses the current Hermes speech-to-text import, avoiding compatibility failures that could disable the entire plugin on hosts with import scanning.
-- The same speech-to-text constants are bundled for standalone use without a Hermes checkout.
+- Standalone speech-to-text helpers share the same endpoint settings without needing a Hermes checkout.
 
 ### Verification
 
