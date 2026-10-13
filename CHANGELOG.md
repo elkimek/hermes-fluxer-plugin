@@ -8,6 +8,16 @@ This project uses simple semantic versioning while the plugin is young:
 - minor versions for new user-visible capabilities;
 - major versions only for breaking configuration or runtime behavior.
 
+## [Unreleased]
+
+### Fixed
+
+- Replies still arrive when session-title lookup fails, including failures while opening the store or reading the title as text. Auto-created threads keep their placeholder name; `/title` safely skips the thread rename when its session cannot be identified.
+- Failed naming lookups no longer log channel/session identifiers or raw error details.
+
+### Verification
+
+- Regression tests cover continued reply delivery with and without thread support, background title checks, `/title` rename failures, and privacy-safe lookup diagnostics.
 
 ## [0.5.0] - 2026-10-10
 
