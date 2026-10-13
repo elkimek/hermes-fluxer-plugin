@@ -635,6 +635,49 @@ def test_release_metadata_matches_changelog():
     assert "## [0.4.0] - 2026-09-08" in changelog
 
 
+def test_current_hermes_plugin_compat_scan_has_no_deprecated_imports():
+    from importlib import import_module
+
+    try:
+        scan_plugin = getattr(import_module("hermes_cli.plugin_compat"), "scan_plugin")
+    except (ImportError, AttributeError):
+        pytest.skip("Hermes Sep-2026 plugin compatibility scanner unavailable")
+
+    hits = scan_plugin(ROOT)
+
+    assert not hits, "\n".join(
+        f"{hit.file}:{hit.line}: {hit.old} -> {hit.new}" for hit in hits
+    )
+
+
+def test_standalone_voice_loop_has_local_public_stt_common_module():
+    import importlib.util
+
+    module_path = ROOT / "tools" / "transcription_common.py"
+    assert module_path.exists()
+    spec = importlib.util.spec_from_file_location("fluxer_standalone_transcription_common", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.ELEVENLABS_STT_BASE_URL
+
+
+def test_voice_loop_uses_public_stt_constant_import():
+    import ast
+
+    source = (ROOT / "scripts" / "fluxer_stt_voice_loop.py").read_text()
+    imports = {
+        (node.module, alias.name)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+
+    assert ("tools.transcription_common", "ELEVENLABS_STT_BASE_URL") in imports
+    assert ("tools.transcription_tools", "ELEVENLABS_STT_BASE_URL") not in imports
+
+
 def test_fluxer_adapter_advertises_markdown_code_blocks():
     assert fluxer_adapter.FluxerAdapter.supports_code_blocks is True
 

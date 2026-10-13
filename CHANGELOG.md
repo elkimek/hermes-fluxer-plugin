@@ -10,14 +10,23 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-13
+
 ### Fixed
 
-- Replies still arrive when session-title lookup fails, including failures while opening the store or reading the title as text. Auto-created threads keep their placeholder name; `/title` safely skips the thread rename when its session cannot be identified.
-- Failed naming lookups no longer log channel/session identifiers or raw error details.
+- Replies still arrive when a session title cannot be read. Threads keep their placeholder name, and `/title` safely skips a rename when the session cannot be identified.
+- Failed naming lookups no longer expose channel/session identifiers or raw error details in diagnostics.
+- The voice-loop helper uses the current Hermes speech-to-text import, avoiding compatibility failures that could disable the entire plugin on hosts with import scanning.
+- Standalone speech-to-text helpers share the same endpoint settings without needing a Hermes checkout.
 
 ### Verification
 
-- Regression tests cover continued reply delivery with and without thread support, background title checks, `/title` rename failures, and privacy-safe lookup diagnostics.
+- Regression tests cover continued delivery during naming failures, private diagnostics, and speech-to-text imports in standalone and Hermes-host environments.
+- Live verification covers text and attachments, incoming messages, tool progress, and final replies. Naming-failure sends were also verified against the real provider in isolated adapter instances.
+
+### Compatibility notes
+
+- Automatic thread replies remain opt-in. Thread creation and pinning depend on server support and permissions; realtime voice-room support is not certified by the messaging smoke tests.
 
 ## [0.5.0] - 2026-10-10
 
