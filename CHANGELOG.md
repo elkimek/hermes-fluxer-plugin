@@ -10,6 +10,15 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+### Fixed
+
+- A reply stays in its thread when that thread already exists. Fluxer anchors a thread to the message it was started from and gives the thread that message's id, so `400 THREAD_ALREADY_CREATED_FOR_MESSAGE` is now read as the thread to use rather than as a failed creation. Previously the whole turn was demoted to the parent channel — the reply that shows up outside its thread — whenever the anchor map did not know the thread: after a gateway restart, after an evicted anchor, or when two sends for one turn interleaved.
+- Thread creation is single-flight per anchor, so interleaved sends for one turn open one thread instead of racing, with the loser's POST returning the refusal above.
+
+### Verification
+
+- Regression tests cover adoption from the refusal, a restart that never created the thread, two interleaved sends opening a single thread, and the guard that keeps every other 4xx on the parent-channel fallback.
+
 ## [0.5.1] - 2026-10-13
 
 ### Fixed

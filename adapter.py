@@ -657,6 +657,22 @@ def _is_missing_channel_error(exc: BaseException) -> bool:
     return False
 
 
+def _thread_already_exists_for_message(exc: BaseException) -> bool:
+    """True when Fluxer refused a thread start because the message already has one.
+
+    Fluxer anchors a thread to the message it was started from and the thread
+    carries that message's id, so this refusal *names* the existing thread. The
+    adapter's anchor map lives in memory only -- a restart, an evicted entry, or a
+    start that raced another send all reach here -- and reading the refusal as
+    "no thread" demotes the whole turn to the parent channel even though the
+    thread is already there.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    return "thread_already_created_for_message" in str(getattr(response, "text", "") or "").lower()
+
+
 def _coerce_reply_to_mode(value: Any, default: str = _DEFAULT_REPLY_TO_MODE) -> str:
     """Normalize an outbound reply-reference mode; unknown values use ``default``."""
     mode = str(value or "").strip().lower()
@@ -1264,6 +1280,10 @@ class FluxerAdapter(BasePlatformAdapter):
         # each creating its own.
         self._threads_by_anchor: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._threads_by_anchor_max = 1000
+        # One creator per anchor. Sends for a turn interleave, so without this two
+        # of them both miss the map above, both POST the same thread, and the
+        # loser's turn is demoted to the parent channel by the failure path.
+        self._thread_create_locks: Dict[tuple[str, str], asyncio.Lock] = {}
         # Parent channel of every thread this adapter created, so a thread
         # inherits its parent's allowlist status and can seed mention memory.
         self._thread_parents: Dict[str, str] = {}
@@ -2185,44 +2205,73 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _start_thread_from_message(self, chat_id: str, message_id: str) -> Optional[str]:
         """Best-effort thread start from ``message_id``; ``None`` keeps the channel.
 
-        Thread creation must never cost a reply, so any failure falls back to the
-        parent channel and the message still lands. A thread already opened for
-        this (chat, message) pair is reused, so one turn's progress bubble and its
-        final reply share a thread rather than creating two.
+        Thread creation must never cost a reply, so a failure that leaves no thread
+        behind falls back to the parent channel and the message still lands. A
+        thread already opened for this (chat, message) pair is reused, so one
+        turn's progress bubble and its final reply share a thread rather than
+        creating two -- across interleaved sends, and across a restart, when the
+        thread exists on the server but this process no longer remembers it.
         """
         key = (str(chat_id), str(message_id))
         existing = self._threads_by_anchor.get(key)
         if existing:
             return existing
-        # Two-phase naming, same as Discord: the placeholder comes from the message
-        # that triggered the turn; the thread is renamed to the session title as
-        # soon as the session has one. The title is usually already there (the
-        # titler runs early in the turn, the thread is opened at send time), in
-        # which case the thread is born with its final name and no rename follows.
-        placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
-        author_id = self._inbound_author_by_message.get(str(message_id)) or None
-        title = await asyncio.to_thread(self._session_title_for_chat, str(chat_id), author_id)
-        thread_name = _collapse_thread_name(title or "") or placeholder
-        try:
-            data = await self.create_thread(
-                str(chat_id), thread_name, message_id=str(message_id)
-            )
-        except Exception as exc:
-            logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
-            return None
-        thread_id = self._remember_thread_id(data, chat_id)
-        if thread_id:
-            self._threads_by_anchor[key] = thread_id
-            self._threads_by_anchor.move_to_end(key)
-            while len(self._threads_by_anchor) > self._threads_by_anchor_max:
-                self._threads_by_anchor.popitem(last=False)
-            created_name = str((data or {}).get("name") or thread_name)
-            self._record_auto_thread(chat_id, thread_id, created_name, author_id)
-            if created_name != placeholder:
-                self._note_renamed_thread(thread_id, created_name)
-            if not title:
-                self._schedule_title_rename(chat_id, thread_id, created_name, author_id)
-        return thread_id
+        async with self._thread_create_lock(key):
+            # Re-read under the lock: a concurrent send may have opened the thread
+            # while this one waited, and creation must not be repeated.
+            existing = self._threads_by_anchor.get(key)
+            if existing:
+                return existing
+            # Two-phase naming, same as Discord: the placeholder comes from the message
+            # that triggered the turn; the thread is renamed to the session title as
+            # soon as the session has one. The title is usually already there (the
+            # titler runs early in the turn, the thread is opened at send time), in
+            # which case the thread is born with its final name and no rename follows.
+            placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
+            author_id = self._inbound_author_by_message.get(str(message_id)) or None
+            title = await asyncio.to_thread(self._session_title_for_chat, str(chat_id), author_id)
+            thread_name = _collapse_thread_name(title or "") or placeholder
+            try:
+                data = await self.create_thread(
+                    str(chat_id), thread_name, message_id=str(message_id)
+                )
+            except Exception as exc:
+                if not _thread_already_exists_for_message(exc):
+                    logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
+                    return None
+                # The refusal names the thread: Fluxer anchors a thread to its
+                # message and gives it that message's id. Adopt it -- falling back
+                # to the channel here is what drops replies out of their thread.
+                logger.info(
+                    "Fluxer thread %s already exists for anchor %s; adopting it", message_id, message_id
+                )
+                data = {"id": str(message_id)}
+                server_name = await self._fetch_channel_name(str(message_id))
+                if server_name:
+                    data["name"] = server_name
+            thread_id = self._remember_thread_id(data, chat_id)
+            if thread_id:
+                self._threads_by_anchor[key] = thread_id
+                self._threads_by_anchor.move_to_end(key)
+                while len(self._threads_by_anchor) > self._threads_by_anchor_max:
+                    self._threads_by_anchor.popitem(last=False)
+                created_name = str((data or {}).get("name") or thread_name)
+                self._record_auto_thread(chat_id, thread_id, created_name, author_id)
+                if created_name != placeholder:
+                    self._note_renamed_thread(thread_id, created_name)
+                if not title:
+                    self._schedule_title_rename(chat_id, thread_id, created_name, author_id)
+            return thread_id
+
+    def _thread_create_lock(self, key: tuple[str, str]) -> asyncio.Lock:
+        """A stable per-anchor creation lock, bounded like the anchor map."""
+        lock = self._thread_create_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._thread_create_locks[key] = lock
+            while len(self._thread_create_locks) > self._threads_by_anchor_max:
+                self._thread_create_locks.pop(next(iter(self._thread_create_locks)))
+        return lock
 
     # ── session-title naming for a thread this adapter opened ───────────────────
 
