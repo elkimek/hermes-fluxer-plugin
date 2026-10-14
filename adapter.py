@@ -1129,6 +1129,17 @@ def _normalize_reaction_emoji(value: Any) -> str:
     return text.replace(_VARIATION_SELECTOR_16, "")
 
 
+def _keycap_emojis_in_text(content: Any) -> List[str]:
+    """Option keycap emojis (1-4) that a message already spells out in text.
+
+    Matches both the full emoji-presentation form (digit + VS16 + keycap) and
+    the bare keycap form (digit + keycap) so a sender's exact encoding never
+    hides an option. Returns the send form, ordered 1-4 and deduped.
+    """
+    probe = str(content or "").replace(_VARIATION_SELECTOR_16, "")
+    return [emoji for emoji in _CLARIFY_REACTION_EMOJIS if f"{emoji[0]}\u20e3" in probe]
+
+
 def _reaction_choice_map(specs: Any) -> Dict[str, str]:
     return {_normalize_reaction_emoji(emoji): choice for emoji, choice, _label in specs}
 
@@ -1553,6 +1564,20 @@ class FluxerAdapter(BasePlatformAdapter):
             f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(message_id)}/reactions/{_quote_id(emoji)}/@me",
         )
 
+    async def _attach_keycap_reactions(self, chat_id: str, message_id: str, content: str) -> None:
+        """Make a plain-message decision ask tappable.
+
+        A message that spells its options out as 1-4 keycap emojis gets the
+        same keycaps attached as reactions, so an allowed user can answer with
+        one tap (forwarded via ``_maybe_forward_reaction_answer``). Best effort
+        only: failures are logged and never affect the send.
+        """
+        for emoji in _keycap_emojis_in_text(content):
+            try:
+                await self._add_reaction(chat_id, message_id, emoji)
+            except Exception as exc:  # noqa: BLE001 - affordance must not break sends
+                logger.debug("Fluxer keycap auto-reaction failed (%s)", type(exc).__name__)
+
     async def add_reaction(
         self,
         chat_id: str,
@@ -1706,6 +1731,7 @@ class FluxerAdapter(BasePlatformAdapter):
                         responses[-1] = {**data, "delivery_verified": True, "delivery_readback": verified}
                     else:
                         responses[-1] = {**data, "delivery_verified": False}
+                    await self._attach_keycap_reactions(chat_id, message_id, chunk_payload["content"])
 
             return SendResult(
                 success=True,

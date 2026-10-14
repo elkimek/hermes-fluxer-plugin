@@ -3447,6 +3447,73 @@ def test_reaction_answer_constants_normalize_keycaps():
     )
 
 
+def test_keycap_emojis_in_text_matches_both_encodings():
+    assert fluxer_adapter._keycap_emojis_in_text(
+        "\u2192 1\ufe0f\u20e3 re-run \u00b7 2\ufe0f\u20e3 skip"
+    ) == ["1\ufe0f\u20e3", "2\ufe0f\u20e3"]
+    assert fluxer_adapter._keycap_emojis_in_text("2\u20e3 then 1\u20e3") == [
+        "1\ufe0f\u20e3",
+        "2\ufe0f\u20e3",
+    ]
+    assert fluxer_adapter._keycap_emojis_in_text("1\ufe0f\u20e3 and 1\ufe0f\u20e3") == [
+        "1\ufe0f\u20e3"
+    ]
+    assert fluxer_adapter._keycap_emojis_in_text("no options here") == []
+    assert fluxer_adapter._keycap_emojis_in_text(None) == []
+
+
+@pytest.mark.asyncio
+async def test_send_attaches_keycap_reactions_for_option_asks(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "delivery_verification": False,
+            },
+        )
+    )
+    adapter._request = AsyncMock(side_effect=[{"id": "msg-ask"}, {}, {}])
+
+    result = await adapter.send(
+        "chan-1", "Backup report \u2192 1\ufe0f\u20e3 re-run \u00b7 2\ufe0f\u20e3 skip"
+    )
+
+    assert result.success is True
+    calls = [(call.args[0], call.args[1]) for call in adapter._request.await_args_list]
+    assert calls == [
+        ("POST", "/channels/chan-1/messages"),
+        ("PUT", "/channels/chan-1/messages/msg-ask/reactions/1%EF%B8%8F%E2%83%A3/@me"),
+        ("PUT", "/channels/chan-1/messages/msg-ask/reactions/2%EF%B8%8F%E2%83%A3/@me"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_survives_keycap_reaction_failures(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "delivery_verification": False,
+            },
+        )
+    )
+    adapter._request = AsyncMock(
+        side_effect=[{"id": "msg-ask"}, RuntimeError("boom"), RuntimeError("boom")]
+    )
+
+    result = await adapter.send("chan-1", "\u2192 1\ufe0f\u20e3 do it")
+
+    assert result.success is True
+
+
 @pytest.mark.asyncio
 async def test_send_clarify_registers_keycap_reactions(monkeypatch):
     adapter = fluxer_adapter.FluxerAdapter(
