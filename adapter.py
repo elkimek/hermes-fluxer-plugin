@@ -673,6 +673,40 @@ def _thread_already_exists_for_message(exc: BaseException) -> bool:
     return "thread_already_created_for_message" in str(getattr(response, "text", "") or "").lower()
 
 
+def _is_reply_reference_rejected_error(exc: BaseException) -> bool:
+    """True when the send failed because the *reply reference* itself was refused.
+
+    Fluxer rejects a reference to a message it types as a system message (the
+    gateway's own progress bubbles arrive as ``type: 4``), answering
+    ``400 CANNOT_REPLY_TO_SYSTEM_MESSAGE`` with ``path: message_reference``. The
+    refusal is about the reference, never about the content, so re-sending the
+    identical payload cannot succeed: the reply has to go out without the
+    reference instead of being dropped.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    body = str(getattr(response, "text", "") or "").lower()
+    return "cannot_reply_to_system_message" in body
+
+
+def _is_text_command(text: str) -> bool:
+    """True when ``text`` is a gateway command typed as a plain message.
+
+    Fluxer registers no native application commands, so ``/new``, ``/help``,
+    ``/stop`` and ``/title`` arrive as ordinary text and the adapter's own
+    admission gate decides whether the command pipeline ever sees them. A leading
+    slash is how the host's ``MessageEvent.is_command()`` reads a command, and
+    this mirrors its two extra rules: a ``@botname`` suffix is allowed, and a name
+    containing ``/`` is not a command at all (a pasted path stays ordinary text).
+    """
+    stripped = str(text or "").lstrip()
+    if not stripped.startswith("/"):
+        return False
+    name = stripped.split(maxsplit=1)[0][1:].split("@", 1)[0]
+    return bool(name) and "/" not in name
+
+
 def _coerce_reply_to_mode(value: Any, default: str = _DEFAULT_REPLY_TO_MODE) -> str:
     """Normalize an outbound reply-reference mode; unknown values use ``default``."""
     mode = str(value or "").strip().lower()
@@ -1670,36 +1704,53 @@ class FluxerAdapter(BasePlatformAdapter):
                         json=chunk_payload,
                     )
                 except Exception as exc:
-                    # A thread this adapter chose can be deleted between the
-                    # progress bubble and the reply. Abandon it and post to the
-                    # parent channel rather than losing the message.
-                    if not (auto_thread_id and _is_missing_channel_error(exc)):
+                    if _is_reply_reference_rejected_error(exc) and chunk_payload.get("message_reference"):
+                        # Whatever the reference pointed at, Fluxer refused it and
+                        # will refuse it again: the refusal names the reference,
+                        # never the content. Drop the reference and let the reply
+                        # through instead of losing it to a retry that cannot win.
+                        logger.info(
+                            "Fluxer refused the reply reference (%s); sending without it",
+                            type(exc).__name__,
+                        )
+                        payload.pop("message_reference", None)
+                        chunk_payload.pop("message_reference", None)
+                        data = await self._request(
+                            "POST",
+                            f"/channels/{_quote_id(target_chat_id)}/messages",
+                            json=chunk_payload,
+                        )
+                    elif auto_thread_id and _is_missing_channel_error(exc):
+                        # A thread this adapter chose can be deleted between the
+                        # progress bubble and the reply. Abandon it and post to the
+                        # parent channel rather than losing the message.
+                        logger.info(
+                            "Fluxer thread %s is gone; falling back to channel %s",
+                            auto_thread_id,
+                            chat_id,
+                        )
+                        self._forget_thread(auto_thread_id)
+                        self._disable_turn_thread(chat_id, reply_to, metadata)
+                        auto_thread_id = None
+                        target_chat_id = str(chat_id)
+                        self._known_channel_ids.add(target_chat_id)
+                        if reply_to and self._reply_to_mode != "off":
+                            # Restore the reference in the shared payload as well: the
+                            # remaining chunks of a split reply are rebuilt from it, so
+                            # patching only this chunk would leave every later one
+                            # unlinked after a fallback. The mode still decides where
+                            # the reference lands.
+                            payload["message_reference"] = {"message_id": str(reply_to)}
+                            chunk_payload["message_reference"] = {"message_id": str(reply_to)}
+                            if index > 0 and self._reply_to_mode != "all":
+                                chunk_payload.pop("message_reference", None)
+                        data = await self._request(
+                            "POST",
+                            f"/channels/{_quote_id(target_chat_id)}/messages",
+                            json=chunk_payload,
+                        )
+                    else:
                         raise
-                    logger.info(
-                        "Fluxer thread %s is gone; falling back to channel %s",
-                        auto_thread_id,
-                        chat_id,
-                    )
-                    self._forget_thread(auto_thread_id)
-                    self._disable_turn_thread(chat_id, reply_to, metadata)
-                    auto_thread_id = None
-                    target_chat_id = str(chat_id)
-                    self._known_channel_ids.add(target_chat_id)
-                    if reply_to and self._reply_to_mode != "off":
-                        # Restore the reference in the shared payload as well: the
-                        # remaining chunks of a split reply are rebuilt from it, so
-                        # patching only this chunk would leave every later one
-                        # unlinked after a fallback. The mode still decides where
-                        # the reference lands.
-                        payload["message_reference"] = {"message_id": str(reply_to)}
-                        chunk_payload["message_reference"] = {"message_id": str(reply_to)}
-                        if index > 0 and self._reply_to_mode != "all":
-                            chunk_payload.pop("message_reference", None)
-                    data = await self._request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        json=chunk_payload,
-                    )
                 responses.append(data)
                 if data.get("id"):
                     message_id = str(data["id"])
@@ -2877,29 +2928,46 @@ class FluxerAdapter(BasePlatformAdapter):
                     files=[("files[0]", path, filename)],
                 )
             except Exception as exc:
-                # Same deleted-thread fallback as text sends: an upload must not
-                # fail just because the thread this adapter chose was removed.
-                if not (auto_thread_id and _is_missing_channel_error(exc)):
+                if _is_reply_reference_rejected_error(exc) and payload.get("message_reference"):
+                    # Same refusal as text sends, and the same answer: the
+                    # reference is what Fluxer rejected, so the upload goes out
+                    # without it rather than being lost.
+                    logger.info(
+                        "Fluxer refused the reply reference (%s); uploading without it",
+                        type(exc).__name__,
+                    )
+                    payload.pop("message_reference", None)
+                    data = await self._multipart_request(
+                        "POST",
+                        f"/channels/{_quote_id(target_chat_id)}/messages",
+                        payload=payload,
+                        files=[("files[0]", path, filename)],
+                    )
+                elif auto_thread_id and _is_missing_channel_error(exc):
+                    # Same deleted-thread fallback as text sends: an upload must
+                    # not fail just because the thread this adapter chose was
+                    # removed.
+                    logger.info(
+                        "Fluxer thread %s is gone; uploading to channel %s instead",
+                        auto_thread_id,
+                        chat_id,
+                    )
+                    self._forget_thread(auto_thread_id)
+                    self._disable_turn_thread(chat_id, reply_to, metadata)
+                    auto_thread_id = None
+                    target_chat_id = str(chat_id)
+                    self._known_channel_ids.add(target_chat_id)
+                    payload.pop("message_reference", None)
+                    if reply_to and self._reply_to_mode != "off":
+                        payload["message_reference"] = {"message_id": str(reply_to)}
+                    data = await self._multipart_request(
+                        "POST",
+                        f"/channels/{_quote_id(target_chat_id)}/messages",
+                        payload=payload,
+                        files=[("files[0]", path, filename)],
+                    )
+                else:
                     raise
-                logger.info(
-                    "Fluxer thread %s is gone; uploading to channel %s instead",
-                    auto_thread_id,
-                    chat_id,
-                )
-                self._forget_thread(auto_thread_id)
-                self._disable_turn_thread(chat_id, reply_to, metadata)
-                auto_thread_id = None
-                target_chat_id = str(chat_id)
-                self._known_channel_ids.add(target_chat_id)
-                payload.pop("message_reference", None)
-                if reply_to and self._reply_to_mode != "off":
-                    payload["message_reference"] = {"message_id": str(reply_to)}
-                data = await self._multipart_request(
-                    "POST",
-                    f"/channels/{_quote_id(target_chat_id)}/messages",
-                    payload=payload,
-                    files=[("files[0]", path, filename)],
-                )
             message_id = str(data.get("id")) if data.get("id") else None
             # Edits/deletes must target the thread, not the caller's channel.
             self._remember_message_destination(message_id, target_chat_id)
@@ -3316,6 +3384,13 @@ class FluxerAdapter(BasePlatformAdapter):
         ):
             return True, text
         if not self._require_mention:
+            return True, text
+        # A command typed as plain text is an address in its own right. Fluxer
+        # registers no native application commands, so /new, /help, /stop and
+        # /title only ever arrive this way, and a mention gate that drops them
+        # makes the whole command pipeline unreachable in exactly the channels
+        # the gate protects -- silently, with no reply to tell the user why.
+        if _is_text_command(text):
             return True, text
 
         is_mentioned = self._message_mentions_bot(data, text)

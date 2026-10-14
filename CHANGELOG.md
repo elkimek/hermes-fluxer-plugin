@@ -14,10 +14,14 @@ This project uses simple semantic versioning while the plugin is young:
 
 - A reply stays in its thread when that thread already exists. Fluxer anchors a thread to the message it was started from and gives the thread that message's id, so `400 THREAD_ALREADY_CREATED_FOR_MESSAGE` is now read as the thread to use rather than as a failed creation. Previously the whole turn was demoted to the parent channel — the reply that shows up outside its thread — whenever the anchor map did not know the thread: after a gateway restart, after an evicted anchor, or when two sends for one turn interleaved.
 - Thread creation is single-flight per anchor, so interleaved sends for one turn open one thread instead of racing, with the loser's POST returning the refusal above.
+- A command is no longer swallowed by the mention gate. Fluxer registers no native application commands, so `/new`, `/help`, `/stop` and `/title` only ever arrive as plain messages; the gate dropped them in every mention-gated channel, which made the whole command pipeline unreachable there — silently, with no reply to say why. A command is now admitted without a mention, matching the host's own command shape (leading `/`, optional `@botname` suffix, and a name containing `/` is a path rather than a command). A hard channel allowlist still excludes the channel for commands exactly as for any other message.
+- A reply whose reply-reference Fluxer refuses is now delivered without the reference instead of being lost. A reference to a message Fluxer types as a system message — the gateway's own `type: 4` progress bubbles — answers `400 CANNOT_REPLY_TO_SYSTEM_MESSAGE`, and because that refusal names the reference and never the content, the retry re-sent the identical payload and the reply never arrived. Both the text and the upload path now drop the reference and send on. Every other failure keeps its existing behaviour.
 
 ### Verification
 
 - Regression tests cover adoption from the refusal, a restart that never created the thread, two interleaved sends opening a single thread, and the guard that keeps every other 4xx on the parent-channel fallback.
+- Regression tests cover command recognition (including a pasted path and a lone `/`), admission of a command with no mention under both `mention_gated_channels` and `strict_mention`, unchanged behaviour for ordinary text, the allowlist still winning, and the reference fallback on the first attempt, across a split reply, and when the failure is unrelated.
+- Verified against the live API: all five commands are admitted in a live mention-gated channel while ordinary text is still dropped; and a raw `message_reference` to a live `type: 4` message is refused (`CANNOT_REPLY_TO_SYSTEM_MESSAGE`) while `send()` with the same reference returns success and the delivered message carries no reference.
 
 ## [0.5.1] - 2026-10-13
 
