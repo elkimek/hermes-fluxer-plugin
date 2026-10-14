@@ -24,7 +24,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional
 from urllib.parse import quote, urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
@@ -1318,6 +1318,12 @@ class FluxerAdapter(BasePlatformAdapter):
         # of them both miss the map above, both POST the same thread, and the
         # loser's turn is demoted to the parent channel by the failure path.
         self._thread_create_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        # Anchors with a send inside, or queued on, their creation lock. The lock
+        # map is bounded, and a bound that evicted a lock still in use would hand
+        # the next send a second lock for the same anchor -- two creators again,
+        # which is the duplicate this lock exists to prevent -- so eviction skips
+        # the anchors listed here.
+        self._thread_create_lock_users: Dict[tuple[str, str], int] = {}
         # Parent channel of every thread this adapter created, so a thread
         # inherits its parent's allowlist status and can seed mention memory.
         self._thread_parents: Dict[str, str] = {}
@@ -2267,7 +2273,7 @@ class FluxerAdapter(BasePlatformAdapter):
         existing = self._threads_by_anchor.get(key)
         if existing:
             return existing
-        async with self._thread_create_lock(key):
+        async with self._thread_creation_slot(key):
             # Re-read under the lock: a concurrent send may have opened the thread
             # while this one waited, and creation must not be repeated.
             existing = self._threads_by_anchor.get(key)
@@ -2282,6 +2288,10 @@ class FluxerAdapter(BasePlatformAdapter):
             author_id = self._inbound_author_by_message.get(str(message_id)) or None
             title = await asyncio.to_thread(self._session_title_for_chat, str(chat_id), author_id)
             thread_name = _collapse_thread_name(title or "") or placeholder
+            # Whether the thread came from the server already existing rather than
+            # from a create here: only a thread this adapter created carries a name
+            # this adapter chose.
+            adopted = False
             try:
                 data = await self.create_thread(
                     str(chat_id), thread_name, message_id=str(message_id)
@@ -2293,6 +2303,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 # The refusal names the thread: Fluxer anchors a thread to its
                 # message and gives it that message's id. Adopt it -- falling back
                 # to the channel here is what drops replies out of their thread.
+                adopted = True
                 logger.info(
                     "Fluxer thread %s already exists for anchor %s; adopting it", message_id, message_id
                 )
@@ -2311,8 +2322,37 @@ class FluxerAdapter(BasePlatformAdapter):
                 if created_name != placeholder:
                     self._note_renamed_thread(thread_id, created_name)
                 if not title:
-                    self._schedule_title_rename(chat_id, thread_id, created_name, author_id)
+                    # Guard with the name this adapter would have given the thread,
+                    # never with the one an adopted thread already carries: there
+                    # ``created_name`` is the server's current name, which a human
+                    # may have chosen, and the guard is exactly what authorises the
+                    # overwrite -- so passing it would let the session title clobber
+                    # that human's choice.
+                    self._schedule_title_rename(
+                        chat_id, thread_id, thread_name if adopted else created_name, author_id
+                    )
             return thread_id
+
+    @contextlib.asynccontextmanager
+    async def _thread_creation_slot(self, key: tuple[str, str]) -> AsyncIterator[None]:
+        """Hold the per-anchor creation lock with the anchor marked in use.
+
+        The mark is taken *before* the lock is awaited, so a send still queued on
+        it pins the lock's entry as well, and released only when the critical
+        section ends. Without the mark the bounded map can evict the lock a send
+        is holding, handing the next send for that anchor a second lock.
+        """
+        users = self._thread_create_lock_users
+        users[key] = users.get(key, 0) + 1
+        try:
+            async with self._thread_create_lock(key):
+                yield
+        finally:
+            remaining = users.get(key, 1) - 1
+            if remaining > 0:
+                users[key] = remaining
+            else:
+                users.pop(key, None)
 
     def _thread_create_lock(self, key: tuple[str, str]) -> asyncio.Lock:
         """A stable per-anchor creation lock, bounded like the anchor map."""
@@ -2320,9 +2360,25 @@ class FluxerAdapter(BasePlatformAdapter):
         if lock is None:
             lock = asyncio.Lock()
             self._thread_create_locks[key] = lock
-            while len(self._thread_create_locks) > self._threads_by_anchor_max:
-                self._thread_create_locks.pop(next(iter(self._thread_create_locks)))
+            self._evict_idle_thread_create_locks()
         return lock
+
+    def _evict_idle_thread_create_locks(self) -> None:
+        """Drop the oldest idle per-anchor locks until the map is within its bound.
+
+        The map is insertion-ordered, so a bound that evicts purely on age can drop
+        the lock a send is still holding (or waiting on): the next send for that
+        anchor then builds a second lock and POSTs a second thread -- the duplicate
+        this lock exists to prevent. Anchors with a send in flight are skipped, so
+        the map may overshoot its bound while every candidate is busy and shrinks
+        again as those sends finish.
+        """
+        for key in list(self._thread_create_locks):
+            if len(self._thread_create_locks) <= self._threads_by_anchor_max:
+                return
+            if key in self._thread_create_lock_users:
+                continue
+            self._thread_create_locks.pop(key, None)
 
     # ── session-title naming for a thread this adapter opened ───────────────────
 

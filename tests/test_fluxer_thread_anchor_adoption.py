@@ -88,10 +88,14 @@ async def test_an_adopted_thread_is_remembered_for_the_rest_of_the_turn():
 
 @pytest.mark.asyncio
 async def test_an_adopted_thread_keeps_the_name_the_server_already_has():
-    """Adoption must not claim a rename that never happened, or the placeholder
-    guard stops protecting a thread someone renamed by hand."""
+    """Adoption must not claim a rename that never happened. The cached label is the
+    real name, so a human's choice stays visible, but the rename *guard* stays the
+    name this adapter would have given the thread: the guard is what authorises an
+    overwrite, so seeding it with the server's current name would authorise
+    replacing that very name."""
     adapter = _adapter()
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._session_title_for_chat = lambda *args, **kwargs: None
     adapter.create_thread = AsyncMock(side_effect=_FakeHttpError(400, THREAD_EXISTS_BODY))
     adapter._fetch_channel_name = AsyncMock(return_value="Gwyn's own thread name")
     watched: list = []
@@ -100,9 +104,59 @@ async def test_an_adopted_thread_keeps_the_name_the_server_already_has():
     await adapter._start_thread_from_message("chan-1", "msg-1")
 
     assert adapter.auto_thread_info_for_chat("chan-1") == ("msg-1", "Gwyn's own thread name")
-    # The poll is seeded with the real name, so a later rename is declined unless
-    # the thread still carries it.
-    assert watched == [("chan-1", "msg-1", "Gwyn's own thread name", None)]
+    assert watched == [("chan-1", "msg-1", "deploy the thing", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_human_thread_name_survives_the_session_title_rename():
+    """The guard declines the rename once the thread no longer carries the name this
+    adapter gave it — which is exactly the case for a thread a human renamed."""
+    adapter = _adapter()
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._session_title_for_chat = lambda *args, **kwargs: None
+    adapter.create_thread = AsyncMock(side_effect=_FakeHttpError(400, THREAD_EXISTS_BODY))
+    adapter._fetch_channel_name = AsyncMock(return_value="Gwyn's own thread name")
+    watched: list = []
+    adapter._schedule_title_rename = lambda *args: watched.append(args)
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+    guard = watched[0][2]
+
+    # The real rename path, against the name the server actually holds.
+    adapter._request = AsyncMock(return_value={})
+    applied = await adapter.rename_thread("msg-1", "Deploying the thing", only_if_current_name=guard)
+
+    assert applied is False
+    adapter._request.assert_not_awaited()  # no PATCH: the human's name stands
+
+
+@pytest.mark.asyncio
+async def test_a_thread_still_carrying_the_placeholder_is_renamed_to_the_title():
+    """The other direction: the guard still lets the session title through when the
+    thread is untouched, which is the restart-mid-turn case this lane exists for."""
+    adapter = _adapter()
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._session_title_for_chat = lambda *args, **kwargs: None
+    adapter.create_thread = AsyncMock(side_effect=_FakeHttpError(400, THREAD_EXISTS_BODY))
+    adapter._fetch_channel_name = AsyncMock(return_value="deploy the thing")
+    watched: list = []
+    adapter._schedule_title_rename = lambda *args: watched.append(args)
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+    guard = watched[0][2]
+
+    assert guard == "deploy the thing"
+    calls: list = []
+
+    async def fake_request(method, path, **kwargs):
+        calls.append(method)
+        return {}
+
+    adapter._request = fake_request
+    applied = await adapter.rename_thread("msg-1", "Deploying the thing", only_if_current_name=guard)
+
+    assert applied is True
+    assert calls == ["PATCH"]
 
 
 @pytest.mark.asyncio
@@ -183,3 +237,74 @@ async def test_the_creation_locks_stay_bounded():
     assert adapter._thread_create_lock(("chan-1", "msg-5")) is adapter._thread_create_lock(
         ("chan-1", "msg-5")
     )
+
+
+@pytest.mark.asyncio
+async def test_a_lock_a_send_is_holding_is_never_evicted():
+    """Eviction on age alone can drop the lock a send still holds, and the next send
+    for that anchor then builds a second lock and POSTs a second thread -- the
+    duplicate the lock exists to prevent."""
+    adapter = _adapter()
+    adapter._threads_by_anchor_max = 2
+    held = ("chan-1", "msg-held")
+    inside = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold():
+        async with adapter._thread_creation_slot(held):
+            inside.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold())
+    # A slot that never opens must fail the test, not hang it.
+    await asyncio.wait_for(inside.wait(), timeout=2)
+    original = adapter._thread_create_locks[held]
+
+    for index in range(6):  # inserts well past the bound
+        adapter._thread_create_lock(("chan-2", f"msg-{index}"))
+
+    # The held anchor keeps its lock object, so a concurrent send for it queues on
+    # the same lock instead of becoming a second creator.
+    assert adapter._thread_create_lock(held) is original
+
+    release.set()
+    await holder
+    assert adapter._thread_create_lock_users == {}  # the mark is released
+    for index in range(6):  # now idle, the anchor is evictable again
+        adapter._thread_create_lock(("chan-3", f"msg-{index}"))
+    assert len(adapter._thread_create_locks) == adapter._threads_by_anchor_max
+
+
+@pytest.mark.asyncio
+async def test_a_lock_a_send_is_only_waiting_on_is_never_evicted():
+    """A queued send pins its anchor's entry as well: it holds the old lock object,
+    so replacing the entry would put two creators on one anchor."""
+    adapter = _adapter()
+    adapter._threads_by_anchor_max = 1
+    key = ("chan-1", "msg-1")
+    first_inside = asyncio.Event()
+    release = asyncio.Event()
+
+    async def send(marker):
+        async with adapter._thread_creation_slot(key):
+            if marker == 1:
+                first_inside.set()
+                await release.wait()
+
+    first = asyncio.create_task(send(1))
+    await asyncio.wait_for(first_inside.wait(), timeout=2)
+    second = asyncio.create_task(send(2))
+    for _ in range(5):  # let the second reach the lock
+        await asyncio.sleep(0)
+    original = adapter._thread_create_locks[key]
+    assert adapter._thread_create_lock_users[key] == 2
+
+    for index in range(4):
+        adapter._thread_create_lock(("chan-9", f"msg-{index}"))
+
+    assert adapter._thread_create_locks.get(key) is original
+    assert adapter._thread_create_lock(key) is original
+
+    release.set()
+    await asyncio.gather(first, second)
+    assert adapter._thread_create_lock_users == {}
