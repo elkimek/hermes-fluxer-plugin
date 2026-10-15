@@ -103,11 +103,54 @@ _EXEC_APPROVAL_REACTIONS = (
     ("♾️", "always", "always approve"),
     ("❌", "deny", "deny"),
 )
+# Emoji per approval choice, so a card built from the host's own ``prompt.actions``
+# (which carry only label/choice/style) still gets the matching reaction glyph.
+_EA_ACTION_EMOJI = {"once": "✅", "session": "🕒", "always": "♾️", "deny": "❌", "cancel": "❌"}
 _SLASH_CONFIRM_REACTIONS = (
     ("✅", "once", "approve once"),
     ("♾️", "always", "always approve"),
     ("❌", "cancel", "cancel"),
 )
+# A pending approval/confirm card is only answerable while the gateway request it
+# belongs to can still be answered. Cards older than the host's ``approvals.timeout``
+# (plus a grace margin) are pruned, so a stale card cannot linger in the maps and be
+# mistaken for a live one. Minimum 300s mirrors the host default.
+_APPROVAL_CARD_TTL_FLOOR = 300.0
+_APPROVAL_CARD_TTL_GRACE = 60.0
+
+
+def _approval_card_ttl() -> float:
+    """Seconds a pending card stays registered: the host's approval timeout + grace."""
+    try:
+        from tools.approval_context import _get_approval_timeout
+
+        timeout = float(_get_approval_timeout())
+    except Exception:
+        timeout = 300.0
+    return max(timeout, _APPROVAL_CARD_TTL_FLOOR) + _APPROVAL_CARD_TTL_GRACE
+
+
+def _exec_approval_choices(
+    *, allow_permanent: bool, allow_session: bool, smart_denied: bool
+) -> tuple[tuple[str, str, str], ...]:
+    """``(emoji, choice, label)`` rows to offer for an exec approval.
+
+    Mirrors the host's own choice policy (``BasePlatformAdapter._exec_approval_actions``):
+    ``once`` and ``deny`` are always offered; ``session`` only when the caller allows it
+    and the prompt is not a smart deny (a one-operation owner override); ``always`` only
+    when the permanent tier is allowed on top of that.
+    """
+    offered: list[tuple[str, str, str]] = []
+    for row in _EXEC_APPROVAL_REACTIONS:
+        _emoji, choice, _label = row
+        if choice == "session" and (smart_denied or not allow_session):
+            continue
+        if choice == "always" and (smart_denied or not allow_session or not allow_permanent):
+            continue
+        offered.append(row)
+    return tuple(offered)
+
+
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 
 
@@ -572,6 +615,124 @@ def _extension_for_attachment(att: Dict[str, Any], content_type: str, default: s
     if subtype:
         return aliases.get(subtype, f".{subtype}")
     return default
+
+
+# Fallback cap for an inbound attachment body when the host does not expose its
+# configured inbound-media limit. Matches the host default
+# (``gateway.max_inbound_media_bytes`` = 128 MiB) so a hostile URL cannot stream an
+# unbounded body into memory regardless of which host version is running.
+_DEFAULT_ATTACHMENT_MAX_BYTES = 128 * 1024 * 1024
+_MAX_ATTACHMENT_REDIRECTS = 4
+
+
+def _attachment_max_bytes() -> int:
+    """The host's configured inbound-media cap, else a safe default.
+
+    ``get_inbound_media_max_bytes`` is the host's public reader for
+    ``gateway.max_inbound_media_bytes``; an older host without it, or a disabled
+    (``0``) cap, falls back to the module default so the download is always bounded.
+    """
+    try:
+        from gateway.platforms.base import get_inbound_media_max_bytes
+
+        limit = int(get_inbound_media_max_bytes())
+        return limit if limit > 0 else _DEFAULT_ATTACHMENT_MAX_BYTES
+    except Exception:
+        return _DEFAULT_ATTACHMENT_MAX_BYTES
+
+
+def _redirect_target(response: Any) -> Optional[str]:
+    """Absolute redirect target visible on an httpx response, or ``None``.
+
+    Prefers the host's own ``redirect_target_from_response`` (which resolves from
+    ``Location`` before the often-unpopulated ``next_request``); falls back to the
+    same logic locally so an older host still gets a correct answer.
+    """
+    try:
+        from tools.url_safety import redirect_target_from_response
+
+        return redirect_target_from_response(response)
+    except Exception:
+        pass
+    if not getattr(response, "is_redirect", False):
+        return None
+    location = (getattr(response, "headers", {}) or {}).get("location")
+    if location:
+        return urljoin(str(getattr(response, "url", "")), str(location))
+    next_request = getattr(response, "next_request", None)
+    return str(next_request.url) if next_request else None
+
+
+async def _fluxer_ssrf_redirect_guard(response: Any) -> None:
+    """Re-validate every redirect target (defence in depth behind the manual loop).
+
+    Async because httpx awaits response event hooks. A public URL that 302s to
+    ``http://169.254.169.254/`` would otherwise slip past the pre-flight
+    ``is_safe_url`` check.
+    """
+    target = _redirect_target(response)
+    if target:
+        from tools.url_safety import is_safe_url
+
+        if not is_safe_url(target):
+            raise ValueError(
+                f"Blocked redirect to private/internal address: {safe_url_for_log(target)}"
+            )
+
+
+async def _read_capped_body(response: Any, max_bytes: int) -> bytes:
+    """Read a streaming response body under ``max_bytes``.
+
+    Rejects an oversized ``Content-Length`` early, then re-checks the running total
+    per chunk so a lying or absent header cannot smuggle a larger body.
+    """
+    content_length = (getattr(response, "headers", {}) or {}).get("content-length")
+    if content_length:
+        try:
+            declared = int(content_length)
+        except (TypeError, ValueError):
+            declared = None
+        if declared is not None and declared > max_bytes:
+            raise ValueError(f"Fluxer attachment exceeds {max_bytes} bytes (declared {declared})")
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"Fluxer attachment exceeds {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _ssrf_safe_async_client_factory() -> tuple[Any, bool]:
+    """``(factory, guarded)`` for an async HTTP client.
+
+    Prefers the host's connect-time SSRF-safe client (DNS is resolved, validated and
+    dialed by IP at connect time, closing the rebinding gap). An older host without
+    it degrades to plain ``httpx.AsyncClient`` — and the caller then keeps
+    ``follow_redirects`` off and walks redirects manually, so a redirect is still
+    re-validated before it is followed.
+    """
+    import httpx
+
+    try:
+        from tools.url_safety import create_ssrf_safe_async_client
+
+        return create_ssrf_safe_async_client, True
+    except Exception:
+        return httpx.AsyncClient, False
+
+
+def _message_has_attachments(data: Dict[str, Any]) -> bool:
+    """True when a message carries at least one attachment dict (metadata only).
+
+    Used to keep a media-only message eligible for admission WITHOUT fetching
+    anything, so no bytes move before the channel/mention gate has decided.
+    """
+    attachments = data.get("attachments")
+    if not isinstance(attachments, list):
+        return False
+    return any(isinstance(att, dict) and _attachment_url(att) for att in attachments)
 
 
 def _message_type_for_media(media_types: List[str]) -> MessageType:
@@ -1309,6 +1470,23 @@ def _normalize_reaction_emoji(value: Any) -> str:
     # Fluxer/clients may round-trip text emoji with or without VS16. Compare
     # both forms so ♾ and ♾️ resolve the same pending approval.
     return text.replace(_VARIATION_SELECTOR_16, "")
+
+
+def _normalize_approval_command(command: Any) -> str:
+    """Redact a command for comparison against the host's pending-approval snapshot.
+
+    The host stores the approval prompt's command already redacted; the runner hands
+    the adapter a *differently* redacted copy of the same string. Normalizing both
+    through the force-redactor (idempotent, verified) makes the two comparable without
+    ever holding a raw secret.
+    """
+    text = str(command or "")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text, force=True)
+    except Exception:
+        return text
 
 
 def _reaction_choice_map(specs: Any) -> Dict[str, str]:
@@ -2055,18 +2233,121 @@ class FluxerAdapter(BasePlatformAdapter):
             },
         )
 
+    def _request_id_for_command(self, session_key: str, command: str) -> Optional[str]:
+        """The gateway request id this approval prompt belongs to, or ``None``.
+
+        ``send_exec_approval`` receives the runner's redacted command but NOT the
+        gateway ``request_id`` (the host's ``ExecApprovalPrompt`` carries no such
+        field). The host's public ``list_gateway_approvals(session_key)`` returns
+        snapshots of the session's unresolved approvals, each carrying its
+        ``request_id``. Match on the normalized command, but ONLY when exactly one
+        pending request matches: a unique match is safe, while an ambiguous one (two
+        identical commands queued) or an unavailable reader yields ``None``, and the
+        caller then falls back to the host's FIFO resolution rather than ever
+        resolving the wrong request.
+        """
+        normalized = _normalize_approval_command(command)
+        try:
+            from tools.approval import list_gateway_approvals
+
+            pending = list_gateway_approvals(session_key) or []
+        except Exception:
+            return None
+        matches = [
+            entry
+            for entry in pending
+            if isinstance(entry, dict)
+            and entry.get("request_id")
+            and _normalize_approval_command(entry.get("command")) == normalized
+        ]
+        if len(matches) == 1:
+            return str(matches[0]["request_id"])
+        if len(matches) > 1:
+            logger.warning(
+                "Fluxer approval prompt has %d pending requests with an identical command; "
+                "not binding a request id (resolution stays FIFO)",
+                len(matches),
+            )
+        return None
+
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Render an exec-approval card natively (the host's contract override).
+
+        The host's ``BasePlatformAdapter.send_exec_approval`` builds an
+        ``ExecApprovalPrompt`` and calls this hook, which is what makes
+        ``supports_exec_approval_buttons()`` true for this adapter. Taking the prompt
+        object means the choice set is derived from ``prompt.actions`` — the host's
+        own allow_permanent / allow_session / smart_denied policy — instead of the
+        adapter inventing a full four-button row.
+        """
+        actions = list(getattr(prompt, "actions", None) or [])
+        if not actions:
+            actions = [("approve once", "once", "primary"), ("deny", "deny", "danger")]
+        return await self._post_approval_card(
+            chat_id=prompt.chat_id,
+            session_key=prompt.session_key,
+            command=prompt.command,
+            description=prompt.description,
+            metadata=getattr(prompt, "metadata", None),
+            reaction_specs=tuple(
+                (_EA_ACTION_EMOJI.get(choice, "•"), choice, label)
+                for label, choice, _style in actions
+            ),
+        )
+
     async def send_exec_approval(
         self,
         chat_id: str,
         command: str,
         session_key: str,
-        description: str = "dangerous command",
+        description: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
-        """Send a dangerous-command approval prompt with clickable reactions."""
+        """Send a dangerous-command approval prompt with clickable reactions.
+
+        Signature matches ``BasePlatformAdapter.send_exec_approval`` so the runner's
+        ``**flags`` (``allow_permanent`` / ``allow_session`` / ``smart_denied``) are
+        honoured instead of raising ``TypeError``. The offered choices follow the
+        host's own policy, so a smart deny or a permanent-incapable prompt cannot be
+        escalated to a permanent approval from this surface.
+        """
+        specs = _exec_approval_choices(
+            allow_permanent=allow_permanent,
+            allow_session=allow_session,
+            smart_denied=smart_denied,
+        )
+        return await self._post_approval_card(
+            chat_id=chat_id,
+            session_key=session_key,
+            command=command,
+            description=description or "dangerous command",
+            metadata=metadata,
+            reaction_specs=specs,
+        )
+
+    async def _post_approval_card(
+        self,
+        *,
+        chat_id: str,
+        session_key: str,
+        command: str,
+        description: str,
+        metadata: Optional[Dict[str, Any]],
+        reaction_specs: tuple[tuple[str, str, str], ...],
+    ) -> SendResult:
+        """Post an exec-approval card and register its components + reactions.
+
+        The card is bound to the gateway ``request_id`` when exactly one pending
+        request matches its command, so a tap resolves THAT request and never another
+        via FIFO. When the id cannot be determined safely it is left unbound and the
+        host's FIFO resolution applies — never a wrong-request approval.
+        """
         target_id = await self._resolve_thread_container(chat_id, metadata, session_key)
         cmd_display = command if len(command) <= 3200 else command[:3197] + "..."
-        reaction_hint = " • ".join(f"{emoji} {label}" for emoji, _choice, label in _EXEC_APPROVAL_REACTIONS)
+        reaction_hint = " • ".join(f"{emoji} {label}" for emoji, _choice, label in reaction_specs)
         content = (
             "**Command approval required**\n"
             f"```\n{cmd_display}\n```\n"
@@ -2078,7 +2359,7 @@ class FluxerAdapter(BasePlatformAdapter):
             self._known_channel_ids.add(target_id)
             buttons, component_actions = _fluxer_action_buttons(
                 prefix="fluxer_exec",
-                specs=_EXEC_APPROVAL_REACTIONS,
+                specs=reaction_specs,
                 danger_choice="deny",
             )
             data, components_enabled = await self._post_message_with_optional_components(
@@ -2090,14 +2371,18 @@ class FluxerAdapter(BasePlatformAdapter):
             if not message_id:
                 return SendResult(success=False, error="Fluxer approval message missing id", retryable=True)
 
+            request_id = self._request_id_for_command(session_key, command)
             pending = {
                 "session_key": session_key,
                 "channel_id": target_id,
                 "created_at": time.time(),
                 "content": content,
                 "resolved": False,
+                "command": command,
+                "request_id": request_id,
             }
             self._pending_exec_approvals[message_id] = pending
+            self._prune_pending_cards()
             if components_enabled:
                 self._register_component_actions(
                     component_actions,
@@ -2105,14 +2390,17 @@ class FluxerAdapter(BasePlatformAdapter):
                     message_id=message_id,
                     session_key=session_key,
                     channel_id=target_id,
+                    request_id=request_id,
                 )
-            for emoji, choice, _label in _EXEC_APPROVAL_REACTIONS:
+            for emoji, choice, _label in reaction_specs:
                 self._pending_reaction_actions[f"{message_id}:{_normalize_reaction_emoji(emoji)}"] = {
                     "kind": "exec_approval",
                     "message_id": message_id,
                     "session_key": session_key,
                     "channel_id": target_id,
                     "choice": choice,
+                    "request_id": request_id,
+                    "created_at": time.time(),
                 }
                 await self._add_reaction(target_id, message_id, emoji)
             return SendResult(success=True, message_id=message_id, raw_response=data)
@@ -2168,8 +2456,10 @@ class FluxerAdapter(BasePlatformAdapter):
                     "confirm_id": confirm_id,
                     "channel_id": target_id,
                     "choice": choice,
+                    "created_at": time.time(),
                 }
                 await self._add_reaction(target_id, message_id, emoji)
+            self._prune_pending_cards()
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
             logger.warning("Fluxer slash confirm prompt failed: %s", exc)
@@ -3875,6 +4165,7 @@ class FluxerAdapter(BasePlatformAdapter):
         channel_id: str,
         session_key: str,
         confirm_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> None:
         """Register Fluxer native button custom IDs for a pending prompt."""
         for custom_id, choice in actions:
@@ -3884,10 +4175,41 @@ class FluxerAdapter(BasePlatformAdapter):
                 "session_key": session_key,
                 "channel_id": channel_id,
                 "choice": choice,
+                "created_at": time.time(),
             }
             if confirm_id is not None:
                 state["confirm_id"] = confirm_id
+            if request_id is not None:
+                state["request_id"] = request_id
             self._pending_component_actions[custom_id] = state
+        self._prune_pending_cards()
+
+    def _prune_pending_cards(self) -> None:
+        """Drop pending approval/confirm cards past the host's approval TTL.
+
+        A card left registered after its gateway request can no longer be answered
+        (turn ended, request timed out) must not linger: it would keep a stale button
+        live and, worse, a later tap could resolve an unrelated pending request. This
+        only prunes the adapter's own maps — it never resolves or denies anything, so
+        the host's own approval timeout remains the sole authority on the request.
+        """
+        ttl = _approval_card_ttl()
+        now = time.time()
+        for mapping in (
+            self._pending_exec_approvals,
+            self._pending_component_actions,
+            self._pending_reaction_actions,
+        ):
+            for key, state in list(mapping.items()):
+                if not isinstance(state, dict):
+                    continue
+                created = state.get("created_at")
+                try:
+                    created_at = float(created) if created is not None else None
+                except (TypeError, ValueError):
+                    created_at = None
+                if created_at is not None and now - created_at > ttl:
+                    mapping.pop(key, None)
 
     async def _post_message_with_optional_components(
         self,
@@ -4022,8 +4344,20 @@ class FluxerAdapter(BasePlatformAdapter):
                     pass
 
     async def _download_attachment_bytes(self, url: str) -> bytes:
+        """Fetch attachment bytes with SSRF, redirect and size protection.
+
+        A pre-flight ``is_safe_url`` alone is not enough: the previous version then
+        used a plain ``httpx.AsyncClient(follow_redirects=True)`` and returned
+        ``response.content`` unbounded, so (a) a public URL that redirected to a
+        private/internal address was followed without re-validation, (b) DNS could
+        be rebound between the check and the connect, and (c) a hostile or merely
+        huge body was buffered fully into memory. Now the host's connect-time
+        SSRF-safe client is used, every redirect is re-validated (manually, so it
+        holds even on a host without the guard) and the body is read under the
+        host's inbound-media cap.
+        """
         try:
-            import httpx
+            import httpx  # noqa: F401
             from tools.url_safety import is_safe_url
         except ImportError as exc:
             raise RuntimeError("httpx and url safety helpers are required for Fluxer attachments") from exc
@@ -4035,10 +4369,36 @@ class FluxerAdapter(BasePlatformAdapter):
         api_host = urlparse(self.api_base_url).netloc.lower()
         if attachment_host and api_host and attachment_host == api_host:
             headers["Authorization"] = f"Bot {self.bot_token}"
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            return response.content
+
+        max_bytes = _attachment_max_bytes()
+        factory, _guarded = _ssrf_safe_async_client_factory()
+        # ``follow_redirects`` stays OFF: redirects are walked here so each hop is
+        # re-validated against ``is_safe_url`` before it is followed.
+        async with factory(
+            timeout=30.0,
+            follow_redirects=False,
+            event_hooks={"response": [_fluxer_ssrf_redirect_guard]},
+        ) as client:
+            download_url = url
+            redirect_count = 0
+            while True:
+                async with client.stream("GET", download_url, headers=headers) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        target = _redirect_target(response)
+                        if not target:
+                            response.raise_for_status()
+                            raise ValueError("Fluxer attachment redirect without a target")
+                        if not is_safe_url(target):
+                            raise ValueError(
+                                f"Blocked unsafe Fluxer attachment redirect: {safe_url_for_log(target)}"
+                            )
+                        if redirect_count >= _MAX_ATTACHMENT_REDIRECTS:
+                            raise ValueError("Too many Fluxer attachment redirects")
+                        download_url = target
+                        redirect_count += 1
+                        continue
+                    response.raise_for_status()
+                    return await _read_capped_body(response, max_bytes)
 
     async def _cache_attachment(self, att: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
         url = _attachment_url(att)
@@ -4472,11 +4832,34 @@ class FluxerAdapter(BasePlatformAdapter):
         pending["resolved"] = True
         session_key = str(action.get("session_key") or pending.get("session_key") or "")
         choice = str(action.get("choice") or "deny")
+        # Bind the resolution to the exact gateway request this card belongs to.
+        # ``request_id`` is captured when the card was posted; the action carries it
+        # too. Passing it to ``resolve_gateway_approval`` resolves THAT request only.
+        # When no id could be determined, resolution falls back to the host's FIFO
+        # order — the pre-existing behaviour — and never to a guessed id, so a card
+        # can never approve a request it does not belong to.
+        request_id = str(action.get("request_id") or pending.get("request_id") or "") or None
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, choice)
-            logger.info("Fluxer approval action resolved %d approval(s) for session %s (choice=%s user=%s)", count, session_key, choice, user_id)
+            count = resolve_gateway_approval(session_key, choice, request_id=request_id)
+            logger.info(
+                "Fluxer approval action resolved %d approval(s) for session %s (choice=%s request_id=%s user=%s)",
+                count,
+                session_key,
+                choice,
+                request_id or "<fifo>",
+                user_id,
+            )
+            if request_id and count == 0:
+                # The card was live but its request is gone (already answered, timed
+                # out, or withdrawn). Do not fall back to FIFO: that could resolve an
+                # unrelated pending request for the same session.
+                logger.info(
+                    "Fluxer approval card %s: request %s no longer pending; not falling back to FIFO",
+                    message_id,
+                    request_id,
+                )
         except Exception as exc:
             logger.error("Fluxer component approval resolve failed: %s", exc)
         for cid, state in list(self._pending_component_actions.items()):
@@ -4784,14 +5167,16 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         pending["resolved"] = True
         session_key = str(pending.get("session_key") or "")
+        request_id = str(pending.get("request_id") or "") or None
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, "deny")
+            count = resolve_gateway_approval(session_key, "deny", request_id=request_id)
             logger.info(
-                "Fluxer deleted approval prompt denied %d approval(s) for session %s",
+                "Fluxer deleted approval prompt denied %d approval(s) for session %s (request_id=%s)",
                 count,
                 session_key,
+                request_id or "<fifo>",
             )
         except Exception as exc:
             logger.error("Fluxer deleted approval prompt deny failed: %s", exc)
@@ -4810,8 +5195,14 @@ class FluxerAdapter(BasePlatformAdapter):
             return
 
         text = data.get("content") or ""
-        media_urls, media_types = await self._extract_attachments(data)
-        if not text and not media_urls:
+        # Attachment BYTES are not fetched here. A message's admission is decided
+        # by its channel and mention, and fetching before that gate meant every
+        # dropped message still triggered outbound network I/O (and, on a
+        # mention-gated channel, an unauthenticated fetch of a stranger's link).
+        # A media-only message stays eligible using metadata alone; the download
+        # happens after the gate below.
+        has_attachments = _message_has_attachments(data)
+        if not text and not has_attachments:
             return
 
         channel_id = str(data.get("channel_id") or (data.get("channel") or {}).get("id") or "")
@@ -4849,6 +5240,11 @@ class FluxerAdapter(BasePlatformAdapter):
         )
         if not should_process:
             return
+        # Now that the message is admitted, fetch its attachment bytes. An
+        # attachment that fails to cache (unsafe URL, SSRF-blocked redirect,
+        # oversize body, network error) is dropped and the turn proceeds on text
+        # alone, exactly as before — the move only changes WHEN the fetch happens.
+        media_urls, media_types = await self._extract_attachments(data)
         # One resolver decides the session container for this message: an in-thread
         # follow-up is keyed on the thread, a channel message that will open a thread
         # is keyed on the anchor that names it. Registered only now that the message

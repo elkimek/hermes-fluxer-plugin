@@ -90,6 +90,16 @@ except ModuleNotFoundError:
         def format_message(self, content: str) -> str:
             return content
 
+        # Host contract surface the adapter overrides / advertises. The real base
+        # defines these; the stub carries the same names so a capability test can
+        # assert the override against a base that actually has the hook.
+        async def _send_exec_approval_prompt(self, prompt: Any) -> Any:
+            return SendResult(success=False, error="Not supported")
+
+        @classmethod
+        def supports_exec_approval_buttons(cls) -> bool:
+            return cls._send_exec_approval_prompt is not BasePlatformAdapter._send_exec_approval_prompt
+
         def build_source(self, **kwargs: Any) -> SimpleNamespace:
             return SimpleNamespace(**kwargs)
 
@@ -191,7 +201,75 @@ except ModuleNotFoundError:
     base_mod.safe_url_for_log = safe_url_for_log
     base_mod.utf16_len = utf16_len
 
+    def get_inbound_media_max_bytes() -> int:
+        return 128 * 1024 * 1024
+
+    base_mod.get_inbound_media_max_bytes = get_inbound_media_max_bytes
+
     sys.modules.setdefault("gateway", gateway_pkg)
     sys.modules.setdefault("gateway.config", config_mod)
     sys.modules.setdefault("gateway.platforms", platforms_pkg)
     sys.modules.setdefault("gateway.platforms.base", base_mod)
+
+
+try:  # Prefer the real Hermes tools package when the runner has it.
+    import tools.url_safety  # type: ignore[import-not-found]  # noqa: F401
+except ModuleNotFoundError:
+    # The plugin's SSRF/size/approval hardening reaches host helpers under
+    # ``tools.*``. Standalone plugin CI has no Hermes tree, so provide minimal
+    # stand-ins with the same names — tests monkeypatch them, and the adapter's
+    # own fallbacks are exercised against them. A test needing the REAL contract
+    # uses ``pytest.importorskip("tools.url_safety")`` and skips here.
+    import ipaddress
+    from urllib.parse import urlparse as _urlparse
+
+    tools_pkg = sys.modules.get("tools") or types.ModuleType("tools")
+    tools_pkg.__path__ = getattr(tools_pkg, "__path__", [])
+    url_safety_mod = types.ModuleType("tools.url_safety")
+    approval_mod = types.ModuleType("tools.approval")
+    approval_context_mod = types.ModuleType("tools.approval_context")
+
+    def is_safe_url(url: str) -> bool:
+        parsed = _urlparse(url)
+        if (parsed.scheme or "").lower() not in {"http", "https"}:
+            return False
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return True  # a hostname is assumed public in the stub
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
+
+    def _no_guard(**kwargs):
+        raise ModuleNotFoundError("SSRF-safe client unavailable in standalone CI")
+
+    def redirect_target_from_response(response):
+        """Same shape as the host's: resolve from Location, then next_request."""
+        from urllib.parse import urljoin as _urljoin
+
+        if not getattr(response, "is_redirect", False):
+            return None
+        location = (getattr(response, "headers", {}) or {}).get("location")
+        if location:
+            return _urljoin(str(getattr(response, "url", "")), str(location))
+        next_request = getattr(response, "next_request", None)
+        return str(next_request.url) if next_request else None
+
+    url_safety_mod.is_safe_url = is_safe_url
+    url_safety_mod.create_ssrf_safe_async_client = _no_guard
+    url_safety_mod.redirect_target_from_response = redirect_target_from_response
+
+    def resolve_gateway_approval(session_key, choice, resolve_all=False, reason=None, request_id=None):
+        return 0
+
+    approval_mod.resolve_gateway_approval = resolve_gateway_approval
+    approval_mod.list_gateway_approvals = lambda session_key: []
+
+    approval_context_mod._get_approval_timeout = lambda: 300
+
+    sys.modules.setdefault("tools", tools_pkg)
+    sys.modules.setdefault("tools.url_safety", url_safety_mod)
+    sys.modules.setdefault("tools.approval", approval_mod)
+    sys.modules.setdefault("tools.approval_context", approval_context_mod)
