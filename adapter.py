@@ -362,6 +362,131 @@ def _event_seq(payload: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+try:  # The host's own classifier; absent in the standalone test shim.
+    from gateway.platforms.base import classify_send_error as _host_classify_send_error
+except Exception:  # pragma: no cover - shim without the classifier
+    _host_classify_send_error = None
+
+# HTTP statuses that a retry can never fix: the request was understood and
+# refused. 408/429 are the two 4xx that mean "try again", so they stay out.
+_PERMANENT_STATUS_KINDS = {
+    400: "unknown",
+    401: "forbidden",
+    403: "forbidden",
+    404: "not_found",
+    405: "unknown",
+    409: "unknown",
+    413: "too_long",
+    415: "bad_format",
+    422: "bad_format",
+}
+# httpx transport failures that never reached the server: safe to retry.
+_CONNECT_LEVEL_EXC_NAMES = frozenset({
+    "ConnectError", "ConnectTimeout", "PoolTimeout", "NetworkError",
+    "RemoteProtocolError", "ReadError", "WriteError", "TransportError",
+})
+# Read/write timeouts MAY have been accepted by the server before the response
+# was lost, so re-sending a POST can duplicate the message: never retry these.
+_LANDED_TIMEOUT_EXC_NAMES = frozenset({"ReadTimeout", "WriteTimeout"})
+
+
+def _http_status_of(exc: BaseException) -> Optional[int]:
+    """Status code off the httpx error the REST helpers raise, else ``None``."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_send_failure(
+    exc: BaseException, error_text: str = ""
+) -> tuple[bool, Optional[str]]:
+    """``(retryable, error_kind)`` for a failed outbound call.
+
+    The host's ``classify_send_error`` supplies the platform-neutral kind where
+    it can; the HTTP status is the authoritative signal for retryability, so a
+    permanent 4xx refusal (403 forbidden, 404 gone, 413 too long) is not retried
+    while a 5xx/429/connection failure is. A read/write timeout is deliberately
+    NOT retryable: the POST may already have landed, and retrying duplicates it.
+    """
+    status = _http_status_of(exc)
+    if status is not None:
+        kind = None
+        if _host_classify_send_error is not None:
+            try:
+                kind = _host_classify_send_error(exc, error_text)
+            except Exception:
+                kind = None
+        if not kind or kind == "unknown":
+            kind = _PERMANENT_STATUS_KINDS.get(status) or (
+                "rate_limited" if status == 429 else
+                "transient" if status >= 500 or status == 408 else "unknown"
+            )
+        retryable = status >= 500 or status in (408, 429)
+        return retryable, kind
+
+    name = type(exc).__name__
+    if name in _CONNECT_LEVEL_EXC_NAMES:
+        return True, "transient"
+    if name in _LANDED_TIMEOUT_EXC_NAMES:
+        return False, "transient"
+
+    kind = None
+    if _host_classify_send_error is not None:
+        try:
+            kind = _host_classify_send_error(exc, error_text)
+        except Exception:
+            kind = None
+    if kind in {"forbidden", "not_found", "too_long", "bad_format"}:
+        return False, kind
+    if kind == "rate_limited":
+        return True, kind
+    # Unknown non-HTTP exception: keep the previous permissive default so a
+    # transport-shaped failure the classifier cannot name is still retried.
+    return True, (kind or "unknown")
+
+
+def _error_text_for(exc: BaseException) -> str:
+    """An error string that always names the exception class.
+
+    httpx timeouts stringify to ``""``, and the host's own timeout/retryable
+    checks match on that text — an empty error would read as an ordinary
+    formatting failure and let the host re-send a POST that may already have
+    landed.
+    """
+    detail = str(exc).strip()
+    name = type(exc).__name__
+    return detail if name in detail else (f"{name}: {detail}" if detail else name)
+
+
+def _failed_send_result(exc: BaseException, *, message_id: Optional[str] = None) -> "SendResult":
+    """A ``SendResult`` failure with the retryability/kind classification applied."""
+    retryable, error_kind = _classify_send_failure(exc)
+    return SendResult(success=False, message_id=message_id, error=_error_text_for(exc),
+                      retryable=retryable, error_kind=error_kind)
+
+
+def _chunk_without_indicator(chunk: str) -> str:
+    """A delivered chunk minus the `` (n/m)`` suffix ``truncate_message`` appends."""
+    return re.sub(r" \(\d+/\d+\)$", "", chunk)
+
+
+class _ThreadGone(Exception):
+    """A chosen thread was deleted mid-send: the caller falls back to its parent.
+
+    Carries the ids so ``send`` can abandon the dead thread without re-deriving
+    them from mutable channel state.
+    """
+
+    def __init__(self, thread_id: str, parent_chat: str, original: BaseException) -> None:
+        super().__init__(str(original))
+        self.thread_id = thread_id
+        self.parent_chat = parent_chat
+        self.original = original
+
+
 def _author_name(author: Dict[str, Any]) -> Optional[str]:
     return (
         author.get("global_name")
@@ -1226,7 +1351,22 @@ class FluxerAdapter(BasePlatformAdapter):
     # this keeps cron delivery from pre-truncating a multi-message report into a
     # single 4,000-codepoint payload. That old path could still exceed Fluxer's
     # 4,000 UTF-16-unit API limit when it contained astral emoji.
+    # Fluxer's message API counts UTF-16 code units and caps a message at 4,000
+    # of them, so the host's length contract must read this adapter's own cap and
+    # unit rather than its 4096-codepoint default.
+    MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     splits_long_messages = True
+
+    @property
+    def message_len_fn(self) -> Callable[[str], int]:
+        """Length unit Fluxer counts in (UTF-16 code units, not codepoints)."""
+        return utf16_len
+
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        return MAX_MESSAGE_LENGTH
+
+    def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
+        return utf16_len
 
     def __init__(self, config: PlatformConfig):
         _ensure_fluxer_platform_registered()
@@ -1755,68 +1895,52 @@ class FluxerAdapter(BasePlatformAdapter):
                     chunk_payload.pop("message_reference", None)
 
                 try:
-                    data = await self._request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        json=chunk_payload,
+                    data = await self._post_chunk(
+                        chunk_payload, payload, target_chat_id, index,
+                        chat_id, reply_to, metadata, auto_thread_id,
+                    )
+                except _ThreadGone as gone:
+                    # A thread this adapter chose can be deleted between the
+                    # progress bubble and the reply. Abandon it and post to the
+                    # parent channel rather than losing the message. For a
+                    # prospective thread the caller's chat_id IS the thread, so
+                    # the parent channel is the one recorded when it was opened.
+                    logger.info(
+                        "Fluxer thread %s is gone; falling back to channel %s",
+                        gone.thread_id, gone.parent_chat,
+                    )
+                    self._forget_thread(gone.thread_id)
+                    self._disable_turn_thread(chat_id, reply_to, metadata)
+                    self._remember_dead_container(gone.thread_id, gone.parent_chat)
+                    self._remember_dead_container(chat_id, gone.parent_chat)
+                    auto_thread_id = None
+                    target_chat_id = str(gone.parent_chat)
+                    self._known_channel_ids.add(target_chat_id)
+                    if reply_to and self._reply_to_mode != "off":
+                        # Restore the reference in the shared payload as well: the
+                        # remaining chunks of a split reply are rebuilt from it, so
+                        # patching only this chunk would leave every later one
+                        # unlinked after a fallback. The mode still decides where
+                        # the reference lands.
+                        payload["message_reference"] = {"message_id": str(reply_to)}
+                        chunk_payload["message_reference"] = {"message_id": str(reply_to)}
+                        if index > 0 and self._reply_to_mode != "all":
+                            chunk_payload.pop("message_reference", None)
+                    data = await self._post_chunk(
+                        chunk_payload, payload, target_chat_id, index,
+                        chat_id, reply_to, metadata, None,
                     )
                 except Exception as exc:
-                    if _is_reply_reference_rejected_error(exc) and chunk_payload.get("message_reference"):
-                        # Whatever the reference pointed at, Fluxer refused it and
-                        # will refuse it again: the refusal names the reference,
-                        # never the content. Drop the reference and let the reply
-                        # through instead of losing it to a retry that cannot win.
-                        logger.info(
-                            "Fluxer refused the reply reference (%s); sending without it",
-                            type(exc).__name__,
+                    # Any other failure: if earlier chunks of this split already
+                    # landed, the failure is a PARTIAL delivery — the host must
+                    # never re-send the visible head, only the missing tail.
+                    if message_ids:
+                        logger.warning(
+                            "Fluxer split send stopped after %d/%d chunks: %s",
+                            len(message_ids), len(chunks), exc,
                         )
-                        payload.pop("message_reference", None)
-                        chunk_payload.pop("message_reference", None)
-                        data = await self._request(
-                            "POST",
-                            f"/channels/{_quote_id(target_chat_id)}/messages",
-                            json=chunk_payload,
-                        )
-                    elif auto_thread_id and _is_missing_channel_error(exc):
-                        # A thread this adapter chose can be deleted between the
-                        # progress bubble and the reply. Abandon it and post to the
-                        # parent channel rather than losing the message. For a
-                        # prospective thread the caller's chat_id IS the thread, so
-                        # the parent channel is the one recorded when it was opened.
-                        fallback_chat = (
-                            self._thread_parents.get(str(chat_id))
-                            or self._threads_pending.get(str(chat_id))
-                            or str(chat_id)
-                        )
-                        logger.info(
-                            "Fluxer thread %s is gone; falling back to channel %s",
-                            auto_thread_id,
-                            fallback_chat,
-                        )
-                        self._forget_thread(auto_thread_id)
-                        self._disable_turn_thread(chat_id, reply_to, metadata)
-                        self._remember_dead_container(auto_thread_id, fallback_chat)
-                        self._remember_dead_container(chat_id, fallback_chat)
-                        auto_thread_id = None
-                        target_chat_id = str(fallback_chat)
-                        self._known_channel_ids.add(target_chat_id)
-                        if reply_to and self._reply_to_mode != "off":
-                            # Restore the reference in the shared payload as well: the
-                            # remaining chunks of a split reply are rebuilt from it, so
-                            # patching only this chunk would leave every later one
-                            # unlinked after a fallback. The mode still decides where
-                            # the reference lands.
-                            payload["message_reference"] = {"message_id": str(reply_to)}
-                            chunk_payload["message_reference"] = {"message_id": str(reply_to)}
-                            if index > 0 and self._reply_to_mode != "all":
-                                chunk_payload.pop("message_reference", None)
-                        data = await self._request(
-                            "POST",
-                            f"/channels/{_quote_id(target_chat_id)}/messages",
-                            json=chunk_payload,
-                        )
-                    else:
-                        raise
+                        return self._partial_split_result(exc, chunks, message_ids, responses)
+                    raise
                 responses.append(data)
                 if data.get("id"):
                     message_id = str(data["id"])
@@ -1833,14 +1957,103 @@ class FluxerAdapter(BasePlatformAdapter):
                     else:
                         responses[-1] = {**data, "delivery_verified": False}
 
+            # Split-payload contract: ``message_id`` is the LAST chunk (later edits
+            # target the newest bubble) and the earlier ones ride in
+            # ``continuation_message_ids`` in send order.
             return SendResult(
                 success=True,
-                message_id=message_ids[0] if message_ids else None,
+                message_id=message_ids[-1] if message_ids else None,
                 raw_response={"message_ids": message_ids, "responses": responses},
+                continuation_message_ids=tuple(message_ids[:-1]),
             )
         except Exception as exc:
             logger.warning("Fluxer send failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
+
+    async def _post_chunk(
+        self,
+        chunk_payload: Dict[str, Any],
+        shared_payload: Dict[str, Any],
+        target_chat_id: str,
+        index: int,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        auto_thread_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """POST one split chunk, absorbing the two recoverable refusals.
+
+        - A refused reply reference (``400 CANNOT_REPLY_TO_SYSTEM_MESSAGE``) names
+          the reference, never the content, so the identical retry can only fail
+          again: drop the reference — from the SHARED payload too, so no later
+          chunk re-sends it — and send on.
+        - A missing container (404 / unknown thread) on a thread this adapter
+          chose raises :class:`_ThreadGone` so the caller falls back to the parent
+          channel. Any other failure propagates unchanged: it is a real delivery
+          problem, not a redirect.
+        """
+        try:
+            return await self._request(
+                "POST",
+                f"/channels/{_quote_id(target_chat_id)}/messages",
+                json=chunk_payload,
+            )
+        except Exception as exc:
+            if _is_reply_reference_rejected_error(exc) and chunk_payload.get("message_reference"):
+                logger.info(
+                    "Fluxer refused the reply reference (%s); sending without it",
+                    type(exc).__name__,
+                )
+                shared_payload.pop("message_reference", None)
+                chunk_payload.pop("message_reference", None)
+                return await self._request(
+                    "POST",
+                    f"/channels/{_quote_id(target_chat_id)}/messages",
+                    json=chunk_payload,
+                )
+            if auto_thread_id and _is_missing_channel_error(exc):
+                parent_chat = (
+                    self._thread_parents.get(str(chat_id))
+                    or self._threads_pending.get(str(chat_id))
+                    or str(chat_id)
+                )
+                raise _ThreadGone(auto_thread_id, str(parent_chat), exc) from exc
+            raise
+
+    def _partial_split_result(
+        self,
+        exc: BaseException,
+        chunks: List[str],
+        message_ids: List[str],
+        responses: List[Dict[str, Any]],
+    ) -> SendResult:
+        """A failure after some split chunks landed, marked ``partial_overflow``.
+
+        The host's retry ladder and stream consumer both read
+        ``raw_response["partial_overflow"]`` to avoid re-sending the visible head,
+        so the delivered ids and the prefix actually on screen travel with the
+        failure. ``message_id`` stays the LAST delivered chunk.
+        """
+        retryable, error_kind = _classify_send_failure(exc)
+        delivered_prefix = "".join(_chunk_without_indicator(c) for c in chunks[: len(message_ids)])
+        return SendResult(
+            success=False,
+            message_id=message_ids[-1],
+            error=_error_text_for(exc),
+            retryable=retryable,
+            error_kind=error_kind,
+            continuation_message_ids=tuple(message_ids[:-1]),
+            raw_response={
+                "partial_overflow": True,
+                "delivered_chunks": len(message_ids),
+                "total_chunks": len(chunks),
+                "last_message_id": message_ids[-1],
+                "delivered_prefix": delivered_prefix,
+                "continuation_message_ids": tuple(message_ids[:-1]),
+                "message_ids": list(message_ids),
+                "responses": responses,
+            },
+        )
 
     async def send_exec_approval(
         self,
@@ -1905,7 +2118,7 @@ class FluxerAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
             logger.warning("Fluxer exec approval prompt failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
 
     async def send_slash_confirm(
         self,
@@ -1960,7 +2173,7 @@ class FluxerAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
             logger.warning("Fluxer slash confirm prompt failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
 
     def _interaction_user_allowed(self, user_id: str) -> bool:
         if not user_id:
@@ -1996,9 +2209,18 @@ class FluxerAdapter(BasePlatformAdapter):
             # unit longer than their source syntax.
             formatted = self._sanitize_outbound_mentions(self.format_message(content))
             if utf16_len(formatted) > MAX_MESSAGE_LENGTH:
-                # Reuse the platform splitter's UTF-16 accounting so an emoji
-                # cannot make an apparently 4,000-character edit exceed the API
-                # limit. Keep the edit to one self-contained first chunk.
+                if finalize:
+                    # The FINAL edit holds the whole answer, so it must be split
+                    # across the preview plus continuations rather than truncated.
+                    # Truncating here delivered only the first chunk and reported
+                    # success, silently hiding the rest of the reply.
+                    return await self._edit_overflow_split(
+                        target_chat_id, message_id, formatted
+                    )
+                # Mid-stream: truncate instead of splitting. Splitting creates
+                # continuation messages whose ids become the new edit target, and
+                # the next token chunk re-edits the full text into the continuation,
+                # triggering another split -> infinite duplication loop.
                 formatted = self.truncate_message(
                     formatted,
                     MAX_MESSAGE_LENGTH,
@@ -2030,7 +2252,80 @@ class FluxerAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.warning("Fluxer edit failed for message %s: %s", message_id, exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
+
+    async def _edit_overflow_split(
+        self, target_chat_id: str, message_id: str, formatted: str
+    ) -> SendResult:
+        """Deliver an oversized FINAL edit: chunk 1 edits ``message_id``, the rest
+        are sent as continuations. Returns ``message_id=<last-id>`` +
+        ``continuation_message_ids``.
+
+        A continuation failure returns ``success=False`` with
+        ``raw_response["partial_overflow"]`` / ``delivered_prefix`` /
+        ``last_message_id`` so the host delivers only the missing tail instead of
+        treating the truncated preview as the whole answer.
+        """
+        chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+        if len(chunks) <= 1:
+            chunks = [formatted]  # defensive: a single chunk just edits normally
+        try:
+            data = await self._request(
+                "PATCH",
+                f"/channels/{_quote_id(target_chat_id)}/messages/{_quote_id(message_id)}",
+                json=self._outbound_message_payload(chunks[0]),
+            )
+        except Exception as exc:
+            logger.error("Fluxer overflow split: first-chunk edit failed: %s", exc)
+            return _failed_send_result(exc)
+        first_id = str(data.get("id") or message_id)
+        delivered_ids = [first_id]
+        delivered_chunks = [chunks[0]]
+        for chunk in chunks[1:]:
+            try:
+                data = await self._request(
+                    "POST",
+                    f"/channels/{_quote_id(target_chat_id)}/messages",
+                    json=self._outbound_message_payload(chunk),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Fluxer overflow split: stopped at %d/%d chunks delivered: %s",
+                    len(delivered_ids), len(chunks), exc,
+                )
+                retryable, error_kind = _classify_send_failure(exc)
+                delivered_prefix = "".join(
+                    _chunk_without_indicator(c) for c in delivered_chunks
+                )
+                last_id = delivered_ids[-1]
+                return SendResult(
+                    success=False,
+                    message_id=last_id,
+                    error=_error_text_for(exc),
+                    retryable=retryable,
+                    error_kind=error_kind,
+                    continuation_message_ids=tuple(delivered_ids[:-1]),
+                    raw_response={
+                        "partial_overflow": True,
+                        "delivered_chunks": len(delivered_ids),
+                        "total_chunks": len(chunks),
+                        "last_message_id": last_id,
+                        "delivered_prefix": delivered_prefix,
+                        "continuation_message_ids": tuple(delivered_ids[:-1]),
+                    },
+                )
+            new_id = str(data.get("id") or "")
+            if new_id:
+                self._remember_message_destination(new_id, target_chat_id)
+                delivered_ids.append(new_id)
+            delivered_chunks.append(chunk)
+        last_id = delivered_ids[-1]
+        return SendResult(
+            success=True,
+            message_id=last_id,
+            continuation_message_ids=tuple(delivered_ids[:-1]),
+            raw_response={"message_ids": delivered_ids},
+        )
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a Fluxer message when gateway cleanup/ephemeral flows ask."""
@@ -3296,7 +3591,7 @@ class FluxerAdapter(BasePlatformAdapter):
             return await self.send_image_file(chat_id, cached, caption=caption, reply_to=reply_to, metadata=metadata)
         except Exception as exc:
             logger.warning("Fluxer image URL upload failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
 
     async def send_image_file(
         self,
@@ -3492,7 +3787,7 @@ class FluxerAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id, raw_response=raw_response)
         except Exception as exc:
             logger.warning("Fluxer file upload failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
 
     async def _verify_delivery(
         self,
@@ -3982,7 +4277,11 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _send_heartbeat(self) -> None:
         if self._ws is None:
             return
-        self._last_heartbeat_sent_at = time.monotonic()
+        # Only the FIRST un-acked heartbeat starts the watchdog window. Resetting
+        # the timestamp on every tick made the elapsed time never exceed one
+        # interval, so a dead gateway was never noticed.
+        if not self._awaiting_heartbeat_ack:
+            self._last_heartbeat_sent_at = time.monotonic()
         self._awaiting_heartbeat_ack = True
         await self._ws.send(json.dumps({"op": 1, "d": self._last_seq}))
 

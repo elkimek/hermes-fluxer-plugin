@@ -78,6 +78,9 @@ except ModuleNotFoundError:
         error: str | None = None
         retryable: bool = False
         raw_response: dict[str, Any] | None = None
+        retry_after: float | None = None
+        continuation_message_ids: tuple = ()
+        error_kind: str | None = None
 
     class BasePlatformAdapter:
         def __init__(self, config: PlatformConfig, platform: Platform | str | None = None):

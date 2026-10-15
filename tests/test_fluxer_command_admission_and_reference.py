@@ -238,6 +238,9 @@ async def test_an_unrelated_failure_is_still_reported_as_a_failure():
     result = await adapter.send("chan-1", "boom", reply_to="msg-1")
 
     assert result.success is False
-    assert result.retryable is True
+    # A permanent 400 is a refusal, not a transient fault: retrying it can only
+    # fail again, so it must not be advertised as retryable.
+    assert result.retryable is False
+    assert result.error_kind == "unknown"
     # One attempt: the reference refusal is the only failure worth a second try.
     assert adapter._request.await_count == 1
