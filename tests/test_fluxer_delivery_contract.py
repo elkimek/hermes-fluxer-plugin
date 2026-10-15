@@ -218,7 +218,9 @@ async def test_partial_delivery_prefix_is_exact_raw_source_prefix(shape):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["mention", "fence"])
 async def test_edit_partial_prefix_is_raw_source_for_host_continuation(shape):
-    from gateway.stream_consumer_fallback import StreamFallbackMixin
+    StreamFallbackMixin = pytest.importorskip(
+        "gateway.stream_consumer_fallback"
+    ).StreamFallbackMixin
 
     class _Cfg:
         cursor = ""

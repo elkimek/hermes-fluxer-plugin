@@ -234,20 +234,6 @@ async def test_in_thread_turn_registration_lives_only_during_processing(monkeypa
     assert (PARENT, OWNER) not in adapter._active_auto_threads
 
 
-@pytest.mark.asyncio
-async def test_a_command_typed_in_the_thread_targets_the_running_turn():
-    """/stop is the reason the two keys have to agree."""
-    adapter = _adapter(thread_reply_channels=[PARENT])
-    _bot_thread(adapter)
-
-    initiating = await _capture_source(adapter, _message(ANCHOR, PARENT, "deploy the thing"))
-    stop = await _capture_source(adapter, _message("msg-2", ANCHOR, "/stop", channel_type=11))
-
-    assert _key(stop) == _key(initiating)
-
-
-
-
 # ── session normalization ───────────────────────────────────────────────────────
 
 

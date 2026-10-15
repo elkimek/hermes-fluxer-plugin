@@ -646,11 +646,11 @@ def _sanitize_mentions_with_source_map(adapter: Any, source: str) -> "tuple":
     cursor = 0
     rules = []
     if not adapter._allow_mention_everyone:
-        rules.append((_MENTION_EVERYONE_RE, lambda m: "@\\u200b" + m.group(1)))
+        rules.append((_MENTION_EVERYONE_RE, lambda m: "@\u200b" + m.group(1)))
     if not adapter._allow_mention_roles:
-        rules.append((_MENTION_ROLE_RE, lambda m: m.group(0).replace("<@&", "<@\\u200b&", 1)))
+        rules.append((_MENTION_ROLE_RE, lambda m: m.group(0).replace("<@&", "<@\u200b&", 1)))
     if not adapter._allow_mention_users:
-        rules.append((_MENTION_USER_RE, lambda m: m.group(0).replace("<@", "<@\\u200b", 1)))
+        rules.append((_MENTION_USER_RE, lambda m: m.group(0).replace("<@", "<@\u200b", 1)))
     matches = []
     for regex, replacement in rules:
         matches.extend((m.start(), m.end(), replacement(m)) for m in regex.finditer(source))
@@ -3179,7 +3179,8 @@ class FluxerAdapter(BasePlatformAdapter):
         thread_id = str(getattr(source, "chat_id", None) or "").strip()
         if not (parent and user_id and thread_id and getattr(source, "chat_type", None) == "thread"):
             return None
-        if self._thread_is_bot_owned(thread_id) is not True:
+        prospective = self._threads_pending.get(thread_id) == parent
+        if not prospective and self._thread_is_bot_owned(thread_id) is not True:
             return None
         key = (parent, user_id)
         threads = self._active_auto_threads.setdefault(key, {})
