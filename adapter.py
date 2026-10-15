@@ -663,6 +663,36 @@ def _redirect_target(response: Any) -> Optional[str]:
     return str(next_request.url) if next_request else None
 
 
+def _same_origin(a: str, b: str) -> bool:
+    """True when two absolute URLs share scheme, host and effective port.
+
+    Origin is the unit a credential is scoped to: a redirect that keeps scheme,
+    host and port may legitimately carry the same ``Authorization`` header, while
+    any change of those three is a new origin that must not see it.
+    """
+    parsed_a, parsed_b = urlparse(a), urlparse(b)
+
+    def _port(parsed: Any) -> Optional[int]:
+        if parsed.port is not None:
+            return parsed.port
+        scheme = (parsed.scheme or "").lower()
+        if scheme == "https":
+            return 443
+        if scheme == "http":
+            return 80
+        return None
+
+    return (
+        (parsed_a.scheme or "").lower(),
+        (parsed_a.hostname or "").lower(),
+        _port(parsed_a),
+    ) == (
+        (parsed_b.scheme or "").lower(),
+        (parsed_b.hostname or "").lower(),
+        _port(parsed_b),
+    )
+
+
 async def _fluxer_ssrf_redirect_guard(response: Any) -> None:
     """Re-validate every redirect target (defence in depth behind the manual loop).
 
@@ -707,20 +737,20 @@ async def _read_capped_body(response: Any, max_bytes: int) -> bytes:
 def _ssrf_safe_async_client_factory() -> tuple[Any, bool]:
     """``(factory, guarded)`` for an async HTTP client.
 
-    Prefers the host's connect-time SSRF-safe client (DNS is resolved, validated and
-    dialed by IP at connect time, closing the rebinding gap). An older host without
-    it degrades to plain ``httpx.AsyncClient`` — and the caller then keeps
-    ``follow_redirects`` off and walks redirects manually, so a redirect is still
-    re-validated before it is followed.
+    Returns the host's connect-time SSRF-safe client (DNS is resolved, validated and
+    dialed by IP at connect time, closing the rebinding gap) and ``True``. On a host
+    without it the factory is ``None`` and ``guarded`` is ``False`` — the caller must
+    then FAIL CLOSED rather than substitute plain ``httpx.AsyncClient``, because a
+    plain client re-resolves the name at connect time and a rebinding hostname would
+    slip past the pre-flight check. A manual redirect walk does not close that gap;
+    only the connect-time guard does.
     """
-    import httpx
-
     try:
         from tools.url_safety import create_ssrf_safe_async_client
 
         return create_ssrf_safe_async_client, True
     except Exception:
-        return httpx.AsyncClient, False
+        return None, False
 
 
 def _message_has_attachments(data: Dict[str, Any]) -> bool:
@@ -2242,9 +2272,9 @@ class FluxerAdapter(BasePlatformAdapter):
         snapshots of the session's unresolved approvals, each carrying its
         ``request_id``. Match on the normalized command, but ONLY when exactly one
         pending request matches: a unique match is safe, while an ambiguous one (two
-        identical commands queued) or an unavailable reader yields ``None``, and the
-        caller then falls back to the host's FIFO resolution rather than ever
-        resolving the wrong request.
+        identical commands queued) or an unavailable reader yields ``None`` — and an
+        unbound card resolves nothing at all, rather than falling back to the host's
+        FIFO order, which could resolve an unrelated pending request.
         """
         normalized = _normalize_approval_command(command)
         try:
@@ -2341,10 +2371,16 @@ class FluxerAdapter(BasePlatformAdapter):
         """Post an exec-approval card and register its components + reactions.
 
         The card is bound to the gateway ``request_id`` when exactly one pending
-        request matches its command, so a tap resolves THAT request and never another
-        via FIFO. When the id cannot be determined safely it is left unbound and the
-        host's FIFO resolution applies — never a wrong-request approval.
+        request matches its command. That binding is frozen BEFORE the first network
+        await (the thread container may have to be opened), because a request queued
+        while this card is being posted would otherwise be the one a later match
+        picks — binding a card to a request that arrived after it. When the id cannot
+        be determined safely the card is left unbound, and an unbound card resolves
+        nothing at all (never the host's FIFO order).
         """
+        # Freeze the binding first: no await has happened yet, so the pending queue
+        # this match reads is the queue the card belongs to.
+        request_id = self._request_id_for_command(session_key, command)
         target_id = await self._resolve_thread_container(chat_id, metadata, session_key)
         cmd_display = command if len(command) <= 3200 else command[:3197] + "..."
         reaction_hint = " • ".join(f"{emoji} {label}" for emoji, _choice, label in reaction_specs)
@@ -2355,6 +2391,14 @@ class FluxerAdapter(BasePlatformAdapter):
             f"React: {reaction_hint}\n"
             "Reply with `/approve once`, `/approve session`, `/approve always`, or `/deny`."
         )
+        if not request_id:
+            # Say it on the card: this card cannot resolve anything, so the text
+            # commands are the only way to answer.
+            content = (
+                f"{content}\n\n"
+                "⚠️ This card could not be bound to a gateway request, so its buttons and "
+                "reactions will not resolve it — use the text commands above."
+            )
         try:
             self._known_channel_ids.add(target_id)
             buttons, component_actions = _fluxer_action_buttons(
@@ -2371,7 +2415,6 @@ class FluxerAdapter(BasePlatformAdapter):
             if not message_id:
                 return SendResult(success=False, error="Fluxer approval message missing id", retryable=True)
 
-            request_id = self._request_id_for_command(session_key, command)
             pending = {
                 "session_key": session_key,
                 "channel_id": target_id,
@@ -4352,9 +4395,10 @@ class FluxerAdapter(BasePlatformAdapter):
         private/internal address was followed without re-validation, (b) DNS could
         be rebound between the check and the connect, and (c) a hostile or merely
         huge body was buffered fully into memory. Now the host's connect-time
-        SSRF-safe client is used, every redirect is re-validated (manually, so it
-        holds even on a host without the guard) and the body is read under the
-        host's inbound-media cap.
+        SSRF-safe client is required (an absent guard fails closed), every redirect
+        is re-validated (manually, so each hop is checked before it is followed),
+        the body is read under the host's inbound-media cap, and the ``Authorization``
+        header is dropped the moment a hop leaves the API origin.
         """
         try:
             import httpx  # noqa: F401
@@ -4364,14 +4408,26 @@ class FluxerAdapter(BasePlatformAdapter):
 
         if not is_safe_url(url):
             raise ValueError(f"Blocked unsafe Fluxer attachment URL: {safe_url_for_log(url)}")
+        factory, guarded = _ssrf_safe_async_client_factory()
+        if not guarded or factory is None:
+            # No connect-time guard means the pre-flight check can be defeated by a
+            # rebinding hostname, so refuse rather than fetch through a plain client.
+            raise RuntimeError(
+                "Fluxer attachment download requires the host's connect-time SSRF-safe "
+                "client; refusing to fetch through an unguarded client"
+            )
         headers = {"User-Agent": "Hermes-Fluxer/0.3", "Accept": "*/*"}
-        attachment_host = urlparse(url).netloc.lower()
-        api_host = urlparse(self.api_base_url).netloc.lower()
-        if attachment_host and api_host and attachment_host == api_host:
+        # The URL the token was minted for. The token rides a hop only while that hop
+        # stays on the same origin as this URL (the API base in the normal case).
+        api_origin = url
+        if _same_origin(url, self.api_base_url):
             headers["Authorization"] = f"Bot {self.bot_token}"
+        # A redirect off the origin is a new origin: the bot token is stripped for
+        # that hop and every hop after it (never restored), while non-credential
+        # headers are preserved.
+        authorized = "Authorization" in headers
 
         max_bytes = _attachment_max_bytes()
-        factory, _guarded = _ssrf_safe_async_client_factory()
         # ``follow_redirects`` stays OFF: redirects are walked here so each hop is
         # re-validated against ``is_safe_url`` before it is followed.
         async with factory(
@@ -4382,7 +4438,12 @@ class FluxerAdapter(BasePlatformAdapter):
             download_url = url
             redirect_count = 0
             while True:
-                async with client.stream("GET", download_url, headers=headers) as response:
+                if authorized and not _same_origin(download_url, api_origin):
+                    # Sticky: drop it from the shared header dict so no later hop
+                    # can restore it, even one that points back at the API origin.
+                    headers.pop("Authorization", None)
+                    authorized = False
+                async with client.stream("GET", download_url, headers=dict(headers)) as response:
                     if response.status_code in (301, 302, 303, 307, 308):
                         target = _redirect_target(response)
                         if not target:
@@ -4779,6 +4840,10 @@ class FluxerAdapter(BasePlatformAdapter):
         emoji = _reaction_emoji_from_event(data)
         if not message_id or not emoji:
             return
+        # A card that has outlived the host's approval TTL must be gone BEFORE it is
+        # read: pruning only at registration left an old card live, so its tap could
+        # still resolve a newer request.
+        self._prune_pending_cards()
         action = self._pending_reaction_actions.get(f"{message_id}:{emoji}")
         if not action:
             return
@@ -4790,8 +4855,11 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.info("Fluxer reaction action ignored for unauthorized user %s", user_id or "<missing>")
             return
         action_channel_id = str(action.get("channel_id") or "")
-        if action_channel_id and channel_id and channel_id != action_channel_id:
-            logger.warning("Fluxer reaction action ignored for mismatched channel %s", channel_id)
+        # Fail closed: the event must name the same channel the card was posted in.
+        # An absent channel id in the event is not a match — it is an unidentified
+        # event, and resolving on it would be resolving an action we cannot place.
+        if not action_channel_id or not channel_id or channel_id != action_channel_id:
+            logger.warning("Fluxer reaction action ignored for unmatched channel %s", channel_id or "<missing>")
             return
         if action.get("kind") == "exec_approval":
             await self._resolve_exec_approval_action(action, user_id=user_id)
@@ -4801,6 +4869,8 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _handle_component_interaction(self, data: Dict[str, Any]) -> None:
         interaction_data = data.get("data") or {}
         custom_id = str(interaction_data.get("custom_id") or "")
+        # Same TTL rule as a reaction: an expired card must not be readable.
+        self._prune_pending_cards()
         action = self._pending_component_actions.get(custom_id)
         if not action:
             return
@@ -4810,19 +4880,51 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         interaction_message_id = str(((data.get("message") or {}).get("id")) or "")
         action_message_id = str(action.get("message_id") or "")
-        if action_message_id and interaction_message_id and interaction_message_id != action_message_id:
-            logger.warning("Fluxer component action %s ignored for mismatched message %s", custom_id, interaction_message_id)
+        # Fail closed on both required ids: an interaction that does not name the
+        # card's message and channel is not this card's interaction.
+        if not action_message_id or not interaction_message_id or interaction_message_id != action_message_id:
+            logger.warning("Fluxer component action %s ignored for unmatched message %s", custom_id, interaction_message_id or "<missing>")
             return
         interaction_channel_id = str(data.get("channel_id") or ((data.get("channel") or {}).get("id")) or "")
         action_channel_id = str(action.get("channel_id") or "")
-        if action_channel_id and interaction_channel_id and interaction_channel_id != action_channel_id:
-            logger.warning("Fluxer component action %s ignored for mismatched channel %s", custom_id, interaction_channel_id)
+        if not action_channel_id or not interaction_channel_id or interaction_channel_id != action_channel_id:
+            logger.warning("Fluxer component action %s ignored for unmatched channel %s", custom_id, interaction_channel_id or "<missing>")
             return
         self._pending_component_actions.pop(custom_id, None)
         if action.get("kind") == "exec_approval":
             await self._resolve_exec_approval_action(action, user_id=user_id, interaction=data)
         elif action.get("kind") == "slash_confirm":
             await self._resolve_slash_confirm_action(action, user_id=user_id, interaction=data)
+
+    async def _render_approval_card_status(
+        self,
+        action: Dict[str, Any],
+        interaction: Optional[Dict[str, Any]],
+        message_id: str,
+        pending: Optional[Dict[str, Any]],
+        content: str,
+    ) -> None:
+        """Update an approval card in place (or answer the interaction) with ``content``."""
+        try:
+            if interaction:
+                await self._respond_to_interaction(interaction, content=content, components=[])
+            elif message_id:
+                await self.edit_message(
+                    str((pending or {}).get("channel_id") or action.get("channel_id") or ""),
+                    message_id,
+                    content,
+                )
+        except Exception as exc:
+            logger.debug("Fluxer approval card status response failed: %s", exc)
+
+    def _drop_card_registrations(self, message_id: str) -> None:
+        """Drop every button/reaction registration belonging to ``message_id``."""
+        for cid, state in list(self._pending_component_actions.items()):
+            if state.get("message_id") == message_id:
+                self._pending_component_actions.pop(cid, None)
+        for rid, state in list(self._pending_reaction_actions.items()):
+            if state.get("message_id") == message_id:
+                self._pending_reaction_actions.pop(rid, None)
 
     async def _resolve_exec_approval_action(self, action: Dict[str, Any], *, user_id: str, interaction: Optional[Dict[str, Any]] = None) -> None:
         message_id = str(action.get("message_id") or (((interaction or {}).get("message") or {}).get("id")) or "")
@@ -4832,51 +4934,67 @@ class FluxerAdapter(BasePlatformAdapter):
         pending["resolved"] = True
         session_key = str(action.get("session_key") or pending.get("session_key") or "")
         choice = str(action.get("choice") or "deny")
-        # Bind the resolution to the exact gateway request this card belongs to.
-        # ``request_id`` is captured when the card was posted; the action carries it
-        # too. Passing it to ``resolve_gateway_approval`` resolves THAT request only.
-        # When no id could be determined, resolution falls back to the host's FIFO
-        # order — the pre-existing behaviour — and never to a guessed id, so a card
-        # can never approve a request it does not belong to.
-        request_id = str(action.get("request_id") or pending.get("request_id") or "") or None
+        # The gateway ``request_id`` this card belongs to. It is captured when the
+        # card is posted and carried on the action too. WITHOUT it there is no way
+        # to name the request a tap means, and the host's FIFO fallback would let a
+        # stale/unbound card resolve whatever happens to be pending — so an unbound
+        # card resolves NOTHING and says so.
+        request_id = str(action.get("request_id") or pending.get("request_id") or "").strip() or None
+        if not request_id:
+            self._drop_card_registrations(message_id)
+            logger.warning(
+                "Fluxer approval card %s is not bound to a gateway request; refusing to resolve (user=%s)",
+                message_id,
+                user_id,
+            )
+            await self._render_approval_card_status(
+                action,
+                interaction,
+                message_id,
+                pending,
+                f"{pending.get('content') or 'Command approval required'}\n\n"
+                "This card is not bound to a gateway request, so it cannot resolve anything. "
+                "Use the text commands: `/approve once`, `/approve session`, `/approve always`, or `/deny`.",
+            )
+            return
+
+        count: Optional[int] = None
+        failure: Optional[Exception] = None
         try:
             from tools.approval import resolve_gateway_approval
 
             count = resolve_gateway_approval(session_key, choice, request_id=request_id)
-            logger.info(
-                "Fluxer approval action resolved %d approval(s) for session %s (choice=%s request_id=%s user=%s)",
-                count,
-                session_key,
-                choice,
-                request_id or "<fifo>",
-                user_id,
-            )
-            if request_id and count == 0:
-                # The card was live but its request is gone (already answered, timed
-                # out, or withdrawn). Do not fall back to FIFO: that could resolve an
-                # unrelated pending request for the same session.
-                logger.info(
-                    "Fluxer approval card %s: request %s no longer pending; not falling back to FIFO",
-                    message_id,
-                    request_id,
-                )
         except Exception as exc:
+            failure = exc
             logger.error("Fluxer component approval resolve failed: %s", exc)
-        for cid, state in list(self._pending_component_actions.items()):
-            if state.get("message_id") == message_id:
-                self._pending_component_actions.pop(cid, None)
-        for rid, state in list(self._pending_reaction_actions.items()):
-            if state.get("message_id") == message_id:
-                self._pending_reaction_actions.pop(rid, None)
-        label = {"once": "approved once", "session": "approved for session", "always": "approved permanently", "deny": "denied"}.get(choice, choice)
-        resolved_content = f"{pending.get('content') or 'Command approval required'}\n\nResolved: {label} by <@{user_id}>."
-        try:
-            if interaction:
-                await self._respond_to_interaction(interaction, content=resolved_content, components=[])
-            else:
-                await self.edit_message(str(pending.get("channel_id") or action.get("channel_id") or ""), message_id, resolved_content)
-        except Exception as exc:
-            logger.debug("Fluxer approval resolution response failed: %s", exc)
+
+        self._drop_card_registrations(message_id)
+
+        if failure is not None:
+            status = (
+                "Could not resolve this approval (resolution error). "
+                "Use the text commands: `/approve once`, `/approve session`, `/approve always`, or `/deny`."
+            )
+        elif not count:
+            # The card was live but its request is gone (already answered, timed out,
+            # or withdrawn). Never fall back to FIFO — that could resolve an unrelated
+            # pending request for the same session.
+            logger.info(
+                "Fluxer approval card %s: request %s no longer pending; not falling back to FIFO",
+                message_id,
+                request_id,
+            )
+            status = "Nothing pending for this approval any more — it was already answered or has expired."
+        else:
+            label = {"once": "approved once", "session": "approved for session", "always": "approved permanently", "deny": "denied"}.get(choice, choice)
+            status = f"Resolved: {label} by <@{user_id}>."
+        await self._render_approval_card_status(
+            action,
+            interaction,
+            message_id,
+            pending,
+            f"{pending.get('content') or 'Command approval required'}\n\n{status}",
+        )
 
     async def _resolve_slash_confirm_action(self, action: Dict[str, Any], *, user_id: str, interaction: Optional[Dict[str, Any]] = None) -> None:
         session_key = str(action.get("session_key") or "")
@@ -5167,7 +5285,16 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         pending["resolved"] = True
         session_key = str(pending.get("session_key") or "")
-        request_id = str(pending.get("request_id") or "") or None
+        request_id = str(pending.get("request_id") or "").strip() or None
+        if not request_id:
+            # An unbound prompt cannot name the request it belongs to, and the host's
+            # FIFO fallback would deny whatever happens to be pending. Deny NOTHING;
+            # the host's own approval timeout remains the authority on the request.
+            logger.warning(
+                "Fluxer deleted approval prompt %s is not bound to a gateway request; refusing to deny via FIFO",
+                message_id,
+            )
+            return
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -5176,7 +5303,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 "Fluxer deleted approval prompt denied %d approval(s) for session %s (request_id=%s)",
                 count,
                 session_key,
-                request_id or "<fifo>",
+                request_id,
             )
         except Exception as exc:
             logger.error("Fluxer deleted approval prompt deny failed: %s", exc)

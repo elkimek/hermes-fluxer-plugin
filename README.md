@@ -436,7 +436,9 @@ Hermes sometimes needs user approval before running sensitive tools or confirmin
 2. **Reactions**, added by the bot to the approval message.
 3. **Visible text fallback**, so the prompt still tells the user what to do if components are unavailable.
 
-Allowed-user checks apply to approval reactions and component clicks. A random server member should not be able to approve another user's agent action unless explicitly allowed.
+Allowed-user checks apply to approval reactions and component clicks. A random server member should not be able to approve another user's agent action unless explicitly allowed. A reaction or click must also name the channel (and, for a button, the message) the card was posted in — an event that does not is ignored.
+
+An approval card is bound to the exact gateway request it was posted for. The adapter reads the session's pending approvals when the card is posted and matches the command against them; the resulting request id is frozen before the card's first network call, so a request that arrives while the card is in flight cannot become the card's target. A tap resolves only that request id. When the match is ambiguous (two identical commands queued) or unavailable, the card is left **unbound** and resolves nothing at all — it does not fall back to the host's first-in-first-out resolution, which could approve a different request — and the card says so, pointing at the text commands. Cards also expire on the host's `approvals.timeout` (plus a grace margin), enforced when a reaction or button is used, so a stale card cannot be replayed against a newer request.
 
 ## Troubleshooting
 

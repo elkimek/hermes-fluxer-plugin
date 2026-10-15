@@ -10,6 +10,10 @@ Two findings are pinned here.
    Fetching also happened *before* the channel/mention admission gate, so a message
    the bot then dropped had already triggered outbound network I/O.
 
+   A manual redirect walk also kept the *same* headers on every hop, so a public
+   attachment URL on the API host that 302-ed to another origin re-sent the bot
+   ``Authorization`` header to that origin.
+
 2. **Exec-approval surface.** ``send_exec_approval`` lacked the host's
    ``allow_permanent`` / ``allow_session`` / ``smart_denied`` flags (the runner
    passes them, so the call raised ``TypeError``), was not reachable through the
@@ -17,6 +21,12 @@ Two findings are pinned here.
    four-choice row regardless of a smart deny, kept ``created_at`` unused so a
    pending card never expired, and resolved approvals by FIFO — a tap on an old card
    could resolve a *different* pending request for the same session.
+
+   A card whose ``request_id`` could not be bound still called
+   ``resolve_gateway_approval`` with ``request_id=None``, i.e. the host's FIFO path:
+   an unbound stale card could therefore approve whatever request happened to be
+   pending. Unbound cards (and a deleted unbound prompt) must resolve nothing and
+   say so, and a resolution must not claim "Resolved" when nothing was resolved.
 
 The tests that need the real Hermes host contract use a per-test
 ``pytest.importorskip``; everything else runs in the bare plugin CI.
@@ -88,12 +98,17 @@ class _FakeStream:
 
 
 class _FakeClient:
-    """Routes GETs to pre-seeded responses and records every URL it was asked for."""
+    """Routes GETs to pre-seeded responses and records every URL it was asked for.
+
+    ``headers_seen`` keeps the exact per-hop headers the adapter sent, so a test
+    can assert what crossed an origin boundary.
+    """
 
     def __init__(self, responses, **kwargs):
         self._responses = responses
         self.kwargs = kwargs
         self.requested = []
+        self.headers_seen = []
 
     async def __aenter__(self):
         return self
@@ -103,6 +118,7 @@ class _FakeClient:
 
     def stream(self, method, url, headers=None):
         self.requested.append(url)
+        self.headers_seen.append((url, dict(headers or {})))
         response = self._responses.get(url)
         if response is None:
             raise AssertionError(f"unexpected fetch of {url}")
@@ -113,6 +129,9 @@ def _install_fake_tools_approval(monkeypatch, *, pending=None, record=None):
     """Install a stub ``tools.approval`` so the binding logic can be driven bare.
 
     ``record`` is a list the stub appends ``(session_key, choice, request_id)`` to.
+    The stub mirrors the host's real contract: an id resolves exactly its own entry
+    and returns 1; the FIFO path (no id) is recorded too, so a test can prove it was
+    never taken.
     """
     module = types.ModuleType("tools.approval")
     calls = record if record is not None else []
@@ -127,6 +146,11 @@ def _install_fake_tools_approval(monkeypatch, *, pending=None, record=None):
     tools_pkg.__path__ = getattr(tools_pkg, "__path__", [])
     monkeypatch.setitem(sys.modules, "tools", tools_pkg)
     monkeypatch.setitem(sys.modules, "tools.approval", module)
+    # A real ``tools`` package that already imported ``approval`` holds the host
+    # module as an attribute, and ``import tools.approval as X`` prefers that
+    # attribute over the sys.modules entry — so replace it too, or a test that
+    # patches "the stub" silently patches the real host module.
+    monkeypatch.setattr(tools_pkg, "approval", module, raising=False)
     return calls
 
 
@@ -263,32 +287,194 @@ async def test_attachment_download_caps_a_body_with_no_content_length(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_attachment_download_falls_back_to_plain_httpx_when_the_host_lacks_the_guard(monkeypatch):
-    """An older host without the SSRF-safe client still gets a bounded, manual-redirect fetch."""
-    import tools.url_safety as url_safety
+async def test_attachment_download_drops_authorization_on_a_cross_origin_redirect(monkeypatch):
+    """The bot token must never follow a redirect to a different origin.
 
-    monkeypatch.delattr(url_safety, "create_ssrf_safe_async_client", raising=False)
-    monkeypatch.setattr(url_safety, "is_safe_url", lambda url: True)
+    The attachment is served from the API host, so the first hop carries
+    ``Authorization: Bot …``. A 302 to another host/scheme/port is a new origin:
+    the token must be stripped for that hop and every hop after it.
+    """
+    import tools.url_safety as url_safety
 
     created = {}
 
-    def fake_httpx_client(**kwargs):
+    def fake_factory(**kwargs):
+        client = _FakeClient(
+            {
+                "https://api.fluxer.app/v1/attachments/x": _FakeResponse(
+                    status_code=302, headers={"location": "https://cdn.evil.example/x"},
+                    url="https://api.fluxer.app/v1/attachments/x",
+                ),
+                "https://cdn.evil.example/x": _FakeResponse(chunks=[b"final"]),
+            },
+            **kwargs,
+        )
+        created["client"] = client
+        return client
+
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", fake_factory)
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda url: True)
+
+    adapter = _adapter()
+    data = await adapter._download_attachment_bytes(
+        "https://api.fluxer.app/v1/attachments/x"
+    )
+    assert data == b"final"
+
+    per_hop = dict(created["client"].headers_seen)
+    assert per_hop["https://api.fluxer.app/v1/attachments/x"]["Authorization"].startswith("Bot ")
+    # The cross-origin hop must NOT carry the token.
+    assert "Authorization" not in per_hop["https://cdn.evil.example/x"]
+    # …and every header that is not a credential is preserved.
+    assert per_hop["https://cdn.evil.example/x"]["User-Agent"] == "Hermes-Fluxer/0.3"
+
+
+@pytest.mark.asyncio
+async def test_attachment_download_keeps_authorization_on_a_same_origin_redirect(monkeypatch):
+    """A redirect that stays on the API origin (path only) keeps the token.
+
+    A same-origin hop is not an origin change, so stripping there would break a
+    legitimate signed-URL redirect and is not what the guard is for.
+    """
+    import tools.url_safety as url_safety
+
+    created = {}
+
+    def fake_factory(**kwargs):
+        client = _FakeClient(
+            {
+                "https://api.fluxer.app/v1/attachments/a": _FakeResponse(
+                    status_code=302,
+                    headers={"location": "https://api.fluxer.app/v1/attachments/b"},
+                    url="https://api.fluxer.app/v1/attachments/a",
+                ),
+                "https://api.fluxer.app/v1/attachments/b": _FakeResponse(chunks=[b"ok"]),
+            },
+            **kwargs,
+        )
+        created["client"] = client
+        return client
+
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", fake_factory)
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda url: True)
+
+    adapter = _adapter()
+    data = await adapter._download_attachment_bytes(
+        "https://api.fluxer.app/v1/attachments/a"
+    )
+    assert data == b"ok"
+    per_hop = dict(created["client"].headers_seen)
+    assert per_hop["https://api.fluxer.app/v1/attachments/b"]["Authorization"].startswith("Bot ")
+
+
+@pytest.mark.asyncio
+async def test_attachment_download_never_restores_authorization_after_a_strip(monkeypatch):
+    """A hop back to the API origin must not resurrect the token once stripped.
+
+    The strip is sticky for the whole walk: after a cross-origin hop the request
+    is no longer the one the token was minted for, so a later redirect that
+    happens to point back at the API host stays unauthenticated.
+    """
+    import tools.url_safety as url_safety
+
+    created = {}
+
+    def fake_factory(**kwargs):
+        client = _FakeClient(
+            {
+                "https://api.fluxer.app/v1/attachments/a": _FakeResponse(
+                    status_code=302,
+                    headers={"location": "https://cdn.other.example/mid"},
+                    url="https://api.fluxer.app/v1/attachments/a",
+                ),
+                "https://cdn.other.example/mid": _FakeResponse(
+                    status_code=302,
+                    headers={"location": "https://api.fluxer.app/v1/attachments/b"},
+                    url="https://cdn.other.example/mid",
+                ),
+                "https://api.fluxer.app/v1/attachments/b": _FakeResponse(chunks=[b"ok"]),
+            },
+            **kwargs,
+        )
+        created["client"] = client
+        return client
+
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", fake_factory)
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda url: True)
+
+    adapter = _adapter()
+    data = await adapter._download_attachment_bytes(
+        "https://api.fluxer.app/v1/attachments/a"
+    )
+    assert data == b"ok"
+    per_hop = dict(created["client"].headers_seen)
+    assert "Authorization" not in per_hop["https://cdn.other.example/mid"]
+    assert "Authorization" not in per_hop["https://api.fluxer.app/v1/attachments/b"]
+
+
+@pytest.mark.asyncio
+async def test_a_public_attachment_url_carries_no_authorization_to_begin_with(monkeypatch):
+    """A CDN URL on another host never gets the token at all."""
+    import tools.url_safety as url_safety
+
+    created = {}
+
+    def fake_factory(**kwargs):
         client = _FakeClient(
             {"https://cdn.example/x": _FakeResponse(chunks=[b"ok"])}, **kwargs
         )
         created["client"] = client
         return client
 
-    import httpx
-
-    monkeypatch.setattr(httpx, "AsyncClient", fake_httpx_client)
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", fake_factory)
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda url: True)
 
     adapter = _adapter()
-    data = await adapter._download_attachment_bytes("https://cdn.example/x")
+    await adapter._download_attachment_bytes("https://cdn.example/x")
+    per_hop = dict(created["client"].headers_seen)
+    assert "Authorization" not in per_hop["https://cdn.example/x"]
 
-    assert data == b"ok"
-    # The fallback must still refuse to auto-follow redirects.
-    assert created["client"].kwargs["follow_redirects"] is False
+
+@pytest.mark.asyncio
+async def test_attachment_download_fails_closed_without_the_connect_time_guard(monkeypatch):
+    """An older host without the SSRF-safe client must NOT silently fetch anyway.
+
+    Degrading to plain ``httpx.AsyncClient`` leaves the DNS-rebinding gap open: the
+    pre-flight ``is_safe_url`` resolves the name, and the connect re-resolves it, so
+    a rebinding host slips through. The download fails closed instead.
+    """
+    import tools.url_safety as url_safety
+
+    monkeypatch.delattr(url_safety, "create_ssrf_safe_async_client", raising=False)
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda url: True)
+
+    opened = []
+    import httpx
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: opened.append(kw) or _FakeClient({}, **kw)
+    )
+
+    adapter = _adapter()
+    with pytest.raises(RuntimeError, match="connect-time"):
+        await adapter._download_attachment_bytes("https://cdn.example/x")
+    # No client was ever built, so no unguarded connection could be dialed.
+    assert opened == []
+
+
+def test_ssrf_safe_factory_reports_whether_the_guard_is_available(monkeypatch):
+    """The factory's second element is the truth about the connect-time guard."""
+    import tools.url_safety as url_safety
+
+    monkeypatch.setattr(url_safety, "create_ssrf_safe_async_client", lambda **kw: object())
+    factory, guarded = fluxer_adapter._ssrf_safe_async_client_factory()
+    assert guarded is True
+    assert factory is url_safety.create_ssrf_safe_async_client
+
+    monkeypatch.delattr(url_safety, "create_ssrf_safe_async_client", raising=False)
+    factory, guarded = fluxer_adapter._ssrf_safe_async_client_factory()
+    assert guarded is False
+    assert factory is None
 
 
 @pytest.mark.asyncio
@@ -658,16 +844,30 @@ async def test_a_bound_card_that_finds_no_pending_request_does_not_fall_back_to_
 
 
 @pytest.mark.asyncio
-async def test_an_unbound_card_resolves_without_a_request_id(monkeypatch):
-    """With no id bound the resolution stays on the host's FIFO path (request_id=None)."""
+async def test_an_unbound_card_resolves_nothing_and_says_so(monkeypatch):
+    """With no id bound there is no request to name — the card must NOT use FIFO.
+
+    The old behaviour passed ``request_id=None`` straight to
+    ``resolve_gateway_approval``, which is the host's FIFO path: an unbound stale
+    card would then resolve whatever request happened to be pending.
+    """
     calls = _install_fake_tools_approval(monkeypatch, pending=[], record=[])
     adapter = _adapter()
+    adapter.edit_message = AsyncMock(return_value=fluxer_adapter.SendResult(success=True))
     adapter._request = AsyncMock(return_value={})
     adapter._pending_exec_approvals["card-1"] = {
         "session_key": SESSION,
         "channel_id": PARENT,
         "content": "prompt",
         "resolved": False,
+        "request_id": None,
+    }
+    adapter._pending_reaction_actions["card-1:❌"] = {
+        "kind": "exec_approval",
+        "message_id": "card-1",
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "choice": "deny",
         "request_id": None,
     }
 
@@ -681,7 +881,172 @@ async def test_an_unbound_card_resolves_without_a_request_id(monkeypatch):
         },
         user_id=OWNER,
     )
-    assert calls[-1]["request_id"] is None
+
+    # No resolution call at all: no request id, so nothing to resolve.
+    assert calls == []
+    # The stale registration is dropped, so the card cannot be tapped again.
+    assert "card-1:❌" not in adapter._pending_reaction_actions
+    # And the card tells the user to use the text commands.
+    rendered = " ".join(str(call.args[2]) for call in adapter.edit_message.await_args_list)
+    assert "text commands" in rendered
+    assert "Resolved" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_card_is_told_so_when_it_is_posted(monkeypatch):
+    """A card the adapter could not bind warns on the card itself."""
+    _install_fake_tools_approval(monkeypatch, pending=[])
+    adapter = _adapter()
+    posted = {}
+
+    async def fake_post(channel_id, content, components):
+        posted["content"] = content
+        return {"id": "card-1"}, False
+
+    adapter._post_message_with_optional_components = fake_post
+    adapter._add_reaction = AsyncMock()
+
+    await adapter.send_exec_approval(PARENT, "rm -rf /", SESSION)
+
+    assert adapter._pending_exec_approvals["card-1"]["request_id"] is None
+    assert "could not be bound to a gateway request" in posted["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_bound_card_that_resolves_nothing_does_not_claim_resolved(monkeypatch):
+    """count == 0 means the request is gone — the card must not say "Resolved"."""
+    calls = _install_fake_tools_approval(monkeypatch, pending=[], record=[])
+    adapter = _adapter()
+    adapter._request = AsyncMock(return_value={})
+    adapter._pending_exec_approvals["card-1"] = {
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "content": "prompt",
+        "resolved": False,
+        "request_id": "req-gone",
+    }
+    adapter.edit_message = AsyncMock(return_value=fluxer_adapter.SendResult(success=True))
+
+    import tools.approval as approval_mod
+
+    def zero(session_key, choice, resolve_all=False, reason=None, request_id=None):
+        calls.append({"session_key": session_key, "choice": choice, "request_id": request_id})
+        return 0
+
+    monkeypatch.setattr(approval_mod, "resolve_gateway_approval", zero)
+
+    await adapter._resolve_exec_approval_action(
+        {
+            "kind": "exec_approval",
+            "message_id": "card-1",
+            "session_key": SESSION,
+            "channel_id": PARENT,
+            "choice": "once",
+            "request_id": "req-gone",
+        },
+        user_id=OWNER,
+    )
+
+    assert len(calls) == 1
+    rendered = " ".join(str(call.args[2]) for call in adapter.edit_message.await_args_list)
+    assert "Resolved" not in rendered
+    assert "Nothing pending" in rendered
+
+
+@pytest.mark.asyncio
+async def test_a_resolution_error_does_not_claim_resolved(monkeypatch):
+    """A raising host resolver is reported as a failure, never as "Resolved"."""
+    _install_fake_tools_approval(monkeypatch, pending=[], record=[])
+    adapter = _adapter()
+    adapter._request = AsyncMock(return_value={})
+    adapter._pending_exec_approvals["card-1"] = {
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "content": "prompt",
+        "resolved": False,
+        "request_id": "req-1",
+    }
+    adapter.edit_message = AsyncMock(return_value=fluxer_adapter.SendResult(success=True))
+
+    import tools.approval as approval_mod
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("host queue unavailable")
+
+    monkeypatch.setattr(approval_mod, "resolve_gateway_approval", boom)
+
+    await adapter._resolve_exec_approval_action(
+        {
+            "kind": "exec_approval",
+            "message_id": "card-1",
+            "session_key": SESSION,
+            "channel_id": PARENT,
+            "choice": "once",
+            "request_id": "req-1",
+        },
+        user_id=OWNER,
+    )
+
+    rendered = " ".join(str(call.args[2]) for call in adapter.edit_message.await_args_list)
+    assert "Resolved" not in rendered
+    assert "Could not resolve" in rendered
+
+
+@pytest.mark.asyncio
+async def test_an_unbound_deleted_prompt_denies_nothing(monkeypatch):
+    """Deleting a prompt with no bound id must not deny via FIFO either."""
+    calls = _install_fake_tools_approval(monkeypatch, pending=[])
+    adapter = _adapter()
+    adapter._pending_exec_approvals["card-1"] = {
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "created_at": 0.0,
+        "content": "prompt",
+        "resolved": False,
+        "request_id": None,
+    }
+
+    await adapter._handle_message_delete({"id": "card-1", "channel_id": PARENT})
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_card_is_bound_before_the_first_network_await(monkeypatch):
+    """The request id is frozen before the container resolver can await.
+
+    A request queued while the card is being posted must not be the one the card
+    binds to. The match therefore happens before ``_resolve_thread_container``,
+    which is the first thing in the post path that can yield.
+    """
+    _install_fake_tools_approval(
+        monkeypatch,
+        pending=[{"request_id": "req-first", "command": "rm -rf /"}],
+    )
+    adapter = _adapter()
+    order = []
+
+    async def fake_container(chat_id, metadata, session_key):
+        order.append("container")
+        return PARENT
+
+    async def fake_post(channel_id, content, components):
+        order.append("post")
+        return {"id": "card-1"}, False
+
+    def fake_match(session_key, command):
+        order.append("match")
+        return "req-first"
+
+    adapter._resolve_thread_container = fake_container
+    adapter._post_message_with_optional_components = fake_post
+    adapter._add_reaction = AsyncMock()
+    adapter._request_id_for_command = fake_match
+
+    await adapter.send_exec_approval(PARENT, "rm -rf /", SESSION)
+
+    assert order == ["match", "container", "post"]
+    assert adapter._pending_exec_approvals["card-1"]["request_id"] == "req-first"
 
 
 # ── 5. interaction guards: user, channel, button, deletion, expiry ─────────────
@@ -811,6 +1176,8 @@ async def test_an_expired_card_cannot_approve_a_new_request(monkeypatch):
 
     A new request is queued after the old card expired; the old card's button must
     find nothing registered and resolve nothing — the new request stays untouched.
+    The prune happens as part of CONSUMING the action (no explicit prune call), so a
+    card that was never re-registered still cannot be replayed.
     """
     monkeypatch.setattr(fluxer_adapter, "_approval_card_ttl", lambda: 100.0)
     calls = _install_fake_tools_approval(monkeypatch, pending=[])
@@ -827,14 +1194,175 @@ async def test_an_expired_card_cannot_approve_a_new_request(monkeypatch):
         "created_at": 0.0,
     }
     monkeypatch.setattr(fluxer_adapter.time, "time", lambda: 10_000.0)
-    adapter._prune_pending_cards()
 
-    assert "old-card:✅" not in adapter._pending_reaction_actions
-
-    # A tap on the expired card resolves nothing.
+    # A tap on the expired card resolves nothing — the handler prunes it first.
     await adapter._handle_reaction_add(
         {"message_id": "old-card", "channel_id": PARENT, "emoji": "✅", "user_id": OWNER}
     )
+    assert calls == []
+    assert "old-card:✅" not in adapter._pending_reaction_actions
+
+
+@pytest.mark.asyncio
+async def test_an_expired_button_cannot_be_pressed(monkeypatch):
+    """The same TTL rule guards a component (button) interaction, not just reactions."""
+    monkeypatch.setattr(fluxer_adapter, "_approval_card_ttl", lambda: 100.0)
+    calls = _install_fake_tools_approval(monkeypatch, pending=[])
+    adapter = _adapter()
+    monkeypatch.setattr(fluxer_adapter.time, "time", lambda: 0.0)
+    adapter._pending_component_actions["old-cid"] = {
+        "kind": "exec_approval",
+        "message_id": "old-card",
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "choice": "once",
+        "request_id": "req-old",
+        "created_at": 0.0,
+    }
+    adapter._pending_exec_approvals["old-card"] = {
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "content": "prompt",
+        "resolved": False,
+        "request_id": "req-old",
+        "created_at": 0.0,
+    }
+    monkeypatch.setattr(fluxer_adapter.time, "time", lambda: 10_000.0)
+
+    await adapter._handle_component_interaction(
+        {
+            "data": {"custom_id": "old-cid"},
+            "user": {"id": OWNER},
+            "message": {"id": "old-card"},
+            "channel_id": PARENT,
+        }
+    )
+    assert calls == []
+    assert "old-cid" not in adapter._pending_component_actions
+
+
+@pytest.mark.asyncio
+async def test_a_reaction_without_a_channel_id_is_ignored(monkeypatch):
+    """A reaction event that names no channel cannot be placed — fail closed."""
+    calls = _install_fake_tools_approval(monkeypatch, pending=[])
+    adapter = _adapter()
+    adapter._pending_reaction_actions["card-1:✅"] = {
+        "kind": "exec_approval",
+        "message_id": "card-1",
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "choice": "once",
+        "request_id": "req-1",
+    }
+    adapter._pending_exec_approvals["card-1"] = {
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "content": "prompt",
+        "resolved": False,
+        "request_id": "req-1",
+    }
+
+    await adapter._handle_reaction_add(
+        {"message_id": "card-1", "emoji": "✅", "user_id": OWNER}
+    )
+    assert calls == []
+    assert "card-1" in adapter._pending_exec_approvals
+
+
+@pytest.mark.asyncio
+async def test_a_component_interaction_without_a_channel_id_is_ignored(monkeypatch):
+    """A button press that names no channel cannot be placed — fail closed."""
+    calls = _install_fake_tools_approval(monkeypatch, pending=[])
+    adapter = _adapter()
+    adapter._pending_component_actions["cid-1"] = {
+        "kind": "exec_approval",
+        "message_id": "card-1",
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "choice": "once",
+        "request_id": "req-1",
+    }
+    adapter._pending_exec_approvals["card-1"] = {
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "content": "prompt",
+        "resolved": False,
+        "request_id": "req-1",
+    }
+
+    await adapter._handle_component_interaction(
+        {"data": {"custom_id": "cid-1"}, "user": {"id": OWNER}, "message": {"id": "card-1"}}
+    )
+    assert calls == []
+    assert "card-1" in adapter._pending_exec_approvals
+
+
+@pytest.mark.asyncio
+async def test_a_component_interaction_without_a_message_id_is_ignored(monkeypatch):
+    """A button press that names no message cannot be placed — fail closed."""
+    calls = _install_fake_tools_approval(monkeypatch, pending=[])
+    adapter = _adapter()
+    adapter._pending_component_actions["cid-1"] = {
+        "kind": "exec_approval",
+        "message_id": "card-1",
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "choice": "once",
+        "request_id": "req-1",
+    }
+    adapter._pending_exec_approvals["card-1"] = {
+        "session_key": SESSION,
+        "channel_id": PARENT,
+        "content": "prompt",
+        "resolved": False,
+        "request_id": "req-1",
+    }
+
+    await adapter._handle_component_interaction(
+        {"data": {"custom_id": "cid-1"}, "user": {"id": OWNER}, "channel_id": PARENT}
+    )
+    assert calls == []
+    assert "card-1" in adapter._pending_exec_approvals
+
+
+@pytest.mark.asyncio
+async def test_a_slash_confirm_resolution_does_not_invent_a_failure_branch(monkeypatch):
+    """``tools.slash_confirm.resolve`` returns ``Optional[str]`` — None does not
+    distinguish "consumed" from "nothing pending", so the adapter must not fabricate
+    a distinction. It reports the choice it applied and leaves the host's return
+    value alone."""
+    calls = _install_fake_tools_approval(monkeypatch, pending=[])
+
+    resolved = {}
+
+    async def fake_resolve(session_key, confirm_id, choice, timeout=300):
+        resolved.update(session_key=session_key, confirm_id=confirm_id, choice=choice)
+        return None
+
+    slash_mod = types.ModuleType("tools.slash_confirm")
+    slash_mod.resolve = fake_resolve
+    monkeypatch.setitem(sys.modules, "tools.slash_confirm", slash_mod)
+    tools_pkg = sys.modules.get("tools")
+    if tools_pkg is not None:
+        monkeypatch.setattr(tools_pkg, "slash_confirm", slash_mod, raising=False)
+
+    adapter = _adapter()
+    adapter.edit_message = AsyncMock(return_value=fluxer_adapter.SendResult(success=True))
+
+    await adapter._resolve_slash_confirm_action(
+        {
+            "kind": "slash_confirm",
+            "message_id": "confirm-1",
+            "session_key": SESSION,
+            "confirm_id": "cid-9",
+            "channel_id": PARENT,
+            "choice": "always",
+        },
+        user_id=OWNER,
+    )
+
+    assert resolved == {"session_key": SESSION, "confirm_id": "cid-9", "choice": "always"}
+    # No approval queue was touched, and the card is not claimed as an approval.
     assert calls == []
 
 
