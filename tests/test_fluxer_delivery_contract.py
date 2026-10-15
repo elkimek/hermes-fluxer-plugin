@@ -173,6 +173,87 @@ async def test_a_continuation_failure_reports_partial_overflow_not_success():
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("text", [
+    "plain " * 1600,
+    "😀x" * 2500,
+    "```py\n" + "\n".join(f"print({i})" for i in range(500)) + "\n```",
+])
+def test_source_span_splitter_matches_the_host_wire_chunks(text):
+    import os
+    if os.getenv("HERMES_AGENT_ROOT") == "/nonexistent-hermes-root":
+        pytest.skip("the standalone gateway stub has no host truncate_message implementation")
+    chunks, spans = fluxer_adapter.split_message_with_source_spans(
+        text, fluxer_adapter.MAX_MESSAGE_LENGTH, len_fn=fluxer_adapter.utf16_len
+    )
+    assert chunks == fluxer_adapter.BasePlatformAdapter.truncate_message(
+        text, fluxer_adapter.MAX_MESSAGE_LENGTH, len_fn=fluxer_adapter.utf16_len
+    )
+    assert len(chunks) == len(spans)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["plain", "mention", "fence", "unicode"])
+async def test_partial_delivery_prefix_is_exact_raw_source_prefix(shape):
+    """The core continuation uses raw text.startswith(prefix); preserve that contract."""
+    adapter = _adapter()
+    adapter.bot_user_id = "bot-1"
+    if shape == "plain":
+        text = "word " * 2000
+    elif shape == "mention":
+        text = "see <@123456> " + "word " * 2000
+    elif shape == "fence":
+        text = "```python\n" + "\n".join(f"print({i})" for i in range(400)) + "\n```"
+    else:
+        text = "😀" * 2100 + " tail " * 100
+    calls = _record_requests(adapter, [{"id": "first"}, _status_error(500, "boom")])
+
+    result = await adapter.send("chan-1", text)
+
+    prefix = result.raw_response["delivered_prefix"]
+    assert text.startswith(prefix), shape
+    assert prefix == text[:len(prefix)]
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["mention", "fence"])
+async def test_edit_partial_prefix_is_raw_source_for_host_continuation(shape):
+    from gateway.stream_consumer_fallback import StreamFallbackMixin
+
+    class _Cfg:
+        cursor = ""
+        stream_limit = 4000
+
+    class _Consumer(StreamFallbackMixin):
+        def __init__(self, prefix):
+            self.cfg = _Cfg()
+            self._last_sent_text = ""
+            self._fallback_prefix = prefix
+            self._already_sent = False
+            self._message_id = "preview"
+            self._accumulated = ""
+
+        @staticmethod
+        def _clean_for_display(text):
+            return text
+
+    adapter = _adapter()
+    adapter.bot_user_id = "bot-1"
+    if shape == "mention":
+        text = "see <@123456> " + "word " * 2000
+    else:
+        text = "```python\n" + "\n".join(f"print({i})" for i in range(400)) + "\n```"
+    calls = _record_requests(adapter, [{"id": "preview"}, _status_error(500, "boom")])
+
+    result = await adapter.edit_message("chan-1", "preview", text, finalize=True)
+
+    prefix = result.raw_response["delivered_prefix"]
+    assert text.startswith(prefix), shape
+    continuation = _Consumer(prefix)._continuation_text(text)
+    assert continuation != text
+    assert len(calls) == 2
+
+
 @pytest.mark.asyncio
 async def test_a_fitting_final_edit_still_takes_the_single_patch_path():
     adapter = _adapter()

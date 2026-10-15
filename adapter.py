@@ -516,6 +516,203 @@ def _chunk_without_indicator(chunk: str) -> str:
     return re.sub(r" \(\d+/\d+\)$", "", chunk)
 
 
+_TRUNCATE_INDICATOR_RESERVE = 10  # room for " (XX/XX)", matching the host splitter
+_TRUNCATE_FENCE_CLOSE = "\n```"
+
+
+def _fence_state_after(text: str, in_code: bool = False, lang: str = "") -> "tuple":
+    """Mirror of ``gateway.platforms.helpers.fence_state_after``.
+
+    Kept local so the standalone plugin tree needs no host import for it; the
+    behaviour must stay identical to the host's, because
+    :func:`split_message_with_source_spans` reproduces the host splitter's fence
+    handling.
+    """
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            tag = stripped[3:].split()
+            in_code, lang = (False, "") if in_code else (True, tag[0] if tag else "")
+    return in_code, lang
+
+
+def _unit_budget_to_cp(s: str, budget: int, len_fn: "Callable[[str], int]") -> int:
+    """Largest codepoint offset ``n`` with ``len_fn(s[:n]) <= budget`` (binary search).
+
+    Mirror of the host's private ``_custom_unit_to_cp``: the splitter needs it to
+    turn a UTF-16 budget into a codepoint offset, and importing a host private is
+    not an option for a plugin.
+    """
+    if len_fn(s) <= budget:
+        return len(s)
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len_fn(s[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def split_message_with_source_spans(
+    content: str,
+    max_length: int = 4096,
+    len_fn: "Optional[Callable[[str], int]]" = None,
+) -> "tuple":
+    """Split ``content`` like the host's ``truncate_message``, and pair each wire
+    chunk with its SOURCE span ``(start, end)`` in ``content``.
+
+    The wire chunks are byte-identical to ``BasePlatformAdapter.truncate_message``
+    (same algorithm: the `` (n/m)`` indicator reserve, newline-then-space split,
+    the inline-code backtick guard, and the close/reopen fence markers) — that
+    parity is asserted against the real host splitter in the test suite.
+
+    The spans describe ONLY the source-derived body of each chunk, so the
+    synthetic ``\\n`` + fence close, a reopened ```lang header, and the
+    whitespace the splitter lstrips between chunks never leak into a reported
+    prefix. That is what lets ``delivered_prefix`` be an exact prefix of the raw
+    host text for fenced replies, where the wire bytes are not.
+
+    Returns ``(chunks, spans)`` with ``spans[k] == (start, end)`` for ``chunks[k]``.
+    """
+    _len = len_fn or len
+    if _len(content) <= max_length:
+        return [content], [(0, len(content))]
+    chunks: List[str] = []
+    spans: List[tuple] = []
+    remaining = content
+    base_off = 0
+    carry_lang: Optional[str] = None
+    while remaining:
+        prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
+        headroom = max_length - _TRUNCATE_INDICATOR_RESERVE - _len(prefix) - _len(_TRUNCATE_FENCE_CLOSE)
+        if headroom < 1:
+            headroom = max(1, max_length // 2)
+        if _len(prefix) + _len(remaining) <= max_length - _TRUNCATE_INDICATOR_RESERVE:
+            final_chunk = prefix + remaining
+            if carry_lang is not None and _fence_state_after(remaining, True, carry_lang)[0]:
+                final_chunk += _TRUNCATE_FENCE_CLOSE
+            chunks.append(final_chunk)
+            spans.append((base_off, len(content)))
+            break
+        _cp_limit = (
+            _unit_budget_to_cp(remaining, headroom, _len) if _len is not len else headroom
+        )
+        region = remaining[:_cp_limit]
+        split_at = region.rfind("\n")
+        if split_at < _cp_limit // 2:
+            split_at = region.rfind(" ")
+        if split_at < 1:
+            split_at = max(1, _cp_limit)
+        candidate = remaining[:split_at]
+        backtick_count = candidate.count("`") - candidate.count("\\`")
+        if backtick_count % 2 == 1:
+            last_bt = candidate.rfind("`")
+            while last_bt > 0 and candidate[last_bt - 1] == "\\":
+                last_bt = candidate.rfind("`", 0, last_bt)
+            if last_bt > 0:
+                safe_split = max(
+                    candidate.rfind(" ", 0, last_bt), candidate.rfind("\n", 0, last_bt)
+                )
+                if safe_split > _cp_limit // 4:
+                    split_at = safe_split
+        chunk_body = remaining[:split_at]
+        body_start = base_off
+        body_end = base_off + split_at
+        tail = remaining[split_at:]
+        stripped_tail = tail.lstrip()
+        remaining = stripped_tail
+        base_off = body_end + (len(tail) - len(stripped_tail))
+        full_chunk = prefix + chunk_body
+        in_code, lang = _fence_state_after(chunk_body, carry_lang is not None, carry_lang or "")
+        carry_lang = lang if in_code else None
+        chunks.append(full_chunk + _TRUNCATE_FENCE_CLOSE if in_code else full_chunk)
+        spans.append((body_start, body_end))
+    if len(chunks) > 1:
+        chunks = [f"{chunk} ({i + 1}/{len(chunks)})" for i, chunk in enumerate(chunks)]
+    return chunks, spans
+
+
+def _sanitize_mentions_with_source_map(adapter: Any, source: str) -> "tuple":
+    """Apply outbound mention neutralization and map each output boundary to source.
+
+    Record only insertions made by the sanitizer. In particular, never infer
+    that an existing zero-width character was synthetic: literal user text must
+    remain part of the original source prefix.
+    """
+    out: List[str] = []
+    boundary_map = [0]
+    cursor = 0
+    rules = []
+    if not adapter._allow_mention_everyone:
+        rules.append((_MENTION_EVERYONE_RE, lambda m: "@\\u200b" + m.group(1)))
+    if not adapter._allow_mention_roles:
+        rules.append((_MENTION_ROLE_RE, lambda m: m.group(0).replace("<@&", "<@\\u200b&", 1)))
+    if not adapter._allow_mention_users:
+        rules.append((_MENTION_USER_RE, lambda m: m.group(0).replace("<@", "<@\\u200b", 1)))
+    matches = []
+    for regex, replacement in rules:
+        matches.extend((m.start(), m.end(), replacement(m)) for m in regex.finditer(source))
+    matches.sort(key=lambda item: item[0])
+    for start, end, replacement in matches:
+        if start < cursor:
+            continue
+        for i in range(cursor, start):
+            out.append(source[i])
+            boundary_map.append(i + 1)
+        original = source[start:end]
+        if replacement.endswith(original):
+            inserted = replacement[:-len(original)]
+            for char in inserted:
+                out.append(char)
+                boundary_map.append(start)
+            for i, char in enumerate(original):
+                out.append(char)
+                boundary_map.append(start + i + 1)
+        else:
+            for char in replacement:
+                out.append(char)
+                boundary_map.append(start)
+            boundary_map[-1] = end
+        cursor = end
+    for i in range(cursor, len(source)):
+        out.append(source[i])
+        boundary_map.append(i + 1)
+    return "".join(out), boundary_map
+
+
+def _delivered_source_prefix(
+    chunks: List[str],
+    spans: "Optional[List[tuple]]",
+    delivered: int,
+    source_text: "Optional[str]",
+    src_of: "Optional[List[int]]",
+) -> str:
+    """The RAW host prefix the first ``delivered`` wire chunks put on screen.
+
+    The host's stream consumer preserves the visible head only when
+    ``raw_text.startswith(delivered_prefix)`` and otherwise re-sends the WHOLE
+    reply, so this must be expressed in the raw host text's coordinates — not in
+    sanitized wire coordinates, where a neutralized mention is one UTF-16 unit
+    longer and a fenced chunk carries synthetic close/reopen markers.
+
+    ``src_of[k]`` maps sanitized position ``k`` back to the source boundary it
+    came from, built by the sanitizer from the insertions IT made, so a literal
+    U+200B the user wrote is never stripped back out. Falls back to the legacy
+    indicator-stripped chunk join when no exact map is available (a
+    ``format_message`` that rewrote the text): that at worst reproduces the
+    pre-fix behaviour and never invents a wrong cut.
+    """
+    if delivered <= 0:
+        return ""
+    if source_text is not None and src_of and spans and delivered <= len(spans):
+        end_cp = spans[delivered - 1][1]
+        end_cp = min(max(end_cp, 0), len(src_of) - 1)
+        return source_text[: src_of[end_cp]]
+    return "".join(_chunk_without_indicator(c) for c in chunks[:delivered])
+
+
 class _ThreadGone(Exception):
     """A chosen thread was deleted mid-send: the caller falls back to its parent.
 
@@ -2093,8 +2290,13 @@ class FluxerAdapter(BasePlatformAdapter):
             # Mention neutralization inserts zero-width characters. Apply it
             # before measuring so the final wire payload cannot cross Fluxer's
             # 4,000 UTF-16-unit limit after sanitization.
-            formatted = self._sanitize_outbound_mentions(self.format_message(content))
-            chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+            formatted_source = self.format_message(content)
+            formatted, source_boundaries = _sanitize_mentions_with_source_map(self, formatted_source)
+            chunks, chunk_spans = split_message_with_source_spans(
+                formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len
+            )
+            raw_source = content if formatted_source == content else None
+            source_map = source_boundaries if raw_source is not None else None
             message_ids: List[str] = []
             responses: List[Dict[str, Any]] = []
 
@@ -2139,10 +2341,23 @@ class FluxerAdapter(BasePlatformAdapter):
                         chunk_payload["message_reference"] = {"message_id": str(reply_to)}
                         if index > 0 and self._reply_to_mode != "all":
                             chunk_payload.pop("message_reference", None)
-                    data = await self._post_chunk(
-                        chunk_payload, payload, target_chat_id, index,
-                        chat_id, reply_to, metadata, None,
-                    )
+                    try:
+                        data = await self._post_chunk(
+                            chunk_payload, payload, target_chat_id, index,
+                            chat_id, reply_to, metadata, None,
+                        )
+                    except Exception as exc:
+                        if message_ids:
+                            logger.warning(
+                                "Fluxer split send stopped after %d/%d chunks during channel fallback: %s",
+                                len(message_ids), len(chunks), exc,
+                            )
+                            return self._partial_split_result(
+                                exc, chunks, message_ids, responses,
+                                source_text=raw_source, chunk_spans=chunk_spans,
+                                source_boundaries=source_map,
+                            )
+                        raise
                 except Exception as exc:
                     # Any other failure: if earlier chunks of this split already
                     # landed, the failure is a PARTIAL delivery — the host must
@@ -2152,7 +2367,11 @@ class FluxerAdapter(BasePlatformAdapter):
                             "Fluxer split send stopped after %d/%d chunks: %s",
                             len(message_ids), len(chunks), exc,
                         )
-                        return self._partial_split_result(exc, chunks, message_ids, responses)
+                        return self._partial_split_result(
+                            exc, chunks, message_ids, responses,
+                            source_text=raw_source, chunk_spans=chunk_spans,
+                            source_boundaries=source_map,
+                        )
                     raise
                 responses.append(data)
                 if data.get("id"):
@@ -2239,6 +2458,10 @@ class FluxerAdapter(BasePlatformAdapter):
         chunks: List[str],
         message_ids: List[str],
         responses: List[Dict[str, Any]],
+        *,
+        source_text: Optional[str] = None,
+        chunk_spans: Optional[List[tuple]] = None,
+        source_boundaries: Optional[List[int]] = None,
     ) -> SendResult:
         """A failure after some split chunks landed, marked ``partial_overflow``.
 
@@ -2248,7 +2471,9 @@ class FluxerAdapter(BasePlatformAdapter):
         failure. ``message_id`` stays the LAST delivered chunk.
         """
         retryable, error_kind = _classify_send_failure(exc)
-        delivered_prefix = "".join(_chunk_without_indicator(c) for c in chunks[: len(message_ids)])
+        delivered_prefix = _delivered_source_prefix(
+            chunks, chunk_spans, len(message_ids), source_text, source_boundaries
+        )
         return SendResult(
             success=False,
             message_id=message_ids[-1],
@@ -2545,7 +2770,10 @@ class FluxerAdapter(BasePlatformAdapter):
             target_chat_id = self._destination_for_message(message_id, chat_id)
             # Sanitize before measuring: neutralized mentions are one UTF-16
             # unit longer than their source syntax.
-            formatted = self._sanitize_outbound_mentions(self.format_message(content))
+            formatted_source = self.format_message(content)
+            formatted, source_boundaries = _sanitize_mentions_with_source_map(self, formatted_source)
+            raw_source = content if formatted_source == content else None
+            source_map = source_boundaries if raw_source is not None else None
             if utf16_len(formatted) > MAX_MESSAGE_LENGTH:
                 if finalize:
                     # The FINAL edit holds the whole answer, so it must be split
@@ -2553,7 +2781,8 @@ class FluxerAdapter(BasePlatformAdapter):
                     # Truncating here delivered only the first chunk and reported
                     # success, silently hiding the rest of the reply.
                     return await self._edit_overflow_split(
-                        target_chat_id, message_id, formatted
+                        target_chat_id, message_id, formatted,
+                        source_text=raw_source, source_boundaries=source_map,
                     )
                 # Mid-stream: truncate instead of splitting. Splitting creates
                 # continuation messages whose ids become the new edit target, and
@@ -2593,7 +2822,13 @@ class FluxerAdapter(BasePlatformAdapter):
             return _failed_send_result(exc)
 
     async def _edit_overflow_split(
-        self, target_chat_id: str, message_id: str, formatted: str
+        self,
+        target_chat_id: str,
+        message_id: str,
+        formatted: str,
+        *,
+        source_text: Optional[str] = None,
+        source_boundaries: Optional[List[int]] = None,
     ) -> SendResult:
         """Deliver an oversized FINAL edit: chunk 1 edits ``message_id``, the rest
         are sent as continuations. Returns ``message_id=<last-id>`` +
@@ -2604,9 +2839,12 @@ class FluxerAdapter(BasePlatformAdapter):
         ``last_message_id`` so the host delivers only the missing tail instead of
         treating the truncated preview as the whole answer.
         """
-        chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+        chunks, chunk_spans = split_message_with_source_spans(
+            formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len
+        )
         if len(chunks) <= 1:
             chunks = [formatted]  # defensive: a single chunk just edits normally
+            chunk_spans = [(0, len(formatted))]
         try:
             data = await self._request(
                 "PATCH",
@@ -2632,8 +2870,9 @@ class FluxerAdapter(BasePlatformAdapter):
                     len(delivered_ids), len(chunks), exc,
                 )
                 retryable, error_kind = _classify_send_failure(exc)
-                delivered_prefix = "".join(
-                    _chunk_without_indicator(c) for c in delivered_chunks
+                delivered_prefix = _delivered_source_prefix(
+                    chunks, chunk_spans, len(delivered_ids), source_text,
+                    source_boundaries,
                 )
                 last_id = delivered_ids[-1]
                 return SendResult(
