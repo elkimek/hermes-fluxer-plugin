@@ -1709,6 +1709,11 @@ class FluxerAdapter(BasePlatformAdapter):
         # indicator and the approval prompt all have to be routed to it --
         # creating it on first use.
         self._threads_pending: Dict[str, str] = {}
+        # Same-user active turns opened from parent channels. This is a narrow
+        # adapter-local index for parent-channel /stop only; it never changes the
+        # persisted per-user thread session key. Values count concurrent owners of
+        # each (parent, user, thread) tuple so one ending turn cannot erase another.
+        self._active_auto_threads: Dict[tuple[str, str], Dict[str, int]] = {}
         # The kind of a channel id learned from the API (``thread`` / ``channel``).
         # Fluxer's own MESSAGE_CREATE payload carries no ``channel_type`` and no
         # nested channel object, so the raw event cannot classify itself; without
@@ -2915,15 +2920,50 @@ class FluxerAdapter(BasePlatformAdapter):
         # actual event, keeping ownership until final/footer/media delivery ends.
         marker = self._turn_context.set((event, session_key))
         key = self._turn_key(event.source.chat_id)
+        active_thread = self._register_active_auto_thread(event.source)
         try:
             await super()._process_message_background(event, session_key)
         finally:
             try:
                 await self.stop_typing(event.source.chat_id)
             finally:
+                if active_thread:
+                    self._unregister_active_auto_thread(*active_thread)
                 self._turn_anchor.pop(key, None)
                 self._turn_thread_disabled.discard(key)
                 self._turn_context.reset(marker)
+
+    def _register_active_auto_thread(self, source: Any) -> Optional[tuple[str, str, str]]:
+        """Track an executing bot auto-thread for same-user parent /stop routing."""
+        parent = str(getattr(source, "parent_chat_id", None) or "").strip()
+        user_id = str(getattr(source, "user_id", None) or "").strip()
+        thread_id = str(getattr(source, "chat_id", None) or "").strip()
+        if not (parent and user_id and thread_id and getattr(source, "chat_type", None) == "thread"):
+            return None
+        if self._thread_is_bot_owned(thread_id) is not True:
+            return None
+        key = (parent, user_id)
+        threads = self._active_auto_threads.setdefault(key, {})
+        threads[thread_id] = threads.get(thread_id, 0) + 1
+        return parent, user_id, thread_id
+
+    def _unregister_active_auto_thread(self, parent: str, user_id: str, thread_id: str) -> None:
+        key = (parent, user_id)
+        threads = self._active_auto_threads.get(key)
+        if not threads:
+            return
+        remaining = threads.get(thread_id, 0) - 1
+        if remaining > 0:
+            threads[thread_id] = remaining
+        else:
+            threads.pop(thread_id, None)
+        if not threads:
+            self._active_auto_threads.pop(key, None)
+
+    def _active_auto_thread_for_user(self, parent: str, user_id: str) -> Optional[str]:
+        """Return the unique active auto-thread, never an arbitrary last one."""
+        threads = self._active_auto_threads.get((str(parent), str(user_id))) or {}
+        return next(iter(threads)) if len(threads) == 1 else None
 
     def _pin_turn_anchor(self, chat_id: str, metadata=None) -> None:
         """Remember only the executing event or an explicit trigger."""
@@ -2987,7 +3027,14 @@ class FluxerAdapter(BasePlatformAdapter):
             # which case the thread is born with its final name and no rename follows.
             placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
             author_id = self._inbound_author_by_message.get(str(message_id)) or None
-            title = await asyncio.to_thread(self._session_title_for_chat, str(chat_id), author_id)
+            title_chat_id = str(message_id)
+            title_parent_chat_id = str(chat_id) if title_chat_id != str(chat_id) else None
+            if title_parent_chat_id:
+                title = await asyncio.to_thread(
+                    self._session_title_for_chat, title_chat_id, author_id, title_parent_chat_id
+                )
+            else:
+                title = await asyncio.to_thread(self._session_title_for_chat, title_chat_id, author_id)
             thread_name = _collapse_thread_name(title or "") or placeholder
             # Whether the thread came from the server already existing rather than
             # from a create here: only a thread this adapter created carries a name
@@ -3030,7 +3077,8 @@ class FluxerAdapter(BasePlatformAdapter):
                     # overwrite -- so passing it would let the session title clobber
                     # that human's choice.
                     self._schedule_title_rename(
-                        chat_id, thread_id, thread_name if adopted else created_name, author_id
+                        title_chat_id, thread_id, thread_name if adopted else created_name,
+                        author_id, title_parent_chat_id,
                     )
             return thread_id
 
@@ -3149,7 +3197,10 @@ class FluxerAdapter(BasePlatformAdapter):
             )
         return None
 
-    def _session_title_for_chat(self, chat_id: str, user_id: Optional[str] = None) -> Optional[str]:
+    def _session_title_for_chat(
+        self, chat_id: str, user_id: Optional[str] = None,
+        fallback_chat_id: Optional[str] = None,
+    ) -> Optional[str]:
         """The triggering session's title for a chat, or ``None``.
 
         Reads the title back through Hermes' own session store: the gateway's
@@ -3168,16 +3219,26 @@ class FluxerAdapter(BasePlatformAdapter):
             chat_key = str(chat_id or "")
             if store is None or not chat_key:
                 return None
-            session_id = store.find_session_by_origin(
-                platform=str(self.platform.value), chat_id=chat_key,
-                user_id=str(user_id) if user_id else None,
-            )
-            if not session_id:
-                return None
-            if store.get_session_title_source(session_id) not in _TITLE_RENAME_SOURCES:
-                return None
-            title = store.get_session_title(session_id)
-            return str(title).strip() or None
+            def _title_for(origin_chat_id: str) -> tuple[bool, Optional[str]]:
+                session_id = store.find_session_by_origin(
+                    platform=str(self.platform.value), chat_id=origin_chat_id,
+                    user_id=str(user_id) if user_id else None,
+                )
+                if not session_id:
+                    return False, None
+                row = store.get_session(session_id) if hasattr(store, "get_session") else None
+                if user_id and row and str(row.get("user_id") or "") != str(user_id):
+                    return True, None
+                if store.get_session_title_source(session_id) not in _TITLE_RENAME_SOURCES:
+                    return True, None
+                title = store.get_session_title(session_id)
+                return True, str(title).strip() or None
+
+            anchor_exists, title = _title_for(chat_key)
+            if anchor_exists:
+                return title
+            fallback = str(fallback_chat_id or "").strip()
+            return _title_for(fallback)[1] if fallback and fallback != chat_key else None
         except Exception as exc:
             logger.debug("Fluxer session title lookup failed (%s)", type(exc).__name__)
             return None
@@ -3255,7 +3316,8 @@ class FluxerAdapter(BasePlatformAdapter):
                     logger.debug("Fluxer session store close failed: %s", type(exc).__name__)
 
     def _schedule_title_rename(
-        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None
+        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None,
+        fallback_chat_id: Optional[str] = None,
     ) -> None:
         """Watch for this session's title and rename ``thread_id`` when it appears."""
         key = str(thread_id)
@@ -3268,7 +3330,9 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         self._loop = loop
         task = loop.create_task(
-            self._rename_thread_when_titled(str(chat_id), key, str(placeholder), user_id)
+            self._rename_thread_when_titled(
+                str(chat_id), key, str(placeholder), user_id, fallback_chat_id=fallback_chat_id
+            )
         )
         self._title_tasks[key] = task
         task.add_done_callback(lambda _t, k=key: self._title_tasks.pop(k, None))
@@ -3282,7 +3346,8 @@ class FluxerAdapter(BasePlatformAdapter):
             evicted.cancel()
 
     async def _rename_thread_when_titled(
-        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None
+        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None,
+        fallback_chat_id: Optional[str] = None,
     ) -> None:
         """Rename a thread to its session title, bounded by a wall-clock window.
 
@@ -3292,7 +3357,12 @@ class FluxerAdapter(BasePlatformAdapter):
         """
         deadline = time.monotonic() + _TITLE_RENAME_WINDOW_SECONDS
         while True:
-            title = await asyncio.to_thread(self._session_title_for_chat, chat_id, user_id)
+            if fallback_chat_id:
+                title = await asyncio.to_thread(
+                    self._session_title_for_chat, chat_id, user_id, fallback_chat_id
+                )
+            else:
+                title = await asyncio.to_thread(self._session_title_for_chat, chat_id, user_id)
             if title and title != placeholder:
                 try:
                     applied = await self.rename_thread(
@@ -3564,6 +3634,27 @@ class FluxerAdapter(BasePlatformAdapter):
                 info = await self._resolve_thread_info(channel_id, expect_thread=True)
                 parent = info.get("parent_id")
             return channel_id, chat_type, (str(parent) if parent else None), None
+        if chat_type == "channel" and _is_text_command(str(data.get("content") or "")):
+            command = str(data.get("content") or "").lstrip().split(maxsplit=1)[0]
+            command_name = command[1:].split("@", 1)[0].lower()
+            if command_name == "stop":
+                user_id = str((data.get("author") or data.get("user") or {}).get("id")
+                              or data.get("author_id") or "").strip()
+                active_thread = self._active_auto_thread_for_user(str(channel_id), user_id)
+                if active_thread:
+                    return active_thread, "thread", str(channel_id), None
+                if user_id and self._active_auto_threads.get((str(channel_id), user_id)):
+                    logger.warning(
+                        "Fluxer parent-channel /stop is ambiguous for user %s in %s; "
+                        "leaving it on the parent channel",
+                        user_id, channel_id,
+                    )
+                    return channel_id, chat_type, None, None
+            # Other commands retain their existing parent-channel semantics.
+            anchor = str(data.get("id") or "").strip()
+            if anchor:
+                self._remember_no_thread_anchor(channel_id, anchor)
+            return channel_id, chat_type, None, None
         if not self._thread_replies_enabled_for(channel_id):
             return channel_id, chat_type, None, None
         # A plain-text command addresses the turn already running in this chat, so
@@ -3576,6 +3667,8 @@ class FluxerAdapter(BasePlatformAdapter):
             anchor = str(data.get("id") or "").strip()
             if anchor:
                 self._remember_no_thread_anchor(channel_id, anchor)
+            return channel_id, chat_type, None, None
+        if not self._thread_replies_enabled_for(channel_id):
             return channel_id, chat_type, None, None
         anchor = str(data.get("id") or "").strip()
         if not anchor:
@@ -3603,6 +3696,15 @@ class FluxerAdapter(BasePlatformAdapter):
             return "thread"
         if self._threads_pending.get(cid):
             return "thread"
+        # Explicit channel configuration is sufficient evidence for a parent
+        # channel. It avoids a cold-start API read without guessing about arbitrary
+        # untyped ids when the lookup is unavailable.
+        known_channels = (
+            self._thread_reply_channels | self._free_response_channels | self._home_channel_ids
+            | self._allowed_channel_ids | self._mention_gated_channels
+        )
+        if cid in known_channels:
+            return "channel"
         return None
 
     def _typing_target_sync(self, chat_id: str, metadata=None) -> tuple[str, bool]:
@@ -5337,7 +5439,10 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         self._known_channel_ids.add(channel_id)
         reply_to_message_id, reply_to_text = await self._resolve_reply_context(data, channel_id)
-        chat_type = _chat_type(data.get("channel_type") or (data.get("channel") or {}).get("type"))
+        channel_type = data.get("channel_type")
+        if channel_type is None:
+            channel_type = (data.get("channel") or {}).get("type")
+        chat_type = _chat_type(channel_type)
         # Fluxer's own MESSAGE_CREATE carries no ``channel_type`` and no nested
         # channel object -- only ``channel_id`` -- so a raw event classified itself
         # as a plain channel even when it arrived inside a thread. That keyed an
@@ -5345,13 +5450,19 @@ class FluxerAdapter(BasePlatformAdapter):
         # thread, which is the split this routing contract exists to remove. The
         # kind is settled from what the adapter already knows, then from one API
         # read; a lookup that fails leaves the event exactly as it arrived.
-        untyped = not (data.get("channel_type") or (data.get("channel") or {}).get("type"))
+        untyped = channel_type is None
         if untyped:
             known_kind = self._classify_untyped_event(channel_id)
             if known_kind is None:
                 known_kind = await self._resolve_channel_kind(channel_id)
             if known_kind:
                 chat_type = known_kind
+            else:
+                logger.warning(
+                    "Fluxer cannot classify untyped container %s after lookup failure; dropping event",
+                    channel_id,
+                )
+                return
         # A follow-up in a thread the bot opened has to be admitted by the same rules
         # as the channel it hangs under, so the parent/owner are resolved BEFORE the
         # admission gate rather than after it. A cold process has neither in memory;

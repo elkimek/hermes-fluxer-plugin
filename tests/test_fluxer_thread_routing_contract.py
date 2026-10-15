@@ -25,6 +25,7 @@ is a property of the real key derivation, not of a local reimplementation.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -138,11 +139,7 @@ async def test_a_command_typed_in_the_thread_targets_the_running_turn():
 
 @pytest.mark.asyncio
 async def test_a_command_typed_in_the_channel_keeps_the_channel_session():
-    """A command addresses the running turn; it must not open a thread of its own.
-
-    Auto-threading a ``/stop`` would key it on the command's own message id — a
-    brand-new session with no run — so the stop would never reach the turn.
-    """
+    """A command addresses the running turn; it must not open a thread of its own."""
     adapter = _adapter(thread_reply_channels=[PARENT])
 
     source = await _capture_source(adapter, _message("msg-2", PARENT, "/stop"))
@@ -151,6 +148,104 @@ async def test_a_command_typed_in_the_channel_keeps_the_channel_session():
     assert source.chat_type == "channel"
     assert _key(source) == "agent:main:fluxer:channel:chan-1:owner-user"
     assert adapter._threads_pending == {}
+
+
+@pytest.mark.asyncio
+async def test_parent_stop_targets_only_the_same_users_active_auto_thread():
+    adapter = _adapter(thread_reply_channels=[PARENT])
+    initiating = await _capture_source(adapter, _message(ANCHOR, PARENT, "deploy"))
+    adapter._active_auto_threads = {(PARENT, OWNER): {ANCHOR}}
+
+    stop = await _capture_source(adapter, _message("stop-1", PARENT, "/stop"))
+
+    assert _key(stop) == _key(initiating)
+    assert stop.chat_id == ANCHOR
+    assert stop.parent_chat_id == PARENT
+
+
+@pytest.mark.asyncio
+async def test_parent_stop_does_not_guess_between_active_auto_threads():
+    adapter = _adapter(thread_reply_channels=[PARENT])
+    adapter._active_auto_threads = {(PARENT, OWNER): {"thread-a", "thread-b"}}
+
+    stop = await _capture_source(adapter, _message("stop-1", PARENT, "/stop"))
+
+    assert stop.chat_id == PARENT
+    assert stop.chat_type == "channel"
+
+
+@pytest.mark.asyncio
+async def test_other_users_active_thread_does_not_retarget_parent_stop():
+    adapter = _adapter(thread_reply_channels=[PARENT])
+    adapter._active_auto_threads = {(PARENT, OTHER): {ANCHOR}}
+
+    stop = await _capture_source(adapter, _message("stop-1", PARENT, "/stop"))
+
+    assert stop.chat_id == PARENT
+    assert stop.chat_type == "channel"
+
+
+@pytest.mark.asyncio
+async def test_cold_untyped_lookup_failure_drops_unknown_container():
+    adapter = _adapter(thread_reply_channels=[PARENT])
+    adapter._resolve_channel_kind = AsyncMock(return_value=None)
+    adapter._fetch_thread_info = AsyncMock(side_effect=RuntimeError("offline"))
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_message_create(_message("msg-2", ANCHOR, "carry on"), {})
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_configured_parent_stays_classifiable_when_untyped_lookup_fails():
+    adapter = _adapter(thread_reply_channels=[PARENT])
+    adapter._resolve_channel_kind = AsyncMock(return_value=None)
+
+    source = await _capture_source(adapter, _message(ANCHOR, PARENT, "deploy"))
+
+    assert source.chat_id == ANCHOR
+    assert source.chat_type == "thread"
+    assert source.parent_chat_id == PARENT
+
+
+@pytest.mark.asyncio
+async def test_in_thread_turn_registration_lives_only_during_processing(monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    adapter = _adapter(thread_reply_channels=[PARENT])
+    adapter._remember_thread_owner(ANCHOR, True)
+    adapter.stop_typing = AsyncMock()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def process(self, event, session_key):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(BasePlatformAdapter, "_process_message_background", process)
+    event = SimpleNamespace(source=SimpleNamespace(
+        chat_id=ANCHOR, parent_chat_id=PARENT, chat_type="thread", user_id=OWNER,
+    ), message_id="msg-trigger")
+    task = asyncio.create_task(adapter._process_message_background(event, "session-key"))
+    await entered.wait()
+    assert adapter._active_auto_threads[(PARENT, OWNER)] == {ANCHOR: 1}
+    release.set()
+    await task
+    assert (PARENT, OWNER) not in adapter._active_auto_threads
+
+
+@pytest.mark.asyncio
+async def test_a_command_typed_in_the_thread_targets_the_running_turn():
+    """/stop is the reason the two keys have to agree."""
+    adapter = _adapter(thread_reply_channels=[PARENT])
+    _bot_thread(adapter)
+
+    initiating = await _capture_source(adapter, _message(ANCHOR, PARENT, "deploy the thing"))
+    stop = await _capture_source(adapter, _message("msg-2", ANCHOR, "/stop", channel_type=11))
+
+    assert _key(stop) == _key(initiating)
+
+
 
 
 # ── session normalization ───────────────────────────────────────────────────────
@@ -190,7 +285,7 @@ async def test_the_initiating_message_names_the_thread_it_will_open():
 async def test_a_channel_without_thread_replies_keeps_its_channel_session():
     adapter = _adapter()
 
-    source = await _capture_source(adapter, _message(ANCHOR, PARENT, "deploy the thing"))
+    source = await _capture_source(adapter, _message(ANCHOR, PARENT, "deploy the thing", channel_type=0))
 
     assert source.chat_id == PARENT
     assert source.chat_type == "channel"
@@ -325,7 +420,7 @@ async def test_typing_lands_in_the_thread_the_turn_will_use():
         return {}
 
     adapter._request = fake_request
-    adapter._schedule_title_rename = lambda *args: None
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
 
     await adapter.send_typing(PARENT, metadata={"reply_to_message_id": ANCHOR})
     await _drain_loop()
@@ -394,7 +489,7 @@ async def test_typing_in_a_pending_thread_creates_it_under_the_parent():
         return {}
 
     adapter._request = fake_request
-    adapter._schedule_title_rename = lambda *args: None
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
 
     await adapter.send_typing(ANCHOR)
     await _drain_loop()
@@ -413,7 +508,7 @@ async def test_a_pending_thread_is_created_before_the_first_delivery():
     """The reply must land in the thread the session was keyed on."""
     adapter = _adapter(thread_reply_channels=[PARENT])
     adapter._threads_pending[ANCHOR] = PARENT
-    adapter._schedule_title_rename = lambda *args: None
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
     posts: list[tuple[str, str]] = []
 
     async def fake_request(method, path, **kwargs):
@@ -443,7 +538,7 @@ async def test_a_deleted_pending_thread_falls_back_to_the_parent_channel():
     """
     adapter = _adapter(thread_reply_channels=[PARENT])
     adapter._threads_pending[ANCHOR] = PARENT
-    adapter._schedule_title_rename = lambda *args: None
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
     posts: list[str] = []
 
     async def fake_request(method, path, **kwargs):

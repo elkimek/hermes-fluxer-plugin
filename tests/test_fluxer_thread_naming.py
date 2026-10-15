@@ -93,6 +93,10 @@ class FakeSessionStore:
             return None
         return str(rows[0]["id"])
 
+    def get_session(self, session_id):
+        rows = self._rows("SELECT user_id FROM sessions WHERE id = ?", (session_id,))
+        return rows[0] if rows else None
+
     def get_session_title(self, session_id):
         rows = self._rows("SELECT title FROM sessions WHERE id = ?", (session_id,))
         return rows[0]["title"] if rows else None
@@ -421,7 +425,7 @@ async def test_thread_is_named_from_the_trigger_when_no_title_exists(state_db):
     adapter = _adapter()
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
     adapter.create_thread = AsyncMock(return_value={"id": "th-1", "name": "deploy the thing"})
-    adapter._schedule_title_rename = lambda *args: None
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
 
     thread_id = await adapter._start_thread_from_message("chan-1", "msg-1")
 
@@ -436,7 +440,7 @@ async def test_thread_is_born_with_the_session_title_when_one_exists(state_db):
     _add_session(state_db, title="Deploy the thing", title_source="llm")
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
     adapter.create_thread = AsyncMock(return_value={"id": "th-1", "name": "Deploy the thing"})
-    adapter._schedule_title_rename = lambda *args: None
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
 
     await adapter._start_thread_from_message("chan-1", "msg-1")
 
@@ -445,26 +449,98 @@ async def test_thread_is_born_with_the_session_title_when_one_exists(state_db):
 
 
 @pytest.mark.asyncio
-async def test_thread_creation_looks_up_the_triggering_author(store, state_db):
+async def test_thread_creation_looks_up_the_prospective_thread_session_first(store, state_db):
     adapter = _adapter()
-    _add_session(state_db, user_id="user-b", title="B's work", title_source="llm")
+    _add_session(state_db, id="old-parent", chat_id="chan-1", user_id="user-b",
+                 title="Old parent title", title_source="llm", started_at=1)
+    _add_session(state_db, id="current-thread", chat_id="msg-1", user_id="user-b",
+                 session_key="agent:main:fluxer:thread:msg-1:user-b",
+                 title="B's work", title_source="llm", started_at=2)
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
     adapter._inbound_author_by_message["msg-1"] = "user-b"
-    adapter.create_thread = AsyncMock(return_value={"id": "th-1", "name": "B's work"})
-    adapter._schedule_title_rename = lambda *args: None
-    seen: list = []
-    original = store.find_session_by_origin
-
-    def spy(**kwargs):
-        seen.append(kwargs)
-        return original(**kwargs)
-
-    store.find_session_by_origin = spy
+    adapter.create_thread = AsyncMock(return_value={"id": "msg-1", "name": "B's work"})
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
 
     await adapter._start_thread_from_message("chan-1", "msg-1")
 
-    assert seen and seen[0]["user_id"] == "user-b"
     assert adapter.create_thread.await_args.args[:2] == ("chan-1", "B's work")
+
+
+@pytest.mark.asyncio
+async def test_prospective_title_lookup_uses_parent_only_as_user_scoped_fallback(store, state_db):
+    adapter = _adapter()
+    _add_session(state_db, id="other-parent", chat_id="chan-1", user_id="user-a",
+                 title="A's title", title_source="llm")
+    _add_session(state_db, id="user-parent", chat_id="chan-1", user_id="user-b",
+                 title="B's title", title_source="llm")
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._inbound_author_by_message["msg-1"] = "user-b"
+    adapter.create_thread = AsyncMock(return_value={"id": "msg-1", "name": "B's title"})
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+
+    assert adapter.create_thread.await_args.args[:2] == ("chan-1", "B's title")
+
+
+@pytest.mark.asyncio
+async def test_prospective_title_lookup_does_not_fallback_to_another_users_parent_title(store, state_db):
+    adapter = _adapter()
+    _add_session(state_db, id="other-parent", chat_id="chan-1", user_id="user-a",
+                 title="A's title", title_source="llm")
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._inbound_author_by_message["msg-1"] = "user-b"
+    adapter.create_thread = AsyncMock(return_value={"id": "msg-1", "name": "deploy the thing"})
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+
+    assert adapter.create_thread.await_args.args[:2] == ("chan-1", "deploy the thing")
+
+
+@pytest.mark.asyncio
+async def test_prospective_title_lookup_does_not_fallback_when_anchor_session_has_no_title(store, state_db):
+    adapter = _adapter()
+    _add_session(state_db, id="parent-session", chat_id="chan-1", user_id="user-b",
+                 title="B's existing work", title_source="llm")
+    _add_session(state_db, id="anchor-session", chat_id="msg-1", user_id="user-b",
+                 session_key="agent:main:fluxer:thread:msg-1:user-b")
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._inbound_author_by_message["msg-1"] = "user-b"
+    adapter.create_thread = AsyncMock(return_value={"id": "msg-1", "name": "B's existing work"})
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+
+    assert adapter.create_thread.await_args.args[:2] == ("chan-1", "deploy the thing")
+
+
+@pytest.mark.asyncio
+async def test_prospective_title_lookup_poller_tracks_anchor_then_parent(store, state_db):
+    adapter = _adapter()
+    _add_session(state_db, id="parent-session", chat_id="chan-1", user_id="user-b")
+    adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
+    adapter._inbound_author_by_message["msg-1"] = "user-b"
+    adapter.create_thread = AsyncMock(return_value={"id": "msg-1", "name": "deploy the thing"})
+    watched = []
+    adapter._schedule_title_rename = lambda *args, **kwargs: watched.append((args, kwargs))
+
+    await adapter._start_thread_from_message("chan-1", "msg-1")
+
+    assert watched == [(("msg-1", "msg-1", "deploy the thing", "user-b", "chan-1"), {})]
+    conn = sqlite3.connect(state_db)
+    conn.execute("UPDATE sessions SET title = ?, title_source = ? WHERE id = ?",
+                 ("B's work", "llm", "parent-session"))
+    conn.commit()
+    conn.close()
+    adapter.rename_thread = AsyncMock(return_value=True)
+    with patch.object(fluxer_adapter, "_TITLE_RENAME_POLL_INTERVAL", 0.01):
+        await adapter._rename_thread_when_titled(
+            "msg-1", "msg-1", "deploy the thing", "user-b", fallback_chat_id="chan-1"
+        )
+    adapter.rename_thread.assert_awaited_once_with(
+        "msg-1", "B's work", only_if_current_name="deploy the thing"
+    )
 
 
 @pytest.mark.asyncio
@@ -477,7 +553,7 @@ async def test_thread_without_a_title_yet_is_watched(state_db):
 
     await adapter._start_thread_from_message("chan-1", "msg-1")
 
-    assert watched == [("chan-1", "th-1", "deploy the thing", None)]
+    assert watched == [("msg-1", "th-1", "deploy the thing", None, "chan-1")]
 
 
 @pytest.mark.asyncio
@@ -485,7 +561,7 @@ async def test_thread_creation_reuses_the_thread_for_the_same_anchor(state_db):
     adapter = _adapter()
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
     adapter.create_thread = AsyncMock(return_value={"id": "th-1", "name": "deploy the thing"})
-    adapter._schedule_title_rename = lambda *args: None
+    adapter._schedule_title_rename = lambda *args, **kwargs: None
 
     assert await adapter._start_thread_from_message("chan-1", "msg-1") == "th-1"
     assert await adapter._start_thread_from_message("chan-1", "msg-1") == "th-1"
@@ -538,7 +614,7 @@ async def test_the_title_is_waited_for_until_it_appears(state_db):
     adapter.rename_thread = AsyncMock(return_value=True)
     results = iter([None, None, "Deploy the thing"])
 
-    adapter._session_title_for_chat = lambda chat_id, user_id=None: next(results, "Deploy the thing")
+    adapter._session_title_for_chat = lambda chat_id, user_id=None, fallback_chat_id=None: next(results, "Deploy the thing")
     with patch.object(fluxer_adapter, "_TITLE_RENAME_POLL_INTERVAL", 0.01):
         await adapter._rename_thread_when_titled("chan-1", "th-1", "deploy the thing")
 

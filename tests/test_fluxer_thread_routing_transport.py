@@ -208,7 +208,7 @@ async def test_an_untyped_event_in_a_thread_enabled_channel_keeps_its_channel_se
 
 
 @pytest.mark.asyncio
-async def test_a_failed_kind_lookup_leaves_the_event_as_it_arrived():
+async def test_a_failed_kind_lookup_drops_an_untyped_unknown_container_event():
     adapter = _adapter(thread_reply_channels=[PARENT])
     adapter._fetch_thread_info = AsyncMock(side_effect=RuntimeError("offline"))
     seen = {}
@@ -219,8 +219,7 @@ async def test_a_failed_kind_lookup_leaves_the_event_as_it_arrived():
 
     await _drive_turn(adapter, _message("msg-2", ANCHOR, "carry on"), turn)
 
-    assert seen["chat_id"] == ANCHOR
-    assert seen["chat_type"] == "channel"  # unchanged behaviour, no invented parent
+    assert seen == {}  # Unknown untyped container: fail closed rather than guess channel.
 
 
 # ── a plain-text command must not open a thread of its own ──────────────────────

@@ -104,7 +104,7 @@ async def test_an_adopted_thread_keeps_the_name_the_server_already_has():
     await adapter._start_thread_from_message("chan-1", "msg-1")
 
     assert adapter.auto_thread_info_for_chat("chan-1") == ("msg-1", "Gwyn's own thread name")
-    assert watched == [("chan-1", "msg-1", "deploy the thing", None)]
+    assert watched == [("msg-1", "msg-1", "deploy the thing", None, "chan-1")]
 
 
 @pytest.mark.asyncio
