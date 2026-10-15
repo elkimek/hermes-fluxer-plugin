@@ -24,17 +24,22 @@ import math
 import os
 import re
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+HERMES_ROOT = Path(os.getenv("HERMES_AGENT_ROOT", str(Path.home() / ".hermes" / "hermes-agent")))
+# Insert the host root first so the plugin root ends up ahead of it (the plugin's
+# own top-level modules must win). No plugin ``tools`` package exists, so this
+# cannot shadow the host's ``tools`` package.
+for candidate in (HERMES_ROOT, ROOT):
+    if str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
 
 from adapter import FluxerAdapter  # noqa: E402
+from fluxer_plugin_tools.temp_audio import secure_temp_audio_path  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from xai_realtime import BargeInInterrupt, XAIRealtimeVoiceClient  # noqa: E402
@@ -602,17 +607,18 @@ async def _conversation_loop(args: argparse.Namespace, bridge: FluxerLiveKitSmok
         gate_transcript = ""
         gate_seconds = 0.0
         if not args.disable_wake_gate:
-            gate_wav = str(Path(tempfile.gettempdir()) / f"fluxer_xai_room_loop_gate_{turn_no}.wav")
-            try:
-                gate_started = time.monotonic()
-                gate_result = await gate_xai.audio_response_from_pcm16(pcm, gate_wav, timeout=args.xai_timeout)
-                gate_seconds = time.monotonic() - gate_started
-                gate_transcript = gate_result.transcript.strip()
-                gate_decision = gate_transcript.upper().strip().split()
-                should_respond = bool(gate_decision and gate_decision[0] == "RESPOND")
-            except Exception as exc:
-                gate_transcript = f"{type(exc).__name__}: wake gate failed"
-                should_respond = False
+            with secure_temp_audio_path() as gate_path:
+                gate_wav = str(gate_path)
+                try:
+                    gate_started = time.monotonic()
+                    gate_result = await gate_xai.audio_response_from_pcm16(pcm, gate_wav, timeout=args.xai_timeout)
+                    gate_seconds = time.monotonic() - gate_started
+                    gate_transcript = gate_result.transcript.strip()
+                    gate_decision = gate_transcript.upper().strip().split()
+                    should_respond = bool(gate_decision and gate_decision[0] == "RESPOND")
+                except Exception as exc:
+                    gate_transcript = f"{type(exc).__name__}: wake gate failed"
+                    should_respond = False
             if not should_respond:
                 logger.info("Wake gate ignored turn %s transcript=%r", turn_no, gate_transcript)
                 turns.append(

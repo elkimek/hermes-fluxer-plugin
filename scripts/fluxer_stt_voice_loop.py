@@ -26,21 +26,39 @@ import re
 import signal
 import sqlite3
 import sys
-import tempfile
 import time
 import urllib.request
 import wave
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+from urllib.error import HTTPError
 
 ROOT = Path(__file__).resolve().parents[1]
 HERMES_ROOT = Path(os.getenv("HERMES_AGENT_ROOT", str(Path.home() / ".hermes" / "hermes-agent")))
-for candidate in (ROOT, HERMES_ROOT):
+# Order matters. The plugin root must win for the plugin's own top-level modules
+# (adapter, livekit_bridge, xai_realtime), so it is inserted LAST and ends up
+# first. The private ``fluxer_plugin_tools`` package keeps that from shadowing the
+# host's ``tools`` package: this script never puts a top-level ``tools`` on the
+# path, so ``tools.*`` always resolves to Hermes.
+for candidate in (HERMES_ROOT, ROOT):
     if str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
 
 from adapter import FluxerAdapter  # noqa: E402
+from fluxer_plugin_tools.temp_audio import secure_temp_audio_path as _secure_temp_audio_path  # noqa: E402
+from fluxer_plugin_tools.transcription_common import ELEVENLABS_STT_BASE_URL  # noqa: E402
+from fluxer_plugin_tools.transcription_tools import (  # noqa: E402
+    _extract_transcript_text,
+    _load_stt_config,
+    _post_json_multipart,
+    _transcribe_elevenlabs,
+    _transcribe_groq,
+    _transcribe_xai,
+    get_env_value,
+    is_truthy_value,
+    transcribe_audio,
+)
 from gateway.config import PlatformConfig  # noqa: E402
 from livekit_bridge import FluxerLiveKitSmokeBridge  # noqa: E402
 from scripts.fluxer_xai_room_loop import (  # noqa: E402
@@ -52,17 +70,6 @@ from scripts.fluxer_xai_room_loop import (  # noqa: E402
     _cancel_task_safely,
     _redact_exception_message,
     _wait_for_barge_in,
-)
-from tools.transcription_common import ELEVENLABS_STT_BASE_URL  # noqa: E402
-from tools.transcription_tools import (  # noqa: E402
-    _extract_transcript_text,
-    _load_stt_config,
-    _transcribe_elevenlabs,
-    _transcribe_groq,
-    _transcribe_xai,
-    get_env_value,
-    is_truthy_value,
-    transcribe_audio,
 )
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
@@ -128,6 +135,69 @@ def write_pcm16_wav(path: Path, pcm: bytes, *, sample_rate: int) -> Path:
         wav.setframerate(sample_rate)
         wav.writeframes(pcm)
     return path
+
+
+@contextlib.contextmanager
+def secure_temp_audio_path(suffix: str = ".wav") -> Iterator[Path]:
+    """Yield a private, unpredictable temp path for raw speech, then unlink it.
+
+    Thin wrapper over the shared helper in ``fluxer_plugin_tools.temp_audio`` so
+    both voice scripts use one implementation.
+    """
+
+    with _secure_temp_audio_path(suffix) as path:
+        yield path
+
+
+def _read_only_sqlite_uri(path: str | Path) -> str:
+    """``file:`` URI for a ``mode=ro`` open that survives reserved characters.
+
+    A raw ``f"file:{path}?mode=ro"`` truncates at the first ``?`` or ``#`` in the
+    path — everything after it is parsed as the URI query string, so ``mode=ro``
+    is swallowed and the handle is not even read-only: it creates the truncated
+    path as an empty database and every query raises ``no such table``. Core's
+    ``hermes_state_holders.read_only_db_uri`` is preferred when importable;
+    ``Path.as_uri()`` (percent-encoding) is the dependency-free equivalent.
+    """
+
+    try:
+        from hermes_state_holders import read_only_db_uri
+
+        return read_only_db_uri(path)
+    except (ImportError, AttributeError):
+        return Path(path).resolve().as_uri() + "?mode=ro"
+
+
+def _http_error_detail(exc: HTTPError) -> str:
+    """Best-effort provider error detail from an ``HTTPError`` response body."""
+
+    try:
+        body = json.loads(exc.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return str(exc.reason or exc)
+    error_value = body.get("detail") or body.get("error")
+    if isinstance(error_value, dict):
+        return str(error_value.get("message") or error_value)
+    if error_value:
+        return str(error_value)
+    return str(exc.reason or exc)
+
+
+def _validate_vad_timing(args: argparse.Namespace) -> None:
+    """Reject an incoherent VAD timing pair at startup, before any capture.
+
+    ``end_padding_ms`` is a slice of ``silence_ms``; when it exceeds it the VAD
+    can never finalize a segment. The operator's knob is not clamped — the value
+    is refused with a clear message so a misconfiguration surfaces immediately
+    instead of as a silent "the bot never hears me".
+    """
+
+    silence_ms = int(getattr(args, "silence_ms", 0))
+    end_padding_ms = int(getattr(args, "end_padding_ms", 0))
+    if end_padding_ms < 0 or end_padding_ms > silence_ms:
+        raise ValueError(
+            f"end_padding_ms ({end_padding_ms}) must be between 0 and silence_ms ({silence_ms})"
+        )
 
 
 _MEMORY_CONTEXT_RE = re.compile(r"<memory-context>.*?</memory-context>", re.IGNORECASE | re.DOTALL)
@@ -424,7 +494,8 @@ def collect_voice_session_recall(
     start, end, label = window
     start_ts = start.timestamp()
     end_ts = end.timestamp()
-    uri = f"file:{path}?mode=ro"
+    uri = _read_only_sqlite_uri(path)
+    con = None
     try:
         con = sqlite3.connect(uri, uri=True, timeout=2)
         sessions = con.execute(
@@ -461,8 +532,9 @@ def collect_voice_session_recall(
     except sqlite3.Error as exc:
         return f"Session recall lookup failed: {type(exc).__name__}: {exc}"
     finally:
-        with contextlib.suppress(Exception):
-            con.close()  # type: ignore[possibly-undefined]
+        if con is not None:
+            with contextlib.suppress(Exception):
+                con.close()
     if not rows:
         return f"No local Hermes session messages found for {label} ({start.date()})."
     lines = [f"Local Hermes session excerpts for {label} ({start.date()}):"]
@@ -593,41 +665,26 @@ def transcribe_elevenlabs_with_language(file_path: str, model_name: str, languag
     diarize = is_truthy_value(elevenlabs_config.get("diarize", False))
 
     try:
-        import requests
-
         data: dict[str, str] = {
             "model_id": model_name,
             "tag_audio_events": "true" if tag_audio_events else "false",
             "diarize": "true" if diarize else "false",
             "language_code": language_code,
         }
-        with open(file_path, "rb") as audio_file:
-            response = requests.post(
+        try:
+            result = _post_json_multipart(
                 f"{base_url}/speech-to-text",
                 headers={"xi-api-key": api_key},
-                files={"file": (Path(file_path).name, audio_file)},
-                data=data,
-                timeout=120,
+                fields=data,
+                file_field="file",
+                file_path=file_path,
             )
-        if response.status_code != 200:
-            detail = ""
-            try:
-                err_body = response.json()
-                error_value = err_body.get("detail") or err_body.get("error")
-                if isinstance(error_value, dict):
-                    detail = str(error_value.get("message") or error_value)
-                elif error_value:
-                    detail = str(error_value)
-                else:
-                    detail = response.text[:300]
-            except Exception:
-                detail = response.text[:300]
+        except HTTPError as exc:
             return {
                 "success": False,
                 "transcript": "",
-                "error": f"ElevenLabs STT API error (HTTP {response.status_code}): {detail}",
+                "error": f"ElevenLabs STT API error (HTTP {exc.code}): {_http_error_detail(exc)}",
             }
-        result = response.json()
         transcript_text = _extract_transcript_text(result)
         if not transcript_text:
             return {"success": False, "transcript": "", "error": "ElevenLabs STT returned empty transcript"}
@@ -685,6 +742,9 @@ def append_jsonl(path: str | None, item: dict[str, Any]) -> None:
 
 async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     load_env_file(Path(args.env_file).expanduser())
+    # Validate operator knobs before any network work, so a misconfigured VAD
+    # pair fails fast with a clear message instead of silently never capturing.
+    _validate_vad_timing(args)
     bot_token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
     if not bot_token:
         raise RuntimeError("FLUXER_BOT_TOKEN is required")
@@ -732,9 +792,8 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
             await asyncio.sleep(args.initial_settle_seconds)
 
             async def transcribe_barge_in_stop_phrase(pcm: bytes) -> str:
-                wav_path = Path(tempfile.gettempdir()) / f"fluxer_stt_loop_barge_stop_{generation}_{int(time.time() * 1000)}.wav"
-                write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
-                try:
+                with secure_temp_audio_path() as wav_path:
+                    write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
                     stt_result = await asyncio.to_thread(
                         transcribe_with_provider,
                         str(wav_path),
@@ -743,9 +802,6 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                         elevenlabs_language_code=args.elevenlabs_language_code,
                     )
                     return normalize_voice_transcript((stt_result.get("transcript") or "").strip())
-                finally:
-                    with contextlib.suppress(OSError):
-                        wav_path.unlink()
 
             args.barge_in_stop_phrase_transcriber = transcribe_barge_in_stop_phrase
 
@@ -777,17 +833,17 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
                     result["turns"].append(turn)
                     append_jsonl(args.turn_log_jsonl, turn)
                     continue
-                wav_path = Path(tempfile.gettempdir()) / f"fluxer_stt_loop_input_{turn_no}.wav"
-                write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
-                stt_started = time.monotonic()
-                stt_result = await asyncio.to_thread(
-                    transcribe_with_provider,
-                    str(wav_path),
-                    provider=args.stt_provider,
-                    model=args.stt_model,
-                    elevenlabs_language_code=args.elevenlabs_language_code,
-                )
-                stt_seconds = time.monotonic() - stt_started
+                with secure_temp_audio_path() as wav_path:
+                    write_pcm16_wav(wav_path, pcm, sample_rate=args.sample_rate)
+                    stt_started = time.monotonic()
+                    stt_result = await asyncio.to_thread(
+                        transcribe_with_provider,
+                        str(wav_path),
+                        provider=args.stt_provider,
+                        model=args.stt_model,
+                        elevenlabs_language_code=args.elevenlabs_language_code,
+                    )
+                    stt_seconds = time.monotonic() - stt_started
                 transcript = normalize_voice_transcript((stt_result.get("transcript") or "").strip())
                 turn: dict[str, Any] = {
                     "turn": turn_no,

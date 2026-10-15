@@ -1,15 +1,21 @@
 """Standalone speech-to-text helpers used by the Fluxer voice plugin.
 
-The plugin normally runs inside Hermes, where ``tools.transcription_tools`` is
-available from the main agent tree.  The public plugin repository and CI run on
-their own, so this module provides the small compatible surface the Fluxer voice
-loop needs without depending on a checkout of Hermes Agent.
+The plugin normally runs inside Hermes, where the host's ``tools`` package is
+importable.  The public plugin repository and CI run on their own, so this
+module provides the small compatible surface the Fluxer voice loop needs
+without depending on a checkout of Hermes Agent.
+
+It lives under the private ``fluxer_plugin_tools`` package on purpose: a
+top-level ``tools`` module here would shadow the host's ``tools`` package and
+break both the adapter's lazy ``tools.*`` imports and this module's own
+resolution (see the package docstring).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -18,10 +24,29 @@ from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
-from tools.transcription_common import ELEVENLABS_STT_BASE_URL
+from fluxer_plugin_tools.transcription_common import ELEVENLABS_STT_BASE_URL
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
+
+# A filename is caller-controlled (a captured audio file), so it must not be
+# able to inject a second multipart header or terminate the header block early.
+_FILENAME_UNSAFE_RE = re.compile(r'[\x00-\x1f\x7f"\\]')
+_FILENAME_FALLBACK = "audio"
+
+
+def sanitize_multipart_filename(name: str) -> str:
+    """Strip characters that would break out of a quoted multipart filename.
+
+    Quotes and backslashes would close the quoted string, and CR/LF would start a
+    new header line; both let a crafted filename inject headers into the upload.
+    """
+
+    cleaned = _FILENAME_UNSAFE_RE.sub("_", str(name or ""))
+    cleaned = cleaned.replace("\r", "").replace("\n", "")
+    cleaned = cleaned.strip()
+    return cleaned or _FILENAME_FALLBACK
+
 
 
 def get_env_value(name: str, default: str | None = None) -> str | None:
@@ -73,9 +98,10 @@ def _multipart_form(fields: dict[str, str], file_field: str, file_path: str) -> 
         chunks.append(f"--{boundary}\r\n".encode())
         chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
     path = Path(file_path)
+    safe_name = sanitize_multipart_filename(path.name)
     chunks.append(f"--{boundary}\r\n".encode())
     chunks.append(
-        f'Content-Disposition: form-data; name="{file_field}"; filename="{path.name}"\r\n'
+        f'Content-Disposition: form-data; name="{file_field}"; filename="{safe_name}"\r\n'
         f"Content-Type: application/octet-stream\r\n\r\n".encode()
     )
     chunks.append(path.read_bytes())

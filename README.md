@@ -22,6 +22,8 @@ This repo is not Fluxer itself and it is not a full Hermes fork. It is the adapt
 | `adapter.py` | The Fluxer platform adapter: REST sends, gateway receive loop, message gating, approvals, media handling, backlog recovery, and channel discovery. |
 | `__init__.py` | Registration shim loaded by Hermes when the plugin is enabled. |
 | `pyproject.toml` | Python package metadata and runtime dependencies. |
+| `fluxer_plugin_tools/` | Plugin-private STT helpers and the secure scratch-file helper used by the voice scripts. Deliberately **not** named `tools`: a plugin-local `tools` package would shadow the host's own `tools` package for the voice scripts, which put the plugin root ahead of the Hermes root on `sys.path`. |
+| `scripts/` | Standalone voice-loop scripts (`fluxer_stt_voice_loop.py`, `fluxer_voice_auto_join.py`, the xAI room loop and smoke scripts). Not part of the installed wheel; the supervisor is normally plugin-managed. |
 | `after-install.md` | Short post-install checklist shown after plugin installation. |
 | `CHANGELOG.md` | User-facing release notes for plugin updates, fixes, and new capabilities. |
 | `AGENTS.md` | Safety and execution contract for AI agents working in this repo. |
@@ -434,7 +436,9 @@ Hermes sometimes needs user approval before running sensitive tools or confirmin
 2. **Reactions**, added by the bot to the approval message.
 3. **Visible text fallback**, so the prompt still tells the user what to do if components are unavailable.
 
-Allowed-user checks apply to approval reactions and component clicks. A random server member should not be able to approve another user's agent action unless explicitly allowed.
+Allowed-user checks apply to approval reactions and component clicks. A random server member should not be able to approve another user's agent action unless explicitly allowed. A reaction or click must also name the channel (and, for a button, the message) the card was posted in — an event that does not is ignored.
+
+An approval card is bound to the exact gateway request it was posted for. The adapter reads the session's pending approvals when the card is posted and matches the command against them; the resulting request id is frozen before the card's first network call, so a request that arrives while the card is in flight cannot become the card's target. A tap resolves only that request id. When the match is ambiguous (two identical commands queued) or unavailable, the card is left **unbound** and resolves nothing at all — it does not fall back to the host's first-in-first-out resolution, which could approve a different request — and the card says so, pointing at the text commands. Cards also expire on the host's `approvals.timeout` (plus a grace margin), enforced when a reaction or button is used, so a stale card cannot be replayed against a newer request.
 
 ## Troubleshooting
 

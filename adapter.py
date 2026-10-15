@@ -24,7 +24,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional
 from urllib.parse import quote, urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
@@ -103,11 +103,54 @@ _EXEC_APPROVAL_REACTIONS = (
     ("♾️", "always", "always approve"),
     ("❌", "deny", "deny"),
 )
+# Emoji per approval choice, so a card built from the host's own ``prompt.actions``
+# (which carry only label/choice/style) still gets the matching reaction glyph.
+_EA_ACTION_EMOJI = {"once": "✅", "session": "🕒", "always": "♾️", "deny": "❌", "cancel": "❌"}
 _SLASH_CONFIRM_REACTIONS = (
     ("✅", "once", "approve once"),
     ("♾️", "always", "always approve"),
     ("❌", "cancel", "cancel"),
 )
+# A pending approval/confirm card is only answerable while the gateway request it
+# belongs to can still be answered. Cards older than the host's ``approvals.timeout``
+# (plus a grace margin) are pruned, so a stale card cannot linger in the maps and be
+# mistaken for a live one. Minimum 300s mirrors the host default.
+_APPROVAL_CARD_TTL_FLOOR = 300.0
+_APPROVAL_CARD_TTL_GRACE = 60.0
+
+
+def _approval_card_ttl() -> float:
+    """Seconds a pending card stays registered: the host's approval timeout + grace."""
+    try:
+        from tools.approval_context import _get_approval_timeout
+
+        timeout = float(_get_approval_timeout())
+    except Exception:
+        timeout = 300.0
+    return max(timeout, _APPROVAL_CARD_TTL_FLOOR) + _APPROVAL_CARD_TTL_GRACE
+
+
+def _exec_approval_choices(
+    *, allow_permanent: bool, allow_session: bool, smart_denied: bool
+) -> tuple[tuple[str, str, str], ...]:
+    """``(emoji, choice, label)`` rows to offer for an exec approval.
+
+    Mirrors the host's own choice policy (``BasePlatformAdapter._exec_approval_actions``):
+    ``once`` and ``deny`` are always offered; ``session`` only when the caller allows it
+    and the prompt is not a smart deny (a one-operation owner override); ``always`` only
+    when the permanent tier is allowed on top of that.
+    """
+    offered: list[tuple[str, str, str]] = []
+    for row in _EXEC_APPROVAL_REACTIONS:
+        _emoji, choice, _label = row
+        if choice == "session" and (smart_denied or not allow_session):
+            continue
+        if choice == "always" and (smart_denied or not allow_session or not allow_permanent):
+            continue
+        offered.append(row)
+    return tuple(offered)
+
+
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 
 
@@ -362,6 +405,328 @@ def _event_seq(payload: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+try:  # The host's own classifier; absent in the standalone test shim.
+    from gateway.platforms.base import classify_send_error as _host_classify_send_error
+except Exception:  # pragma: no cover - shim without the classifier
+    _host_classify_send_error = None
+
+# HTTP statuses that a retry can never fix: the request was understood and
+# refused. 408/429 are the two 4xx that mean "try again", so they stay out.
+_PERMANENT_STATUS_KINDS = {
+    400: "unknown",
+    401: "forbidden",
+    403: "forbidden",
+    404: "not_found",
+    405: "unknown",
+    409: "unknown",
+    413: "too_long",
+    415: "bad_format",
+    422: "bad_format",
+}
+# httpx transport failures that never reached the server: safe to retry.
+_CONNECT_LEVEL_EXC_NAMES = frozenset({
+    "ConnectError", "ConnectTimeout", "PoolTimeout", "NetworkError",
+    "RemoteProtocolError", "ReadError", "WriteError", "TransportError",
+})
+# Read/write timeouts MAY have been accepted by the server before the response
+# was lost, so re-sending a POST can duplicate the message: never retry these.
+_LANDED_TIMEOUT_EXC_NAMES = frozenset({"ReadTimeout", "WriteTimeout"})
+
+
+def _http_status_of(exc: BaseException) -> Optional[int]:
+    """Status code off the httpx error the REST helpers raise, else ``None``."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_send_failure(
+    exc: BaseException, error_text: str = ""
+) -> tuple[bool, Optional[str]]:
+    """``(retryable, error_kind)`` for a failed outbound call.
+
+    The host's ``classify_send_error`` supplies the platform-neutral kind where
+    it can; the HTTP status is the authoritative signal for retryability, so a
+    permanent 4xx refusal (403 forbidden, 404 gone, 413 too long) is not retried
+    while a 5xx/429/connection failure is. A read/write timeout is deliberately
+    NOT retryable: the POST may already have landed, and retrying duplicates it.
+    """
+    status = _http_status_of(exc)
+    if status is not None:
+        kind = None
+        if _host_classify_send_error is not None:
+            try:
+                kind = _host_classify_send_error(exc, error_text)
+            except Exception:
+                kind = None
+        if not kind or kind == "unknown":
+            kind = _PERMANENT_STATUS_KINDS.get(status) or (
+                "rate_limited" if status == 429 else
+                "transient" if status >= 500 or status == 408 else "unknown"
+            )
+        retryable = status >= 500 or status in (408, 429)
+        return retryable, kind
+
+    name = type(exc).__name__
+    if name in _CONNECT_LEVEL_EXC_NAMES:
+        return True, "transient"
+    if name in _LANDED_TIMEOUT_EXC_NAMES:
+        return False, "transient"
+
+    kind = None
+    if _host_classify_send_error is not None:
+        try:
+            kind = _host_classify_send_error(exc, error_text)
+        except Exception:
+            kind = None
+    if kind in {"forbidden", "not_found", "too_long", "bad_format"}:
+        return False, kind
+    if kind == "rate_limited":
+        return True, kind
+    # Unknown non-HTTP exception: keep the previous permissive default so a
+    # transport-shaped failure the classifier cannot name is still retried.
+    return True, (kind or "unknown")
+
+
+def _error_text_for(exc: BaseException) -> str:
+    """An error string that always names the exception class.
+
+    httpx timeouts stringify to ``""``, and the host's own timeout/retryable
+    checks match on that text — an empty error would read as an ordinary
+    formatting failure and let the host re-send a POST that may already have
+    landed.
+    """
+    detail = str(exc).strip()
+    name = type(exc).__name__
+    return detail if name in detail else (f"{name}: {detail}" if detail else name)
+
+
+def _failed_send_result(exc: BaseException, *, message_id: Optional[str] = None) -> "SendResult":
+    """A ``SendResult`` failure with the retryability/kind classification applied."""
+    retryable, error_kind = _classify_send_failure(exc)
+    return SendResult(success=False, message_id=message_id, error=_error_text_for(exc),
+                      retryable=retryable, error_kind=error_kind)
+
+
+def _chunk_without_indicator(chunk: str) -> str:
+    """A delivered chunk minus the `` (n/m)`` suffix ``truncate_message`` appends."""
+    return re.sub(r" \(\d+/\d+\)$", "", chunk)
+
+
+_TRUNCATE_INDICATOR_RESERVE = 10  # room for " (XX/XX)", matching the host splitter
+_TRUNCATE_FENCE_CLOSE = "\n```"
+
+
+def _fence_state_after(text: str, in_code: bool = False, lang: str = "") -> "tuple":
+    """Mirror of ``gateway.platforms.helpers.fence_state_after``.
+
+    Kept local so the standalone plugin tree needs no host import for it; the
+    behaviour must stay identical to the host's, because
+    :func:`split_message_with_source_spans` reproduces the host splitter's fence
+    handling.
+    """
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            tag = stripped[3:].split()
+            in_code, lang = (False, "") if in_code else (True, tag[0] if tag else "")
+    return in_code, lang
+
+
+def _unit_budget_to_cp(s: str, budget: int, len_fn: "Callable[[str], int]") -> int:
+    """Largest codepoint offset ``n`` with ``len_fn(s[:n]) <= budget`` (binary search).
+
+    Mirror of the host's private ``_custom_unit_to_cp``: the splitter needs it to
+    turn a UTF-16 budget into a codepoint offset, and importing a host private is
+    not an option for a plugin.
+    """
+    if len_fn(s) <= budget:
+        return len(s)
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len_fn(s[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def split_message_with_source_spans(
+    content: str,
+    max_length: int = 4096,
+    len_fn: "Optional[Callable[[str], int]]" = None,
+) -> "tuple":
+    """Split ``content`` like the host's ``truncate_message``, and pair each wire
+    chunk with its SOURCE span ``(start, end)`` in ``content``.
+
+    The wire chunks are byte-identical to ``BasePlatformAdapter.truncate_message``
+    (same algorithm: the `` (n/m)`` indicator reserve, newline-then-space split,
+    the inline-code backtick guard, and the close/reopen fence markers) — that
+    parity is asserted against the real host splitter in the test suite.
+
+    The spans describe ONLY the source-derived body of each chunk, so the
+    synthetic ``\\n`` + fence close, a reopened ```lang header, and the
+    whitespace the splitter lstrips between chunks never leak into a reported
+    prefix. That is what lets ``delivered_prefix`` be an exact prefix of the raw
+    host text for fenced replies, where the wire bytes are not.
+
+    Returns ``(chunks, spans)`` with ``spans[k] == (start, end)`` for ``chunks[k]``.
+    """
+    _len = len_fn or len
+    if _len(content) <= max_length:
+        return [content], [(0, len(content))]
+    chunks: List[str] = []
+    spans: List[tuple] = []
+    remaining = content
+    base_off = 0
+    carry_lang: Optional[str] = None
+    while remaining:
+        prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
+        headroom = max_length - _TRUNCATE_INDICATOR_RESERVE - _len(prefix) - _len(_TRUNCATE_FENCE_CLOSE)
+        if headroom < 1:
+            headroom = max(1, max_length // 2)
+        if _len(prefix) + _len(remaining) <= max_length - _TRUNCATE_INDICATOR_RESERVE:
+            final_chunk = prefix + remaining
+            if carry_lang is not None and _fence_state_after(remaining, True, carry_lang)[0]:
+                final_chunk += _TRUNCATE_FENCE_CLOSE
+            chunks.append(final_chunk)
+            spans.append((base_off, len(content)))
+            break
+        _cp_limit = (
+            _unit_budget_to_cp(remaining, headroom, _len) if _len is not len else headroom
+        )
+        region = remaining[:_cp_limit]
+        split_at = region.rfind("\n")
+        if split_at < _cp_limit // 2:
+            split_at = region.rfind(" ")
+        if split_at < 1:
+            split_at = max(1, _cp_limit)
+        candidate = remaining[:split_at]
+        backtick_count = candidate.count("`") - candidate.count("\\`")
+        if backtick_count % 2 == 1:
+            last_bt = candidate.rfind("`")
+            while last_bt > 0 and candidate[last_bt - 1] == "\\":
+                last_bt = candidate.rfind("`", 0, last_bt)
+            if last_bt > 0:
+                safe_split = max(
+                    candidate.rfind(" ", 0, last_bt), candidate.rfind("\n", 0, last_bt)
+                )
+                if safe_split > _cp_limit // 4:
+                    split_at = safe_split
+        chunk_body = remaining[:split_at]
+        body_start = base_off
+        body_end = base_off + split_at
+        tail = remaining[split_at:]
+        stripped_tail = tail.lstrip()
+        remaining = stripped_tail
+        base_off = body_end + (len(tail) - len(stripped_tail))
+        full_chunk = prefix + chunk_body
+        in_code, lang = _fence_state_after(chunk_body, carry_lang is not None, carry_lang or "")
+        carry_lang = lang if in_code else None
+        chunks.append(full_chunk + _TRUNCATE_FENCE_CLOSE if in_code else full_chunk)
+        spans.append((body_start, body_end))
+    if len(chunks) > 1:
+        chunks = [f"{chunk} ({i + 1}/{len(chunks)})" for i, chunk in enumerate(chunks)]
+    return chunks, spans
+
+
+def _sanitize_mentions_with_source_map(adapter: Any, source: str) -> "tuple":
+    """Apply outbound mention neutralization and map each output boundary to source.
+
+    Record only insertions made by the sanitizer. In particular, never infer
+    that an existing zero-width character was synthetic: literal user text must
+    remain part of the original source prefix.
+    """
+    out: List[str] = []
+    boundary_map = [0]
+    cursor = 0
+    rules = []
+    if not adapter._allow_mention_everyone:
+        rules.append((_MENTION_EVERYONE_RE, lambda m: "@\u200b" + m.group(1)))
+    if not adapter._allow_mention_roles:
+        rules.append((_MENTION_ROLE_RE, lambda m: m.group(0).replace("<@&", "<@\u200b&", 1)))
+    if not adapter._allow_mention_users:
+        rules.append((_MENTION_USER_RE, lambda m: m.group(0).replace("<@", "<@\u200b", 1)))
+    matches = []
+    for regex, replacement in rules:
+        matches.extend((m.start(), m.end(), replacement(m)) for m in regex.finditer(source))
+    matches.sort(key=lambda item: item[0])
+    for start, end, replacement in matches:
+        if start < cursor:
+            continue
+        for i in range(cursor, start):
+            out.append(source[i])
+            boundary_map.append(i + 1)
+        original = source[start:end]
+        if replacement.endswith(original):
+            inserted = replacement[:-len(original)]
+            for char in inserted:
+                out.append(char)
+                boundary_map.append(start)
+            for i, char in enumerate(original):
+                out.append(char)
+                boundary_map.append(start + i + 1)
+        else:
+            for char in replacement:
+                out.append(char)
+                boundary_map.append(start)
+            boundary_map[-1] = end
+        cursor = end
+    for i in range(cursor, len(source)):
+        out.append(source[i])
+        boundary_map.append(i + 1)
+    return "".join(out), boundary_map
+
+
+def _delivered_source_prefix(
+    chunks: List[str],
+    spans: "Optional[List[tuple]]",
+    delivered: int,
+    source_text: "Optional[str]",
+    src_of: "Optional[List[int]]",
+) -> str:
+    """The RAW host prefix the first ``delivered`` wire chunks put on screen.
+
+    The host's stream consumer preserves the visible head only when
+    ``raw_text.startswith(delivered_prefix)`` and otherwise re-sends the WHOLE
+    reply, so this must be expressed in the raw host text's coordinates — not in
+    sanitized wire coordinates, where a neutralized mention is one UTF-16 unit
+    longer and a fenced chunk carries synthetic close/reopen markers.
+
+    ``src_of[k]`` maps sanitized position ``k`` back to the source boundary it
+    came from, built by the sanitizer from the insertions IT made, so a literal
+    U+200B the user wrote is never stripped back out. Falls back to the legacy
+    indicator-stripped chunk join when no exact map is available (a
+    ``format_message`` that rewrote the text): that at worst reproduces the
+    pre-fix behaviour and never invents a wrong cut.
+    """
+    if delivered <= 0:
+        return ""
+    if source_text is not None and src_of and spans and delivered <= len(spans):
+        end_cp = spans[delivered - 1][1]
+        end_cp = min(max(end_cp, 0), len(src_of) - 1)
+        return source_text[: src_of[end_cp]]
+    return "".join(_chunk_without_indicator(c) for c in chunks[:delivered])
+
+
+class _ThreadGone(Exception):
+    """A chosen thread was deleted mid-send: the caller falls back to its parent.
+
+    Carries the ids so ``send`` can abandon the dead thread without re-deriving
+    them from mutable channel state.
+    """
+
+    def __init__(self, thread_id: str, parent_chat: str, original: BaseException) -> None:
+        super().__init__(str(original))
+        self.thread_id = thread_id
+        self.parent_chat = parent_chat
+        self.original = original
+
+
 def _author_name(author: Dict[str, Any]) -> Optional[str]:
     return (
         author.get("global_name")
@@ -447,6 +812,154 @@ def _extension_for_attachment(att: Dict[str, Any], content_type: str, default: s
     if subtype:
         return aliases.get(subtype, f".{subtype}")
     return default
+
+
+# Fallback cap for an inbound attachment body when the host does not expose its
+# configured inbound-media limit. Matches the host default
+# (``gateway.max_inbound_media_bytes`` = 128 MiB) so a hostile URL cannot stream an
+# unbounded body into memory regardless of which host version is running.
+_DEFAULT_ATTACHMENT_MAX_BYTES = 128 * 1024 * 1024
+_MAX_ATTACHMENT_REDIRECTS = 4
+
+
+def _attachment_max_bytes() -> int:
+    """The host's configured inbound-media cap, else a safe default.
+
+    ``get_inbound_media_max_bytes`` is the host's public reader for
+    ``gateway.max_inbound_media_bytes``; an older host without it, or a disabled
+    (``0``) cap, falls back to the module default so the download is always bounded.
+    """
+    try:
+        from gateway.platforms.base import get_inbound_media_max_bytes
+
+        limit = int(get_inbound_media_max_bytes())
+        return limit if limit > 0 else _DEFAULT_ATTACHMENT_MAX_BYTES
+    except Exception:
+        return _DEFAULT_ATTACHMENT_MAX_BYTES
+
+
+def _redirect_target(response: Any) -> Optional[str]:
+    """Absolute redirect target visible on an httpx response, or ``None``.
+
+    Prefers the host's own ``redirect_target_from_response`` (which resolves from
+    ``Location`` before the often-unpopulated ``next_request``); falls back to the
+    same logic locally so an older host still gets a correct answer.
+    """
+    try:
+        from tools.url_safety import redirect_target_from_response
+
+        return redirect_target_from_response(response)
+    except Exception:
+        pass
+    if not getattr(response, "is_redirect", False):
+        return None
+    location = (getattr(response, "headers", {}) or {}).get("location")
+    if location:
+        return urljoin(str(getattr(response, "url", "")), str(location))
+    next_request = getattr(response, "next_request", None)
+    return str(next_request.url) if next_request else None
+
+
+def _same_origin(a: str, b: str) -> bool:
+    """True when two absolute URLs share scheme, host and effective port.
+
+    Origin is the unit a credential is scoped to: a redirect that keeps scheme,
+    host and port may legitimately carry the same ``Authorization`` header, while
+    any change of those three is a new origin that must not see it.
+    """
+    parsed_a, parsed_b = urlparse(a), urlparse(b)
+
+    def _port(parsed: Any) -> Optional[int]:
+        if parsed.port is not None:
+            return parsed.port
+        scheme = (parsed.scheme or "").lower()
+        if scheme == "https":
+            return 443
+        if scheme == "http":
+            return 80
+        return None
+
+    return (
+        (parsed_a.scheme or "").lower(),
+        (parsed_a.hostname or "").lower(),
+        _port(parsed_a),
+    ) == (
+        (parsed_b.scheme or "").lower(),
+        (parsed_b.hostname or "").lower(),
+        _port(parsed_b),
+    )
+
+
+async def _fluxer_ssrf_redirect_guard(response: Any) -> None:
+    """Re-validate every redirect target (defence in depth behind the manual loop).
+
+    Async because httpx awaits response event hooks. A public URL that 302s to
+    ``http://169.254.169.254/`` would otherwise slip past the pre-flight
+    ``is_safe_url`` check.
+    """
+    target = _redirect_target(response)
+    if target:
+        from tools.url_safety import is_safe_url
+
+        if not is_safe_url(target):
+            raise ValueError(
+                f"Blocked redirect to private/internal address: {safe_url_for_log(target)}"
+            )
+
+
+async def _read_capped_body(response: Any, max_bytes: int) -> bytes:
+    """Read a streaming response body under ``max_bytes``.
+
+    Rejects an oversized ``Content-Length`` early, then re-checks the running total
+    per chunk so a lying or absent header cannot smuggle a larger body.
+    """
+    content_length = (getattr(response, "headers", {}) or {}).get("content-length")
+    if content_length:
+        try:
+            declared = int(content_length)
+        except (TypeError, ValueError):
+            declared = None
+        if declared is not None and declared > max_bytes:
+            raise ValueError(f"Fluxer attachment exceeds {max_bytes} bytes (declared {declared})")
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"Fluxer attachment exceeds {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _ssrf_safe_async_client_factory() -> tuple[Any, bool]:
+    """``(factory, guarded)`` for an async HTTP client.
+
+    Returns the host's connect-time SSRF-safe client (DNS is resolved, validated and
+    dialed by IP at connect time, closing the rebinding gap) and ``True``. On a host
+    without it the factory is ``None`` and ``guarded`` is ``False`` — the caller must
+    then FAIL CLOSED rather than substitute plain ``httpx.AsyncClient``, because a
+    plain client re-resolves the name at connect time and a rebinding hostname would
+    slip past the pre-flight check. A manual redirect walk does not close that gap;
+    only the connect-time guard does.
+    """
+    try:
+        from tools.url_safety import create_ssrf_safe_async_client
+
+        return create_ssrf_safe_async_client, True
+    except Exception:
+        return None, False
+
+
+def _message_has_attachments(data: Dict[str, Any]) -> bool:
+    """True when a message carries at least one attachment dict (metadata only).
+
+    Used to keep a media-only message eligible for admission WITHOUT fetching
+    anything, so no bytes move before the channel/mention gate has decided.
+    """
+    attachments = data.get("attachments")
+    if not isinstance(attachments, list):
+        return False
+    return any(isinstance(att, dict) and _attachment_url(att) for att in attachments)
 
 
 def _message_type_for_media(media_types: List[str]) -> MessageType:
@@ -655,6 +1168,72 @@ def _is_missing_channel_error(exc: BaseException) -> bool:
         body = str(getattr(response, "text", "") or "").lower()
         return "unknown channel" in body or "unknown thread" in body
     return False
+
+
+def _thread_already_exists_for_message(exc: BaseException) -> bool:
+    """True when Fluxer refused a thread start because the message already has one.
+
+    Fluxer anchors a thread to the message it was started from and the thread
+    carries that message's id, so this refusal *names* the existing thread. The
+    adapter's anchor map lives in memory only -- a restart, an evicted entry, or a
+    start that raced another send all reach here -- and reading the refusal as
+    "no thread" demotes the whole turn to the parent channel even though the
+    thread is already there.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    return "thread_already_created_for_message" in str(getattr(response, "text", "") or "").lower()
+
+
+def _is_reply_reference_rejected_error(exc: BaseException) -> bool:
+    """True when the send failed because the *reply reference* itself was refused.
+
+    Fluxer rejects a reference to a message it types as a system message (the
+    gateway's own progress bubbles arrive as ``type: 4``), answering
+    ``400 CANNOT_REPLY_TO_SYSTEM_MESSAGE`` with ``path: message_reference``. The
+    refusal is about the reference, never about the content, so re-sending the
+    identical payload cannot succeed: the reply has to go out without the
+    reference instead of being dropped.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    body = str(getattr(response, "text", "") or "").lower()
+    return "cannot_reply_to_system_message" in body
+
+
+def _is_text_command(text: str) -> bool:
+    """True when ``text`` is a gateway command typed as a plain message.
+
+    Fluxer registers no native application commands, so ``/new``, ``/help``,
+    ``/stop`` and ``/title`` arrive as ordinary text and the adapter's own
+    admission gate decides whether the command pipeline ever sees them. A leading
+    slash is how the host's ``MessageEvent.is_command()`` reads a command, and
+    this mirrors its two extra rules: a ``@botname`` suffix is allowed, and a name
+    containing ``/`` is not a command at all (a pasted path stays ordinary text).
+    """
+    stripped = str(text or "").lstrip()
+    if not stripped.startswith("/"):
+        return False
+    name = stripped.split(maxsplit=1)[0][1:].split("@", 1)[0]
+    return bool(name) and "/" not in name
+
+
+def _thread_id_from_session_key(session_key: Optional[str], platform: str) -> Optional[str]:
+    """The thread container a session key is bound to, or ``None``.
+
+    A thread-keyed session names its container in the ``chat_id`` slot
+    (``<ns>:<platform>:thread:<thread-id>[:<user>]``), so an operation that has only
+    the session key -- an approval prompt, a confirmation -- can still find the
+    thread the waiting turn lives in. Anything that is not a thread-keyed key for
+    this platform (a channel session, another platform) yields ``None``.
+    """
+    parts = str(session_key or "").split(":")
+    # <ns>:<platform>:<chat_type>:<chat_id>[:<user>]  (ns is always two slots)
+    if len(parts) < 5 or parts[2] != str(platform) or parts[3] != "thread":
+        return None
+    return parts[4] or None
 
 
 def _coerce_reply_to_mode(value: Any, default: str = _DEFAULT_REPLY_TO_MODE) -> str:
@@ -1120,6 +1699,23 @@ def _normalize_reaction_emoji(value: Any) -> str:
     return text.replace(_VARIATION_SELECTOR_16, "")
 
 
+def _normalize_approval_command(command: Any) -> str:
+    """Redact a command for comparison against the host's pending-approval snapshot.
+
+    The host stores the approval prompt's command already redacted; the runner hands
+    the adapter a *differently* redacted copy of the same string. Normalizing both
+    through the force-redactor (idempotent, verified) makes the two comparable without
+    ever holding a raw secret.
+    """
+    text = str(command or "")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text, force=True)
+    except Exception:
+        return text
+
+
 def _reaction_choice_map(specs: Any) -> Dict[str, str]:
     return {_normalize_reaction_emoji(emoji): choice for emoji, choice, _label in specs}
 
@@ -1160,7 +1756,22 @@ class FluxerAdapter(BasePlatformAdapter):
     # this keeps cron delivery from pre-truncating a multi-message report into a
     # single 4,000-codepoint payload. That old path could still exceed Fluxer's
     # 4,000 UTF-16-unit API limit when it contained astral emoji.
+    # Fluxer's message API counts UTF-16 code units and caps a message at 4,000
+    # of them, so the host's length contract must read this adapter's own cap and
+    # unit rather than its 4096-codepoint default.
+    MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     splits_long_messages = True
+
+    @property
+    def message_len_fn(self) -> Callable[[str], int]:
+        """Length unit Fluxer counts in (UTF-16 code units, not codepoints)."""
+        return utf16_len
+
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        return MAX_MESSAGE_LENGTH
+
+    def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
+        return utf16_len
 
     def __init__(self, config: PlatformConfig):
         _ensure_fluxer_platform_registered()
@@ -1264,9 +1875,59 @@ class FluxerAdapter(BasePlatformAdapter):
         # each creating its own.
         self._threads_by_anchor: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._threads_by_anchor_max = 1000
+        # One creator per anchor. Sends for a turn interleave, so without this two
+        # of them both miss the map above, both POST the same thread, and the
+        # loser's turn is demoted to the parent channel by the failure path.
+        self._thread_create_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        # Anchors with a send inside, or queued on, their creation lock. The lock
+        # map is bounded, and a bound that evicted a lock still in use would hand
+        # the next send a second lock for the same anchor -- two creators again,
+        # which is the duplicate this lock exists to prevent -- so eviction skips
+        # the anchors listed here.
+        self._thread_create_lock_users: Dict[tuple[str, str], int] = {}
         # Parent channel of every thread this adapter created, so a thread
         # inherits its parent's allowlist status and can seed mention memory.
+        # Only a thread the adapter owns lands here: a thread a human created
+        # must stay independent of the parent channel's session and access rules.
         self._thread_parents: Dict[str, str] = {}
+        # Whether each known thread is one THIS adapter opened. A bot-owned thread
+        # inherits its parent channel's free-response status (it is where the bot
+        # was addressed); a thread a human created must not, or the whole channel
+        # becomes reachable through a thread the operator never allowlisted.
+        self._thread_owners: Dict[str, bool] = {}
+        # Thread metadata read back from the API, so the parent/owner of a thread
+        # is resolved once per process rather than once per follow-up message.
+        # Cleared per thread when the thread is forgotten.
+        self._thread_info_cache: Dict[str, Dict[str, Any]] = {}
+        # Auto-thread anchors whose thread this adapter has not created yet:
+        # ``anchor message id`` -> ``parent channel id``. Fluxer gives a thread the
+        # id of the message it was started from, so the session container of the
+        # message that opens a thread IS that thread, and the reply, the typing
+        # indicator and the approval prompt all have to be routed to it --
+        # creating it on first use.
+        self._threads_pending: Dict[str, str] = {}
+        # Same-user active turns opened from parent channels. This is a narrow
+        # adapter-local index for parent-channel /stop only; it never changes the
+        # persisted per-user thread session key. Values count concurrent owners of
+        # each (parent, user, thread) tuple so one ending turn cannot erase another.
+        self._active_auto_threads: Dict[tuple[str, str], Dict[str, int]] = {}
+        # The kind of a channel id learned from the API (``thread`` / ``channel``).
+        # Fluxer's own MESSAGE_CREATE payload carries no ``channel_type`` and no
+        # nested channel object, so the raw event cannot classify itself; without
+        # this a follow-up typed inside a thread was read as a channel message and
+        # keyed to a different session than the turn that opened the thread.
+        self._channel_kinds: OrderedDict[str, str] = OrderedDict()
+        # Anchor message ids that must NOT open a thread of their own: a text
+        # command typed in a thread-enabled channel. The command addresses the turn
+        # already running in that chat, so threading its own message creates a
+        # container with no session behind it (live artefact: an active thread
+        # named ``/stop``).
+        self._no_thread_anchors: set = set()
+        # Containers delivery found deleted: the container to use instead. A
+        # deleted thread's id never comes back, so the redirect holds for the rest
+        # of the process and every later send for that turn lands in the parent
+        # instead of failing against the same missing thread.
+        self._dead_containers: Dict[str, str] = {}
         # Routing belongs to the executing event, not the channel's newest
         # message or the typing lifetime. Child tasks inherit the context;
         # queued turns rebind it when their processing actually begins.
@@ -1629,8 +2290,13 @@ class FluxerAdapter(BasePlatformAdapter):
             # Mention neutralization inserts zero-width characters. Apply it
             # before measuring so the final wire payload cannot cross Fluxer's
             # 4,000 UTF-16-unit limit after sanitization.
-            formatted = self._sanitize_outbound_mentions(self.format_message(content))
-            chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len)
+            formatted_source = self.format_message(content)
+            formatted, source_boundaries = _sanitize_mentions_with_source_map(self, formatted_source)
+            chunks, chunk_spans = split_message_with_source_spans(
+                formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len
+            )
+            raw_source = content if formatted_source == content else None
+            source_map = source_boundaries if raw_source is not None else None
             message_ids: List[str] = []
             responses: List[Dict[str, Any]] = []
 
@@ -1644,26 +2310,26 @@ class FluxerAdapter(BasePlatformAdapter):
                     chunk_payload.pop("message_reference", None)
 
                 try:
-                    data = await self._request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        json=chunk_payload,
+                    data = await self._post_chunk(
+                        chunk_payload, payload, target_chat_id, index,
+                        chat_id, reply_to, metadata, auto_thread_id,
                     )
-                except Exception as exc:
+                except _ThreadGone as gone:
                     # A thread this adapter chose can be deleted between the
                     # progress bubble and the reply. Abandon it and post to the
-                    # parent channel rather than losing the message.
-                    if not (auto_thread_id and _is_missing_channel_error(exc)):
-                        raise
+                    # parent channel rather than losing the message. For a
+                    # prospective thread the caller's chat_id IS the thread, so
+                    # the parent channel is the one recorded when it was opened.
                     logger.info(
                         "Fluxer thread %s is gone; falling back to channel %s",
-                        auto_thread_id,
-                        chat_id,
+                        gone.thread_id, gone.parent_chat,
                     )
-                    self._forget_thread(auto_thread_id)
+                    self._forget_thread(gone.thread_id)
                     self._disable_turn_thread(chat_id, reply_to, metadata)
+                    self._remember_dead_container(gone.thread_id, gone.parent_chat)
+                    self._remember_dead_container(chat_id, gone.parent_chat)
                     auto_thread_id = None
-                    target_chat_id = str(chat_id)
+                    target_chat_id = str(gone.parent_chat)
                     self._known_channel_ids.add(target_chat_id)
                     if reply_to and self._reply_to_mode != "off":
                         # Restore the reference in the shared payload as well: the
@@ -1675,11 +2341,38 @@ class FluxerAdapter(BasePlatformAdapter):
                         chunk_payload["message_reference"] = {"message_id": str(reply_to)}
                         if index > 0 and self._reply_to_mode != "all":
                             chunk_payload.pop("message_reference", None)
-                    data = await self._request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        json=chunk_payload,
-                    )
+                    try:
+                        data = await self._post_chunk(
+                            chunk_payload, payload, target_chat_id, index,
+                            chat_id, reply_to, metadata, None,
+                        )
+                    except Exception as exc:
+                        if message_ids:
+                            logger.warning(
+                                "Fluxer split send stopped after %d/%d chunks during channel fallback: %s",
+                                len(message_ids), len(chunks), exc,
+                            )
+                            return self._partial_split_result(
+                                exc, chunks, message_ids, responses,
+                                source_text=raw_source, chunk_spans=chunk_spans,
+                                source_boundaries=source_map,
+                            )
+                        raise
+                except Exception as exc:
+                    # Any other failure: if earlier chunks of this split already
+                    # landed, the failure is a PARTIAL delivery — the host must
+                    # never re-send the visible head, only the missing tail.
+                    if message_ids:
+                        logger.warning(
+                            "Fluxer split send stopped after %d/%d chunks: %s",
+                            len(message_ids), len(chunks), exc,
+                        )
+                        return self._partial_split_result(
+                            exc, chunks, message_ids, responses,
+                            source_text=raw_source, chunk_spans=chunk_spans,
+                            source_boundaries=source_map,
+                        )
+                    raise
                 responses.append(data)
                 if data.get("id"):
                     message_id = str(data["id"])
@@ -1696,27 +2389,231 @@ class FluxerAdapter(BasePlatformAdapter):
                     else:
                         responses[-1] = {**data, "delivery_verified": False}
 
+            # Split-payload contract: ``message_id`` is the LAST chunk (later edits
+            # target the newest bubble) and the earlier ones ride in
+            # ``continuation_message_ids`` in send order.
             return SendResult(
                 success=True,
-                message_id=message_ids[0] if message_ids else None,
+                message_id=message_ids[-1] if message_ids else None,
                 raw_response={"message_ids": message_ids, "responses": responses},
+                continuation_message_ids=tuple(message_ids[:-1]),
             )
         except Exception as exc:
             logger.warning("Fluxer send failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
+
+    async def _post_chunk(
+        self,
+        chunk_payload: Dict[str, Any],
+        shared_payload: Dict[str, Any],
+        target_chat_id: str,
+        index: int,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        auto_thread_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """POST one split chunk, absorbing the two recoverable refusals.
+
+        - A refused reply reference (``400 CANNOT_REPLY_TO_SYSTEM_MESSAGE``) names
+          the reference, never the content, so the identical retry can only fail
+          again: drop the reference — from the SHARED payload too, so no later
+          chunk re-sends it — and send on.
+        - A missing container (404 / unknown thread) on a thread this adapter
+          chose raises :class:`_ThreadGone` so the caller falls back to the parent
+          channel. Any other failure propagates unchanged: it is a real delivery
+          problem, not a redirect.
+        """
+        try:
+            return await self._request(
+                "POST",
+                f"/channels/{_quote_id(target_chat_id)}/messages",
+                json=chunk_payload,
+            )
+        except Exception as exc:
+            if _is_reply_reference_rejected_error(exc) and chunk_payload.get("message_reference"):
+                logger.info(
+                    "Fluxer refused the reply reference (%s); sending without it",
+                    type(exc).__name__,
+                )
+                shared_payload.pop("message_reference", None)
+                chunk_payload.pop("message_reference", None)
+                return await self._request(
+                    "POST",
+                    f"/channels/{_quote_id(target_chat_id)}/messages",
+                    json=chunk_payload,
+                )
+            if auto_thread_id and _is_missing_channel_error(exc):
+                parent_chat = (
+                    self._thread_parents.get(str(chat_id))
+                    or self._threads_pending.get(str(chat_id))
+                    or str(chat_id)
+                )
+                raise _ThreadGone(auto_thread_id, str(parent_chat), exc) from exc
+            raise
+
+    def _partial_split_result(
+        self,
+        exc: BaseException,
+        chunks: List[str],
+        message_ids: List[str],
+        responses: List[Dict[str, Any]],
+        *,
+        source_text: Optional[str] = None,
+        chunk_spans: Optional[List[tuple]] = None,
+        source_boundaries: Optional[List[int]] = None,
+    ) -> SendResult:
+        """A failure after some split chunks landed, marked ``partial_overflow``.
+
+        The host's retry ladder and stream consumer both read
+        ``raw_response["partial_overflow"]`` to avoid re-sending the visible head,
+        so the delivered ids and the prefix actually on screen travel with the
+        failure. ``message_id`` stays the LAST delivered chunk.
+        """
+        retryable, error_kind = _classify_send_failure(exc)
+        delivered_prefix = _delivered_source_prefix(
+            chunks, chunk_spans, len(message_ids), source_text, source_boundaries
+        )
+        return SendResult(
+            success=False,
+            message_id=message_ids[-1],
+            error=_error_text_for(exc),
+            retryable=retryable,
+            error_kind=error_kind,
+            continuation_message_ids=tuple(message_ids[:-1]),
+            raw_response={
+                "partial_overflow": True,
+                "delivered_chunks": len(message_ids),
+                "total_chunks": len(chunks),
+                "last_message_id": message_ids[-1],
+                "delivered_prefix": delivered_prefix,
+                "continuation_message_ids": tuple(message_ids[:-1]),
+                "message_ids": list(message_ids),
+                "responses": responses,
+            },
+        )
+
+    def _request_id_for_command(self, session_key: str, command: str) -> Optional[str]:
+        """The gateway request id this approval prompt belongs to, or ``None``.
+
+        ``send_exec_approval`` receives the runner's redacted command but NOT the
+        gateway ``request_id`` (the host's ``ExecApprovalPrompt`` carries no such
+        field). The host's public ``list_gateway_approvals(session_key)`` returns
+        snapshots of the session's unresolved approvals, each carrying its
+        ``request_id``. Match on the normalized command, but ONLY when exactly one
+        pending request matches: a unique match is safe, while an ambiguous one (two
+        identical commands queued) or an unavailable reader yields ``None`` — and an
+        unbound card resolves nothing at all, rather than falling back to the host's
+        FIFO order, which could resolve an unrelated pending request.
+        """
+        normalized = _normalize_approval_command(command)
+        try:
+            from tools.approval import list_gateway_approvals
+
+            pending = list_gateway_approvals(session_key) or []
+        except Exception:
+            return None
+        matches = [
+            entry
+            for entry in pending
+            if isinstance(entry, dict)
+            and entry.get("request_id")
+            and _normalize_approval_command(entry.get("command")) == normalized
+        ]
+        if len(matches) == 1:
+            return str(matches[0]["request_id"])
+        if len(matches) > 1:
+            logger.warning(
+                "Fluxer approval prompt has %d pending requests with an identical command; "
+                "not binding a request id (resolution stays FIFO)",
+                len(matches),
+            )
+        return None
+
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Render an exec-approval card natively (the host's contract override).
+
+        The host's ``BasePlatformAdapter.send_exec_approval`` builds an
+        ``ExecApprovalPrompt`` and calls this hook, which is what makes
+        ``supports_exec_approval_buttons()`` true for this adapter. Taking the prompt
+        object means the choice set is derived from ``prompt.actions`` — the host's
+        own allow_permanent / allow_session / smart_denied policy — instead of the
+        adapter inventing a full four-button row.
+        """
+        actions = list(getattr(prompt, "actions", None) or [])
+        if not actions:
+            actions = [("approve once", "once", "primary"), ("deny", "deny", "danger")]
+        return await self._post_approval_card(
+            chat_id=prompt.chat_id,
+            session_key=prompt.session_key,
+            command=prompt.command,
+            description=prompt.description,
+            metadata=getattr(prompt, "metadata", None),
+            reaction_specs=tuple(
+                (_EA_ACTION_EMOJI.get(choice, "•"), choice, label)
+                for label, choice, _style in actions
+            ),
+        )
 
     async def send_exec_approval(
         self,
         chat_id: str,
         command: str,
         session_key: str,
-        description: str = "dangerous command",
+        description: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
-        """Send a dangerous-command approval prompt with clickable reactions."""
-        target_id = str((metadata or {}).get("thread_id") or chat_id)
+        """Send a dangerous-command approval prompt with clickable reactions.
+
+        Signature matches ``BasePlatformAdapter.send_exec_approval`` so the runner's
+        ``**flags`` (``allow_permanent`` / ``allow_session`` / ``smart_denied``) are
+        honoured instead of raising ``TypeError``. The offered choices follow the
+        host's own policy, so a smart deny or a permanent-incapable prompt cannot be
+        escalated to a permanent approval from this surface.
+        """
+        specs = _exec_approval_choices(
+            allow_permanent=allow_permanent,
+            allow_session=allow_session,
+            smart_denied=smart_denied,
+        )
+        return await self._post_approval_card(
+            chat_id=chat_id,
+            session_key=session_key,
+            command=command,
+            description=description or "dangerous command",
+            metadata=metadata,
+            reaction_specs=specs,
+        )
+
+    async def _post_approval_card(
+        self,
+        *,
+        chat_id: str,
+        session_key: str,
+        command: str,
+        description: str,
+        metadata: Optional[Dict[str, Any]],
+        reaction_specs: tuple[tuple[str, str, str], ...],
+    ) -> SendResult:
+        """Post an exec-approval card and register its components + reactions.
+
+        The card is bound to the gateway ``request_id`` when exactly one pending
+        request matches its command. That binding is frozen BEFORE the first network
+        await (the thread container may have to be opened), because a request queued
+        while this card is being posted would otherwise be the one a later match
+        picks — binding a card to a request that arrived after it. When the id cannot
+        be determined safely the card is left unbound, and an unbound card resolves
+        nothing at all (never the host's FIFO order).
+        """
+        # Freeze the binding first: no await has happened yet, so the pending queue
+        # this match reads is the queue the card belongs to.
+        request_id = self._request_id_for_command(session_key, command)
+        target_id = await self._resolve_thread_container(chat_id, metadata, session_key)
         cmd_display = command if len(command) <= 3200 else command[:3197] + "..."
-        reaction_hint = " • ".join(f"{emoji} {label}" for emoji, _choice, label in _EXEC_APPROVAL_REACTIONS)
+        reaction_hint = " • ".join(f"{emoji} {label}" for emoji, _choice, label in reaction_specs)
         content = (
             "**Command approval required**\n"
             f"```\n{cmd_display}\n```\n"
@@ -1724,11 +2621,19 @@ class FluxerAdapter(BasePlatformAdapter):
             f"React: {reaction_hint}\n"
             "Reply with `/approve once`, `/approve session`, `/approve always`, or `/deny`."
         )
+        if not request_id:
+            # Say it on the card: this card cannot resolve anything, so the text
+            # commands are the only way to answer.
+            content = (
+                f"{content}\n\n"
+                "⚠️ This card could not be bound to a gateway request, so its buttons and "
+                "reactions will not resolve it — use the text commands above."
+            )
         try:
             self._known_channel_ids.add(target_id)
             buttons, component_actions = _fluxer_action_buttons(
                 prefix="fluxer_exec",
-                specs=_EXEC_APPROVAL_REACTIONS,
+                specs=reaction_specs,
                 danger_choice="deny",
             )
             data, components_enabled = await self._post_message_with_optional_components(
@@ -1746,8 +2651,11 @@ class FluxerAdapter(BasePlatformAdapter):
                 "created_at": time.time(),
                 "content": content,
                 "resolved": False,
+                "command": command,
+                "request_id": request_id,
             }
             self._pending_exec_approvals[message_id] = pending
+            self._prune_pending_cards()
             if components_enabled:
                 self._register_component_actions(
                     component_actions,
@@ -1755,20 +2663,23 @@ class FluxerAdapter(BasePlatformAdapter):
                     message_id=message_id,
                     session_key=session_key,
                     channel_id=target_id,
+                    request_id=request_id,
                 )
-            for emoji, choice, _label in _EXEC_APPROVAL_REACTIONS:
+            for emoji, choice, _label in reaction_specs:
                 self._pending_reaction_actions[f"{message_id}:{_normalize_reaction_emoji(emoji)}"] = {
                     "kind": "exec_approval",
                     "message_id": message_id,
                     "session_key": session_key,
                     "channel_id": target_id,
                     "choice": choice,
+                    "request_id": request_id,
+                    "created_at": time.time(),
                 }
                 await self._add_reaction(target_id, message_id, emoji)
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
             logger.warning("Fluxer exec approval prompt failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
 
     async def send_slash_confirm(
         self,
@@ -1780,7 +2691,7 @@ class FluxerAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a slash-command confirmation prompt with clickable reactions."""
-        target_id = str((metadata or {}).get("thread_id") or chat_id)
+        target_id = await self._resolve_thread_container(chat_id, metadata, session_key)
         content_message = (message or "").rstrip()
         if not re.search(r"/(?:approve|always|cancel)", content_message, flags=re.IGNORECASE):
             content_message = f"{content_message}\n\n_Text fallback: reply `/approve`, `/always`, or `/cancel`._"
@@ -1818,12 +2729,14 @@ class FluxerAdapter(BasePlatformAdapter):
                     "confirm_id": confirm_id,
                     "channel_id": target_id,
                     "choice": choice,
+                    "created_at": time.time(),
                 }
                 await self._add_reaction(target_id, message_id, emoji)
+            self._prune_pending_cards()
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
             logger.warning("Fluxer slash confirm prompt failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
 
     def _interaction_user_allowed(self, user_id: str) -> bool:
         if not user_id:
@@ -1857,11 +2770,24 @@ class FluxerAdapter(BasePlatformAdapter):
             target_chat_id = self._destination_for_message(message_id, chat_id)
             # Sanitize before measuring: neutralized mentions are one UTF-16
             # unit longer than their source syntax.
-            formatted = self._sanitize_outbound_mentions(self.format_message(content))
+            formatted_source = self.format_message(content)
+            formatted, source_boundaries = _sanitize_mentions_with_source_map(self, formatted_source)
+            raw_source = content if formatted_source == content else None
+            source_map = source_boundaries if raw_source is not None else None
             if utf16_len(formatted) > MAX_MESSAGE_LENGTH:
-                # Reuse the platform splitter's UTF-16 accounting so an emoji
-                # cannot make an apparently 4,000-character edit exceed the API
-                # limit. Keep the edit to one self-contained first chunk.
+                if finalize:
+                    # The FINAL edit holds the whole answer, so it must be split
+                    # across the preview plus continuations rather than truncated.
+                    # Truncating here delivered only the first chunk and reported
+                    # success, silently hiding the rest of the reply.
+                    return await self._edit_overflow_split(
+                        target_chat_id, message_id, formatted,
+                        source_text=raw_source, source_boundaries=source_map,
+                    )
+                # Mid-stream: truncate instead of splitting. Splitting creates
+                # continuation messages whose ids become the new edit target, and
+                # the next token chunk re-edits the full text into the continuation,
+                # triggering another split -> infinite duplication loop.
                 formatted = self.truncate_message(
                     formatted,
                     MAX_MESSAGE_LENGTH,
@@ -1893,7 +2819,90 @@ class FluxerAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.warning("Fluxer edit failed for message %s: %s", message_id, exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
+
+    async def _edit_overflow_split(
+        self,
+        target_chat_id: str,
+        message_id: str,
+        formatted: str,
+        *,
+        source_text: Optional[str] = None,
+        source_boundaries: Optional[List[int]] = None,
+    ) -> SendResult:
+        """Deliver an oversized FINAL edit: chunk 1 edits ``message_id``, the rest
+        are sent as continuations. Returns ``message_id=<last-id>`` +
+        ``continuation_message_ids``.
+
+        A continuation failure returns ``success=False`` with
+        ``raw_response["partial_overflow"]`` / ``delivered_prefix`` /
+        ``last_message_id`` so the host delivers only the missing tail instead of
+        treating the truncated preview as the whole answer.
+        """
+        chunks, chunk_spans = split_message_with_source_spans(
+            formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len
+        )
+        if len(chunks) <= 1:
+            chunks = [formatted]  # defensive: a single chunk just edits normally
+            chunk_spans = [(0, len(formatted))]
+        try:
+            data = await self._request(
+                "PATCH",
+                f"/channels/{_quote_id(target_chat_id)}/messages/{_quote_id(message_id)}",
+                json=self._outbound_message_payload(chunks[0]),
+            )
+        except Exception as exc:
+            logger.error("Fluxer overflow split: first-chunk edit failed: %s", exc)
+            return _failed_send_result(exc)
+        first_id = str(data.get("id") or message_id)
+        delivered_ids = [first_id]
+        delivered_chunks = [chunks[0]]
+        for chunk in chunks[1:]:
+            try:
+                data = await self._request(
+                    "POST",
+                    f"/channels/{_quote_id(target_chat_id)}/messages",
+                    json=self._outbound_message_payload(chunk),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Fluxer overflow split: stopped at %d/%d chunks delivered: %s",
+                    len(delivered_ids), len(chunks), exc,
+                )
+                retryable, error_kind = _classify_send_failure(exc)
+                delivered_prefix = _delivered_source_prefix(
+                    chunks, chunk_spans, len(delivered_ids), source_text,
+                    source_boundaries,
+                )
+                last_id = delivered_ids[-1]
+                return SendResult(
+                    success=False,
+                    message_id=last_id,
+                    error=_error_text_for(exc),
+                    retryable=retryable,
+                    error_kind=error_kind,
+                    continuation_message_ids=tuple(delivered_ids[:-1]),
+                    raw_response={
+                        "partial_overflow": True,
+                        "delivered_chunks": len(delivered_ids),
+                        "total_chunks": len(chunks),
+                        "last_message_id": last_id,
+                        "delivered_prefix": delivered_prefix,
+                        "continuation_message_ids": tuple(delivered_ids[:-1]),
+                    },
+                )
+            new_id = str(data.get("id") or "")
+            if new_id:
+                self._remember_message_destination(new_id, target_chat_id)
+                delivered_ids.append(new_id)
+            delivered_chunks.append(chunk)
+        last_id = delivered_ids[-1]
+        return SendResult(
+            success=True,
+            message_id=last_id,
+            continuation_message_ids=tuple(delivered_ids[:-1]),
+            raw_response={"message_ids": delivered_ids},
+        )
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a Fluxer message when gateway cleanup/ephemeral flows ask."""
@@ -2097,6 +3106,10 @@ class FluxerAdapter(BasePlatformAdapter):
                 self._turn_anchor.pop(turn_key, None)
         self._known_channel_ids.discard(tid)
         self._thread_parents.pop(tid, None)
+        self._thread_owners.pop(tid, None)
+        self._thread_info_cache.pop(tid, None)
+        self._threads_pending.pop(tid, None)
+        self._channel_kinds.pop(tid, None)
         self._mentioned_threads.pop(tid, None)
         for key in [k for k, v in self._threads_by_anchor.items() if v == tid]:
             self._threads_by_anchor.pop(key, None)
@@ -2146,15 +3159,51 @@ class FluxerAdapter(BasePlatformAdapter):
         # actual event, keeping ownership until final/footer/media delivery ends.
         marker = self._turn_context.set((event, session_key))
         key = self._turn_key(event.source.chat_id)
+        active_thread = self._register_active_auto_thread(event.source)
         try:
             await super()._process_message_background(event, session_key)
         finally:
             try:
                 await self.stop_typing(event.source.chat_id)
             finally:
+                if active_thread:
+                    self._unregister_active_auto_thread(*active_thread)
                 self._turn_anchor.pop(key, None)
                 self._turn_thread_disabled.discard(key)
                 self._turn_context.reset(marker)
+
+    def _register_active_auto_thread(self, source: Any) -> Optional[tuple[str, str, str]]:
+        """Track an executing bot auto-thread for same-user parent /stop routing."""
+        parent = str(getattr(source, "parent_chat_id", None) or "").strip()
+        user_id = str(getattr(source, "user_id", None) or "").strip()
+        thread_id = str(getattr(source, "chat_id", None) or "").strip()
+        if not (parent and user_id and thread_id and getattr(source, "chat_type", None) == "thread"):
+            return None
+        prospective = self._threads_pending.get(thread_id) == parent
+        if not prospective and self._thread_is_bot_owned(thread_id) is not True:
+            return None
+        key = (parent, user_id)
+        threads = self._active_auto_threads.setdefault(key, {})
+        threads[thread_id] = threads.get(thread_id, 0) + 1
+        return parent, user_id, thread_id
+
+    def _unregister_active_auto_thread(self, parent: str, user_id: str, thread_id: str) -> None:
+        key = (parent, user_id)
+        threads = self._active_auto_threads.get(key)
+        if not threads:
+            return
+        remaining = threads.get(thread_id, 0) - 1
+        if remaining > 0:
+            threads[thread_id] = remaining
+        else:
+            threads.pop(thread_id, None)
+        if not threads:
+            self._active_auto_threads.pop(key, None)
+
+    def _active_auto_thread_for_user(self, parent: str, user_id: str) -> Optional[str]:
+        """Return the unique active auto-thread, never an arbitrary last one."""
+        threads = self._active_auto_threads.get((str(parent), str(user_id))) or {}
+        return next(iter(threads)) if len(threads) == 1 else None
 
     def _pin_turn_anchor(self, chat_id: str, metadata=None) -> None:
         """Remember only the executing event or an explicit trigger."""
@@ -2175,6 +3224,10 @@ class FluxerAdapter(BasePlatformAdapter):
         self._known_channel_ids.add(thread_id)
         if parent_chat_id:
             self._thread_parents[thread_id] = str(parent_chat_id)
+        # This thread now exists, so it is no longer waiting to be created, and it
+        # is by definition one this adapter opened.
+        self._threads_pending.pop(thread_id, None)
+        self._remember_thread_owner(thread_id, True)
         # A thread this adapter created continues a conversation the bot was
         # already addressed in, so ordinary follow-ups in it belong to the bot.
         # Strict mention mode opts out and keeps requiring a fresh mention.
@@ -2185,44 +3238,136 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _start_thread_from_message(self, chat_id: str, message_id: str) -> Optional[str]:
         """Best-effort thread start from ``message_id``; ``None`` keeps the channel.
 
-        Thread creation must never cost a reply, so any failure falls back to the
-        parent channel and the message still lands. A thread already opened for
-        this (chat, message) pair is reused, so one turn's progress bubble and its
-        final reply share a thread rather than creating two.
+        Thread creation must never cost a reply, so a failure that leaves no thread
+        behind falls back to the parent channel and the message still lands. A
+        thread already opened for this (chat, message) pair is reused, so one
+        turn's progress bubble and its final reply share a thread rather than
+        creating two -- across interleaved sends, and across a restart, when the
+        thread exists on the server but this process no longer remembers it.
         """
         key = (str(chat_id), str(message_id))
+        # An anchor this adapter recorded as a command never opens a thread: the
+        # command addresses the turn already running in that chat, and a thread on
+        # its own message id would key a container with no session behind it.
+        if key in self._no_thread_anchors:
+            return None
         existing = self._threads_by_anchor.get(key)
         if existing:
             return existing
-        # Two-phase naming, same as Discord: the placeholder comes from the message
-        # that triggered the turn; the thread is renamed to the session title as
-        # soon as the session has one. The title is usually already there (the
-        # titler runs early in the turn, the thread is opened at send time), in
-        # which case the thread is born with its final name and no rename follows.
-        placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
-        author_id = self._inbound_author_by_message.get(str(message_id)) or None
-        title = await asyncio.to_thread(self._session_title_for_chat, str(chat_id), author_id)
-        thread_name = _collapse_thread_name(title or "") or placeholder
+        async with self._thread_creation_slot(key):
+            # Re-read under the lock: a concurrent send may have opened the thread
+            # while this one waited, and creation must not be repeated.
+            existing = self._threads_by_anchor.get(key)
+            if existing:
+                return existing
+            # Two-phase naming, same as Discord: the placeholder comes from the message
+            # that triggered the turn; the thread is renamed to the session title as
+            # soon as the session has one. The title is usually already there (the
+            # titler runs early in the turn, the thread is opened at send time), in
+            # which case the thread is born with its final name and no rename follows.
+            placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
+            author_id = self._inbound_author_by_message.get(str(message_id)) or None
+            title_chat_id = str(message_id)
+            title_parent_chat_id = str(chat_id) if title_chat_id != str(chat_id) else None
+            if title_parent_chat_id:
+                title = await asyncio.to_thread(
+                    self._session_title_for_chat, title_chat_id, author_id, title_parent_chat_id
+                )
+            else:
+                title = await asyncio.to_thread(self._session_title_for_chat, title_chat_id, author_id)
+            thread_name = _collapse_thread_name(title or "") or placeholder
+            # Whether the thread came from the server already existing rather than
+            # from a create here: only a thread this adapter created carries a name
+            # this adapter chose.
+            adopted = False
+            try:
+                data = await self.create_thread(
+                    str(chat_id), thread_name, message_id=str(message_id)
+                )
+            except Exception as exc:
+                if not _thread_already_exists_for_message(exc):
+                    logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
+                    return None
+                # The refusal names the thread: Fluxer anchors a thread to its
+                # message and gives it that message's id. Adopt it -- falling back
+                # to the channel here is what drops replies out of their thread.
+                adopted = True
+                logger.info(
+                    "Fluxer thread %s already exists for anchor %s; adopting it", message_id, message_id
+                )
+                data = {"id": str(message_id)}
+                server_name = await self._fetch_channel_name(str(message_id))
+                if server_name:
+                    data["name"] = server_name
+            thread_id = self._remember_thread_id(data, chat_id)
+            if thread_id:
+                self._threads_by_anchor[key] = thread_id
+                self._threads_by_anchor.move_to_end(key)
+                while len(self._threads_by_anchor) > self._threads_by_anchor_max:
+                    self._threads_by_anchor.popitem(last=False)
+                created_name = str((data or {}).get("name") or thread_name)
+                self._record_auto_thread(chat_id, thread_id, created_name, author_id)
+                if created_name != placeholder:
+                    self._note_renamed_thread(thread_id, created_name)
+                if not title:
+                    # Guard with the name this adapter would have given the thread,
+                    # never with the one an adopted thread already carries: there
+                    # ``created_name`` is the server's current name, which a human
+                    # may have chosen, and the guard is exactly what authorises the
+                    # overwrite -- so passing it would let the session title clobber
+                    # that human's choice.
+                    self._schedule_title_rename(
+                        title_chat_id, thread_id, thread_name if adopted else created_name,
+                        author_id, title_parent_chat_id,
+                    )
+            return thread_id
+
+    @contextlib.asynccontextmanager
+    async def _thread_creation_slot(self, key: tuple[str, str]) -> AsyncIterator[None]:
+        """Hold the per-anchor creation lock with the anchor marked in use.
+
+        The mark is taken *before* the lock is awaited, so a send still queued on
+        it pins the lock's entry as well, and released only when the critical
+        section ends. Without the mark the bounded map can evict the lock a send
+        is holding, handing the next send for that anchor a second lock.
+        """
+        users = self._thread_create_lock_users
+        users[key] = users.get(key, 0) + 1
         try:
-            data = await self.create_thread(
-                str(chat_id), thread_name, message_id=str(message_id)
-            )
-        except Exception as exc:
-            logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
-            return None
-        thread_id = self._remember_thread_id(data, chat_id)
-        if thread_id:
-            self._threads_by_anchor[key] = thread_id
-            self._threads_by_anchor.move_to_end(key)
-            while len(self._threads_by_anchor) > self._threads_by_anchor_max:
-                self._threads_by_anchor.popitem(last=False)
-            created_name = str((data or {}).get("name") or thread_name)
-            self._record_auto_thread(chat_id, thread_id, created_name, author_id)
-            if created_name != placeholder:
-                self._note_renamed_thread(thread_id, created_name)
-            if not title:
-                self._schedule_title_rename(chat_id, thread_id, created_name, author_id)
-        return thread_id
+            async with self._thread_create_lock(key):
+                yield
+        finally:
+            remaining = users.get(key, 1) - 1
+            if remaining > 0:
+                users[key] = remaining
+            else:
+                users.pop(key, None)
+
+    def _thread_create_lock(self, key: tuple[str, str]) -> asyncio.Lock:
+        """A stable per-anchor creation lock, bounded like the anchor map."""
+        lock = self._thread_create_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._thread_create_locks[key] = lock
+            self._evict_idle_thread_create_locks()
+        return lock
+
+    def _evict_idle_thread_create_locks(self) -> None:
+        """Drop the oldest idle per-anchor locks until the map is within its bound.
+
+        The map is insertion-ordered, so a bound that evicts purely on age can drop
+        the lock a send is still holding (or waiting on): the next send for that
+        anchor then builds a second lock and POSTs a second thread -- the duplicate
+        this lock exists to prevent. Anchors with a send in flight are skipped, so
+        the map may overshoot its bound while every candidate is busy and shrinks
+        again as those sends finish.
+        """
+        for key in list(self._thread_create_locks):
+            if len(self._thread_create_locks) <= self._threads_by_anchor_max:
+                return
+            if key in self._thread_create_lock_users:
+                continue
+            self._thread_create_locks.pop(key, None)
 
     # ── session-title naming for a thread this adapter opened ───────────────────
 
@@ -2292,7 +3437,10 @@ class FluxerAdapter(BasePlatformAdapter):
             )
         return None
 
-    def _session_title_for_chat(self, chat_id: str, user_id: Optional[str] = None) -> Optional[str]:
+    def _session_title_for_chat(
+        self, chat_id: str, user_id: Optional[str] = None,
+        fallback_chat_id: Optional[str] = None,
+    ) -> Optional[str]:
         """The triggering session's title for a chat, or ``None``.
 
         Reads the title back through Hermes' own session store: the gateway's
@@ -2311,16 +3459,26 @@ class FluxerAdapter(BasePlatformAdapter):
             chat_key = str(chat_id or "")
             if store is None or not chat_key:
                 return None
-            session_id = store.find_session_by_origin(
-                platform=str(self.platform.value), chat_id=chat_key,
-                user_id=str(user_id) if user_id else None,
-            )
-            if not session_id:
-                return None
-            if store.get_session_title_source(session_id) not in _TITLE_RENAME_SOURCES:
-                return None
-            title = store.get_session_title(session_id)
-            return str(title).strip() or None
+            def _title_for(origin_chat_id: str) -> tuple[bool, Optional[str]]:
+                session_id = store.find_session_by_origin(
+                    platform=str(self.platform.value), chat_id=origin_chat_id,
+                    user_id=str(user_id) if user_id else None,
+                )
+                if not session_id:
+                    return False, None
+                row = store.get_session(session_id) if hasattr(store, "get_session") else None
+                if user_id and row and str(row.get("user_id") or "") != str(user_id):
+                    return True, None
+                if store.get_session_title_source(session_id) not in _TITLE_RENAME_SOURCES:
+                    return True, None
+                title = store.get_session_title(session_id)
+                return True, str(title).strip() or None
+
+            anchor_exists, title = _title_for(chat_key)
+            if anchor_exists:
+                return title
+            fallback = str(fallback_chat_id or "").strip()
+            return _title_for(fallback)[1] if fallback and fallback != chat_key else None
         except Exception as exc:
             logger.debug("Fluxer session title lookup failed (%s)", type(exc).__name__)
             return None
@@ -2398,7 +3556,8 @@ class FluxerAdapter(BasePlatformAdapter):
                     logger.debug("Fluxer session store close failed: %s", type(exc).__name__)
 
     def _schedule_title_rename(
-        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None
+        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None,
+        fallback_chat_id: Optional[str] = None,
     ) -> None:
         """Watch for this session's title and rename ``thread_id`` when it appears."""
         key = str(thread_id)
@@ -2411,7 +3570,9 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         self._loop = loop
         task = loop.create_task(
-            self._rename_thread_when_titled(str(chat_id), key, str(placeholder), user_id)
+            self._rename_thread_when_titled(
+                str(chat_id), key, str(placeholder), user_id, fallback_chat_id=fallback_chat_id
+            )
         )
         self._title_tasks[key] = task
         task.add_done_callback(lambda _t, k=key: self._title_tasks.pop(k, None))
@@ -2425,7 +3586,8 @@ class FluxerAdapter(BasePlatformAdapter):
             evicted.cancel()
 
     async def _rename_thread_when_titled(
-        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None
+        self, chat_id: str, thread_id: str, placeholder: str, user_id: Optional[str] = None,
+        fallback_chat_id: Optional[str] = None,
     ) -> None:
         """Rename a thread to its session title, bounded by a wall-clock window.
 
@@ -2435,7 +3597,12 @@ class FluxerAdapter(BasePlatformAdapter):
         """
         deadline = time.monotonic() + _TITLE_RENAME_WINDOW_SECONDS
         while True:
-            title = await asyncio.to_thread(self._session_title_for_chat, chat_id, user_id)
+            if fallback_chat_id:
+                title = await asyncio.to_thread(
+                    self._session_title_for_chat, chat_id, user_id, fallback_chat_id
+                )
+            else:
+                title = await asyncio.to_thread(self._session_title_for_chat, chat_id, user_id)
             if title and title != placeholder:
                 try:
                     applied = await self.rename_thread(
@@ -2512,6 +3679,370 @@ class FluxerAdapter(BasePlatformAdapter):
                 self._auto_thread_by_session[session_key] = (cached_id, name)
 
 
+    async def _fetch_thread_info(self, thread_id: str) -> Dict[str, Any]:
+        """Read a channel's parent, owner and kind from the API.
+
+        Fluxer returns a thread as a channel whose ``parent_id`` is the channel it
+        hangs under; the thread's creator is the message author, so a thread the
+        bot opened can be told apart from one a human created. ``type`` is the same
+        channel-type integer ``_chat_type`` reads. The id itself is the anchor
+        message id, which the caller already knows, so only these fields are read.
+        """
+        data = await self._request("GET", f"/channels/{_quote_id(thread_id)}", warn_on_error=False)
+        info: Dict[str, Any] = {}
+        if isinstance(data, Mapping):
+            if data.get("type") is not None:
+                info["type"] = data["type"]
+            parent = data.get("parent_id") or data.get("parent_chat_id")
+            if parent:
+                info["parent_id"] = str(parent)
+            owner = data.get("owner_id") or data.get("ownerId")
+            if owner is not None:
+                info["owner_id"] = str(owner)
+        return info
+
+    def _remember_channel_kind(self, channel_id: str, info: Mapping[str, Any]) -> None:
+        """Cache a channel id's kind from an API read, bounded like the other maps."""
+        cid = str(channel_id or "").strip()
+        if not cid or info.get("type") is None:
+            return
+        self._channel_kinds[cid] = _chat_type(info.get("type"))
+        self._channel_kinds.move_to_end(cid)
+        while len(self._channel_kinds) > self._threads_by_anchor_max:
+            self._channel_kinds.popitem(last=False)
+
+    async def _resolve_channel_kind(self, channel_id: str) -> Optional[str]:
+        """The kind of ``channel_id`` (``thread`` / ``channel`` / ``dm``), or ``None``.
+
+        An event that classifies itself (``channel_type``, or a nested channel
+        object) never reaches here. Fluxer's real MESSAGE_CREATE carries neither, so
+        the kind is learned from the API once and remembered; a lookup that fails
+        returns ``None`` and the caller keeps the event exactly as it arrived rather
+        than guessing "channel" and splitting the session.
+        """
+        cid = str(channel_id or "").strip()
+        if not cid:
+            return None
+        known = self._channel_kinds.get(cid)
+        if known is not None:
+            return known
+        # A thread this adapter opened already names its kind and its parent.
+        if cid in self._thread_parents or self._thread_is_bot_owned(cid) is not None:
+            self._remember_channel_kind(cid, {"type": 11})
+            return "thread"
+        if self._threads_pending.get(cid):
+            return "thread"
+        info = await self._resolve_thread_info(cid)
+        if info.get("type") is None:
+            return None
+        return self._channel_kinds.get(cid)
+
+    async def _resolve_thread_info(self, thread_id: str, *, expect_thread: bool = False) -> Dict[str, Any]:
+        """Cached ``_fetch_thread_info``; a failed lookup is never cached.
+
+        ``expect_thread`` states that the caller already knows the channel is a
+        thread (its message arrived in one). Only then is a parent recorded when the
+        API read omits ``type``: the plain kind-resolution path must not mistake a
+        text channel's category for a parent channel.
+        """
+        tid = str(thread_id or "").strip()
+        if not tid:
+            return {}
+        cached = self._thread_info_cache.get(tid)
+        if cached is not None:
+            return cached
+        try:
+            info = await self._fetch_thread_info(tid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A lookup failure must not invent a parent, and must not cost the
+            # message: leave the thread exactly as it arrived and try again later.
+            logger.debug("Fluxer thread info lookup failed for %s (%s)", tid, type(exc).__name__)
+            return {}
+        if not isinstance(info, Mapping):
+            return {}
+        info = dict(info)
+        # The kind comes first: a thread this adapter did not open must be decided
+        # BEFORE its parent is recorded, or an unknown-owner thread would inherit
+        # the parent channel's hard allowlist the moment the parent is cached.
+        self._remember_channel_kind(tid, info)
+        owner = info.get("owner_id")
+        owned = self._thread_is_bot_owned(tid)
+        if owner is not None and self.bot_user_id is not None:
+            owned = str(owner) == str(self.bot_user_id)
+            self._thread_owners[tid] = owned
+            # A thread this adapter opened is one the bot was addressed in, so its
+            # ordinary follow-ups belong to the bot -- the same rule the create path
+            # applies. Learning it here is what keeps a cold restart from turning the
+            # bot's own thread into a mention-gated drop zone.
+            if owned and not self._strict_mention:
+                self._remember_mentioned_thread(tid)
+        # The parent is recorded for a THREAD only, and only when the API read says
+        # the channel is one. This method is also reached from channel *kind*
+        # resolution, where ``parent_id`` is a category rather than a parent
+        # channel; caching that in the map the thread fallbacks read would send a
+        # fallback to a category. Inheritance of the parent's admission rules is a
+        # separate decision, gated on confirmed ownership in
+        # ``_should_process_message``.
+        parent = info.get("parent_id")
+        known_thread = expect_thread or self._channel_kinds.get(tid) == "thread"
+        if parent and known_thread:
+            self._thread_parents[tid] = str(parent)
+        elif known_thread:
+            self._thread_parents.pop(tid, None)
+        self._thread_info_cache[tid] = info
+        # Bounded like the other per-adapter caches: a long-lived process must not
+        # grow one entry per thread it has ever seen.
+        if len(self._thread_info_cache) > self._threads_by_anchor_max:
+            self._thread_info_cache.pop(next(iter(self._thread_info_cache)), None)
+        return info
+
+    def _remember_thread_owner(self, thread_id: str, owned: bool) -> None:
+        """Record whether ``thread_id`` is a thread this adapter opened."""
+        tid = str(thread_id or "").strip()
+        if tid:
+            self._thread_owners[tid] = bool(owned)
+
+    def _remember_no_thread_anchor(self, chat_id: str, anchor: str) -> None:
+        """Mark ``(chat_id, anchor)`` as a turn that must never open a thread.
+
+        A text command addresses the turn already running in its chat, so the
+        container it resolves to is that chat -- not a thread opened on the
+        command's own message id. The anchor is recorded because the typing
+        indicator and the reply both derive their container from the turn anchor,
+        and each would otherwise open a thread of its own for the command.
+        """
+        key = (str(chat_id or ""), str(anchor or ""))
+        if not key[0] or not key[1]:
+            return
+        self._no_thread_anchors.add(key)
+        while len(self._no_thread_anchors) > self._threads_by_anchor_max:
+            self._no_thread_anchors.pop()
+
+    def _remember_dead_container(self, container_id: str, fallback: str) -> None:
+        """Redirect every later send for a deleted container to ``fallback``.
+
+        A deleted thread's id never comes back, so recording the redirect is what
+        keeps the rest of the turn (and the typing indicator) from re-addressing
+        the same missing thread and failing.
+        """
+        cid = str(container_id or "").strip()
+        target = str(fallback or "").strip()
+        if not cid or not target or cid == target:
+            return
+        self._dead_containers[cid] = target
+        while len(self._dead_containers) > self._threads_by_anchor_max:
+            self._dead_containers.pop(next(iter(self._dead_containers)), None)
+
+    def _thread_is_bot_owned(self, thread_id: str) -> Optional[bool]:
+        """Whether ``thread_id`` is the bot's own thread, or ``None`` if unknown."""
+        return self._thread_owners.get(str(thread_id or ""))
+
+    async def _resolve_thread_source(
+        self, data: Dict[str, Any], channel_id: str, chat_type: str
+    ) -> tuple[str, str, Optional[str], Optional[str]]:
+        """Normalize an inbound message to one routing contract.
+
+        Returns ``(chat_id, chat_type, parent_chat_id, pending_parent)``.
+
+        A message that arrives in a thread is keyed on that thread's own id in the
+        ``chat_id`` slot with no thread slot -- the shape the host derives for a
+        platform whose threads are separate chat containers (Discord), and the shape
+        this deployment's persisted Fluxer thread sessions already use. The parent
+        channel travels in ``parent_chat_id`` for admission and profile routing.
+
+        A channel message that will open a thread is keyed on the anchor message id
+        -- the id Fluxer will give the thread -- so the turn that opens a thread and
+        every follow-up inside it derive ONE session key. The thread itself is not
+        created here: creating it is a send-time decision, and a turn that never
+        delivers must not leave an empty thread behind. ``pending_parent`` names the
+        channel the thread must be created under when the first send happens, and is
+        only registered once the message has been admitted.
+        """
+        if chat_type == "dm":
+            return channel_id, chat_type, None, None
+        if chat_type == "thread":
+            # Parent/owner come from the create that opened the thread, or are read
+            # back once after a restart; an unresolvable thread keeps its own id.
+            # The parent is reported whatever the owner is -- the host uses it for
+            # profile routing and branching -- while inheritance of the parent's
+            # admission rules stays gated on confirmed ownership in
+            # ``_should_process_message``.
+            parent = self._thread_parents.get(str(channel_id))
+            if parent is None:
+                info = await self._resolve_thread_info(channel_id, expect_thread=True)
+                parent = info.get("parent_id")
+            return channel_id, chat_type, (str(parent) if parent else None), None
+        if chat_type == "channel" and _is_text_command(str(data.get("content") or "")):
+            command = str(data.get("content") or "").lstrip().split(maxsplit=1)[0]
+            command_name = command[1:].split("@", 1)[0].lower()
+            if command_name == "stop":
+                user_id = str((data.get("author") or data.get("user") or {}).get("id")
+                              or data.get("author_id") or "").strip()
+                active_thread = self._active_auto_thread_for_user(str(channel_id), user_id)
+                if active_thread:
+                    return active_thread, "thread", str(channel_id), None
+                if user_id and self._active_auto_threads.get((str(channel_id), user_id)):
+                    logger.warning(
+                        "Fluxer parent-channel /stop is ambiguous for user %s in %s; "
+                        "leaving it on the parent channel",
+                        user_id, channel_id,
+                    )
+                    return channel_id, chat_type, None, None
+            # Other commands retain their existing parent-channel semantics.
+            anchor = str(data.get("id") or "").strip()
+            if anchor:
+                self._remember_no_thread_anchor(channel_id, anchor)
+            return channel_id, chat_type, None, None
+        if not self._thread_replies_enabled_for(channel_id):
+            return channel_id, chat_type, None, None
+        # A plain-text command addresses the turn already running in this chat, so
+        # it keeps the channel's session: auto-threading it would key it on the
+        # command's own message id and the stop would never reach its target. The
+        # anchor is recorded as never-threadable so the typing indicator and the
+        # reply -- which both resolve their container from the turn anchor -- do not
+        # open a thread on the command's own message either.
+        if _is_text_command(str(data.get("content") or "")):
+            anchor = str(data.get("id") or "").strip()
+            if anchor:
+                self._remember_no_thread_anchor(channel_id, anchor)
+            return channel_id, chat_type, None, None
+        if not self._thread_replies_enabled_for(channel_id):
+            return channel_id, chat_type, None, None
+        anchor = str(data.get("id") or "").strip()
+        if not anchor:
+            return channel_id, chat_type, None, None
+        # Bounded: a channel that never delivers must not leak one entry per message.
+        if len(self._threads_pending) > self._threads_by_anchor_max:
+            self._threads_pending.pop(next(iter(self._threads_pending)), None)
+        return anchor, "thread", str(channel_id), str(channel_id)
+
+    def _classify_untyped_event(self, channel_id: str) -> Optional[str]:
+        """Kind of ``channel_id`` from state already in hand, else ``None``.
+
+        Fluxer's own MESSAGE_CREATE payload carries no ``channel_type`` and no nested
+        channel object, so a raw event cannot classify itself. Everything the adapter
+        has *learned* about the id -- a thread it opened, a thread it is about to
+        open, a kind a previous lookup recorded -- decides it here with no I/O.
+        """
+        cid = str(channel_id or "").strip()
+        if not cid:
+            return None
+        known = self._channel_kinds.get(cid)
+        if known is not None:
+            return known
+        if cid in self._thread_parents or self._thread_is_bot_owned(cid) is not None:
+            return "thread"
+        if self._threads_pending.get(cid):
+            return "thread"
+        # Explicit channel configuration is sufficient evidence for a parent
+        # channel. It avoids a cold-start API read without guessing about arbitrary
+        # untyped ids when the lookup is unavailable.
+        known_channels = (
+            self._thread_reply_channels | self._free_response_channels | self._home_channel_ids
+            | self._allowed_channel_ids | self._mention_gated_channels
+        )
+        if cid in known_channels:
+            return "channel"
+        return None
+
+    def _typing_target_sync(self, chat_id: str, metadata=None) -> tuple[str, bool]:
+        """``(container, needs_creation)`` for a typing indicator.
+
+        A turn whose session is a thread delivers into that thread, so the indicator
+        has to refresh the thread -- a parent-channel indicator is what a user
+        watching the thread sees as "nothing happening". A prospective thread that
+        does not exist yet reports ``needs_creation``; the caller opens it first.
+
+        Precedence matches the delivery resolver: an explicit container wins, then a
+        container this adapter already knows, then the prospective thread this turn
+        will open, then the caller's chat id.
+        """
+        cid = str(chat_id or "")
+        if not cid:
+            return "", False
+        # A container delivery already found deleted is never addressed again.
+        redirect = self._dead_containers.get(cid)
+        if redirect:
+            return str(redirect), False
+        explicit = str((metadata or {}).get("thread_id") or "").strip()
+        if explicit:
+            return explicit, False
+        # Already a container of its own: a thread the adapter opened, or a thread
+        # whose parent/owner is known. Post straight into it.
+        if cid in self._thread_parents or self._thread_is_bot_owned(cid) is not None:
+            return cid, False
+        # The chat id IS a not-yet-created thread's anchor: the thread to open is
+        # this container, under the parent recorded when the message was admitted.
+        if self._threads_pending.get(cid):
+            return cid, True
+        # A channel: the thread this turn will deliver into, if thread replies apply.
+        anchor = self._turn_key(cid, metadata=metadata)[1]
+        if not anchor:
+            return cid, False
+        existing = self._threads_by_anchor.get((cid, anchor))
+        if existing:
+            return existing, False
+        if self._no_thread_anchors and (cid, anchor) in self._no_thread_anchors:
+            return cid, False
+        if self._threads_pending.get(cid) == anchor or self._thread_replies_enabled_for(cid):
+            return anchor, True
+        return cid, False
+
+    async def _typing_target(self, chat_id: str, metadata=None) -> str:
+        """The container a typing indicator for this turn belongs in."""
+        target, needs_creation = self._typing_target_sync(chat_id, metadata)
+        if not needs_creation:
+            return target or str(chat_id)
+        parent = (
+            self._threads_pending.get(target)
+            or self._threads_pending.get(str(chat_id))
+            or str(chat_id)
+        )
+        created = await self._start_thread_from_message(str(parent), target)
+        # A thread that could not be opened is not a container: refresh the parent
+        # channel rather than posting a typing indicator at a channel that is not
+        # there (the prospective id names a thread that does not exist yet).
+        return created or str(parent)
+
+    async def _resolve_thread_container(
+        self, chat_id: str, metadata=None, session_key: Optional[str] = None
+    ) -> str:
+        """The container a non-message operation (approval, confirm) belongs in.
+
+        An explicit ``thread_id`` wins. A container delivery already found deleted
+        is redirected to its parent. Otherwise a session keyed on a thread names
+        its container in the key itself, so an approval prompt posted while a
+        thread-keyed turn is waiting for input lands in that thread -- and a thread
+        that does not exist yet is created under its parent first. A creation that
+        fails falls back to the parent channel: aiming the prompt at a container
+        that is not there 404s, and the waiting turn can then never be answered.
+        """
+        explicit = str((metadata or {}).get("thread_id") or "").strip()
+        if explicit:
+            return explicit
+        redirect = self._dead_containers.get(str(chat_id))
+        if redirect:
+            return str(redirect)
+        candidate = _thread_id_from_session_key(session_key, str(self.platform.value))
+        if candidate:
+            redirect = self._dead_containers.get(str(candidate))
+            if redirect:
+                return str(redirect)
+            pending_parent = self._threads_pending.get(candidate)
+            if pending_parent:
+                created = await self._start_thread_from_message(str(pending_parent), candidate)
+                # The parent is where the prompt has to land when the thread could
+                # not be opened: a prospective id names a channel that does not exist.
+                return created or str(pending_parent)
+            return candidate
+        pending_parent = self._threads_pending.get(str(chat_id))
+        if pending_parent:
+            created = await self._start_thread_from_message(str(pending_parent), str(chat_id))
+            return created or str(pending_parent)
+        return str(chat_id)
+
     async def _resolve_outbound_target(
         self,
         chat_id: str,
@@ -2534,25 +4065,60 @@ class FluxerAdapter(BasePlatformAdapter):
         auto_thread_id: Optional[str] = None
         explicit_thread_id = str((metadata or {}).get("thread_id") or "").strip()
         started_thread = False
-        if explicit_thread_id:
+        # A container delivery already found deleted is never addressed again: the
+        # redirect is what keeps the rest of the turn in the parent channel instead
+        # of failing against the same missing thread.
+        dead_redirect = self._dead_containers.get(str(chat_id))
+        if dead_redirect:
+            target_chat_id = str(dead_redirect)
+        elif explicit_thread_id:
             target_chat_id = explicit_thread_id
-        elif self._thread_replies_enabled_for(chat_id) and self._turn_key(chat_id, reply_to, metadata) not in self._turn_thread_disabled:
-            # The gateway sets ``reply_to`` only for a few platforms and supplies
-            # no thread id for Fluxer. Prefer the trigger in hand, then the anchor
-            # pinned when this turn started -- the channel's latest inbound message
-            # can move while a reply is still being produced, and using it here
-            # would split one turn across two threads.
-            anchor = self._turn_key(chat_id, reply_to, metadata)[1]
-            if anchor:
-                new_thread_id = await self._start_thread_from_message(chat_id, anchor)
-                if new_thread_id:
-                    target_chat_id = new_thread_id
-                    auto_thread_id = new_thread_id
-                    started_thread = True
+        elif str(chat_id) in self._thread_parents or self._thread_is_bot_owned(str(chat_id)) is not None:
+            # The caller's chat id IS a thread this adapter already opened. It has to
+            # count as an auto-chosen container, not a plain channel: a thread opened
+            # earlier in the turn (by the typing indicator or a progress send) can be
+            # deleted before the reply, and only an ``auto_thread_id`` gets the
+            # parent-channel fallback instead of a failed send.
+            target_chat_id = str(chat_id)
+            auto_thread_id = str(chat_id)
+        else:
+            turn_key = self._turn_key(chat_id, reply_to, metadata)
+            anchor = turn_key[1]
+            # A prospective thread: the session container IS the anchor message, and
+            # Fluxer will give the thread that same id, so creating it here is what
+            # puts the reply inside the thread the session was keyed on. A creation
+            # failure still has to deliver, so it falls back to the parent channel.
+            pending_parent = self._threads_pending.get(str(chat_id))
+            if pending_parent:
+                if turn_key in self._turn_thread_disabled:
+                    target_chat_id = str(pending_parent)
                 else:
-                    # Choosing the parent is a turn-level decision, including
-                    # a failed/empty creation response, not just deleted threads.
-                    self._disable_turn_thread(chat_id, reply_to, metadata)
+                    new_thread_id = await self._start_thread_from_message(str(pending_parent), str(chat_id))
+                    if new_thread_id:
+                        target_chat_id = new_thread_id
+                        auto_thread_id = new_thread_id
+                        started_thread = True
+                    else:
+                        self._disable_turn_thread(chat_id, reply_to, metadata)
+                        target_chat_id = str(pending_parent)
+            elif self._thread_replies_enabled_for(chat_id) and turn_key not in self._turn_thread_disabled:
+                # The gateway sets ``reply_to`` only for a few platforms and supplies
+                # no thread id for Fluxer. Prefer the trigger in hand, then the anchor
+                # pinned when this turn started -- the channel's latest inbound message
+                # can move while a reply is still being produced, and using it here
+                # would split one turn across two threads. An anchor this adapter
+                # recorded as a command keeps the channel: a thread opened on the
+                # command's own message keys the reply to a session with no run.
+                if anchor and (chat_id, anchor) not in self._no_thread_anchors:
+                    new_thread_id = await self._start_thread_from_message(chat_id, anchor)
+                    if new_thread_id:
+                        target_chat_id = new_thread_id
+                        auto_thread_id = new_thread_id
+                        started_thread = True
+                    else:
+                        # Choosing the parent is a turn-level decision, including
+                        # a failed/empty creation response, not just deleted threads.
+                        self._disable_turn_thread(chat_id, reply_to, metadata)
         # A thread started from the triggering message already carries the parent
         # context, so a second reference inside it is redundant.
         if reply_to and self._reply_to_mode != "off" and not started_thread:
@@ -2652,12 +4218,16 @@ class FluxerAdapter(BasePlatformAdapter):
         self._pin_turn_anchor(chat_id, metadata)
         if chat_key in self._typing_tasks:
             return
+        # The indicator belongs to the container the turn delivers into, so resolve
+        # it through the same resolver as delivery -- opening the prospective thread
+        # if it does not exist yet, rather than refreshing the parent channel.
+        target = await self._typing_target(chat_id, metadata)
 
         async def _typing_loop() -> None:
             try:
                 while True:
                     try:
-                        await self._request("POST", f"/channels/{_quote_id(chat_id)}/typing", json={})
+                        await self._request("POST", f"/channels/{_quote_id(target)}/typing", json={})
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -2696,7 +4266,7 @@ class FluxerAdapter(BasePlatformAdapter):
             return await self.send_image_file(chat_id, cached, caption=caption, reply_to=reply_to, metadata=metadata)
         except Exception as exc:
             logger.warning("Fluxer image URL upload failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
 
     async def send_image_file(
         self,
@@ -2828,29 +4398,54 @@ class FluxerAdapter(BasePlatformAdapter):
                     files=[("files[0]", path, filename)],
                 )
             except Exception as exc:
-                # Same deleted-thread fallback as text sends: an upload must not
-                # fail just because the thread this adapter chose was removed.
-                if not (auto_thread_id and _is_missing_channel_error(exc)):
+                if _is_reply_reference_rejected_error(exc) and payload.get("message_reference"):
+                    # Same refusal as text sends, and the same answer: the
+                    # reference is what Fluxer rejected, so the upload goes out
+                    # without it rather than being lost.
+                    logger.info(
+                        "Fluxer refused the reply reference (%s); uploading without it",
+                        type(exc).__name__,
+                    )
+                    payload.pop("message_reference", None)
+                    data = await self._multipart_request(
+                        "POST",
+                        f"/channels/{_quote_id(target_chat_id)}/messages",
+                        payload=payload,
+                        files=[("files[0]", path, filename)],
+                    )
+                elif auto_thread_id and _is_missing_channel_error(exc):
+                    # Same deleted-thread fallback as text sends: an upload must
+                    # not fail just because the thread this adapter chose was
+                    # removed. The parent channel is the fallback for a prospective
+                    # thread, whose caller-side chat_id IS the thread.
+                    fallback_chat = (
+                        self._thread_parents.get(str(chat_id))
+                        or self._threads_pending.get(str(chat_id))
+                        or str(chat_id)
+                    )
+                    logger.info(
+                        "Fluxer thread %s is gone; uploading to channel %s instead",
+                        auto_thread_id,
+                        fallback_chat,
+                    )
+                    self._forget_thread(auto_thread_id)
+                    self._disable_turn_thread(chat_id, reply_to, metadata)
+                    self._remember_dead_container(auto_thread_id, fallback_chat)
+                    self._remember_dead_container(chat_id, fallback_chat)
+                    auto_thread_id = None
+                    target_chat_id = str(fallback_chat)
+                    self._known_channel_ids.add(target_chat_id)
+                    payload.pop("message_reference", None)
+                    if reply_to and self._reply_to_mode != "off":
+                        payload["message_reference"] = {"message_id": str(reply_to)}
+                    data = await self._multipart_request(
+                        "POST",
+                        f"/channels/{_quote_id(target_chat_id)}/messages",
+                        payload=payload,
+                        files=[("files[0]", path, filename)],
+                    )
+                else:
                     raise
-                logger.info(
-                    "Fluxer thread %s is gone; uploading to channel %s instead",
-                    auto_thread_id,
-                    chat_id,
-                )
-                self._forget_thread(auto_thread_id)
-                self._disable_turn_thread(chat_id, reply_to, metadata)
-                auto_thread_id = None
-                target_chat_id = str(chat_id)
-                self._known_channel_ids.add(target_chat_id)
-                payload.pop("message_reference", None)
-                if reply_to and self._reply_to_mode != "off":
-                    payload["message_reference"] = {"message_id": str(reply_to)}
-                data = await self._multipart_request(
-                    "POST",
-                    f"/channels/{_quote_id(target_chat_id)}/messages",
-                    payload=payload,
-                    files=[("files[0]", path, filename)],
-                )
             message_id = str(data.get("id")) if data.get("id") else None
             # Edits/deletes must target the thread, not the caller's channel.
             self._remember_message_destination(message_id, target_chat_id)
@@ -2867,7 +4462,7 @@ class FluxerAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id, raw_response=raw_response)
         except Exception as exc:
             logger.warning("Fluxer file upload failed: %s", exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return _failed_send_result(exc)
 
     async def _verify_delivery(
         self,
@@ -2955,6 +4550,7 @@ class FluxerAdapter(BasePlatformAdapter):
         channel_id: str,
         session_key: str,
         confirm_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> None:
         """Register Fluxer native button custom IDs for a pending prompt."""
         for custom_id, choice in actions:
@@ -2964,10 +4560,41 @@ class FluxerAdapter(BasePlatformAdapter):
                 "session_key": session_key,
                 "channel_id": channel_id,
                 "choice": choice,
+                "created_at": time.time(),
             }
             if confirm_id is not None:
                 state["confirm_id"] = confirm_id
+            if request_id is not None:
+                state["request_id"] = request_id
             self._pending_component_actions[custom_id] = state
+        self._prune_pending_cards()
+
+    def _prune_pending_cards(self) -> None:
+        """Drop pending approval/confirm cards past the host's approval TTL.
+
+        A card left registered after its gateway request can no longer be answered
+        (turn ended, request timed out) must not linger: it would keep a stale button
+        live and, worse, a later tap could resolve an unrelated pending request. This
+        only prunes the adapter's own maps — it never resolves or denies anything, so
+        the host's own approval timeout remains the sole authority on the request.
+        """
+        ttl = _approval_card_ttl()
+        now = time.time()
+        for mapping in (
+            self._pending_exec_approvals,
+            self._pending_component_actions,
+            self._pending_reaction_actions,
+        ):
+            for key, state in list(mapping.items()):
+                if not isinstance(state, dict):
+                    continue
+                created = state.get("created_at")
+                try:
+                    created_at = float(created) if created is not None else None
+                except (TypeError, ValueError):
+                    created_at = None
+                if created_at is not None and now - created_at > ttl:
+                    mapping.pop(key, None)
 
     async def _post_message_with_optional_components(
         self,
@@ -3102,23 +4729,79 @@ class FluxerAdapter(BasePlatformAdapter):
                     pass
 
     async def _download_attachment_bytes(self, url: str) -> bytes:
+        """Fetch attachment bytes with SSRF, redirect and size protection.
+
+        A pre-flight ``is_safe_url`` alone is not enough: the previous version then
+        used a plain ``httpx.AsyncClient(follow_redirects=True)`` and returned
+        ``response.content`` unbounded, so (a) a public URL that redirected to a
+        private/internal address was followed without re-validation, (b) DNS could
+        be rebound between the check and the connect, and (c) a hostile or merely
+        huge body was buffered fully into memory. Now the host's connect-time
+        SSRF-safe client is required (an absent guard fails closed), every redirect
+        is re-validated (manually, so each hop is checked before it is followed),
+        the body is read under the host's inbound-media cap, and the ``Authorization``
+        header is dropped the moment a hop leaves the API origin.
+        """
         try:
-            import httpx
+            import httpx  # noqa: F401
             from tools.url_safety import is_safe_url
         except ImportError as exc:
             raise RuntimeError("httpx and url safety helpers are required for Fluxer attachments") from exc
 
         if not is_safe_url(url):
             raise ValueError(f"Blocked unsafe Fluxer attachment URL: {safe_url_for_log(url)}")
+        factory, guarded = _ssrf_safe_async_client_factory()
+        if not guarded or factory is None:
+            # No connect-time guard means the pre-flight check can be defeated by a
+            # rebinding hostname, so refuse rather than fetch through a plain client.
+            raise RuntimeError(
+                "Fluxer attachment download requires the host's connect-time SSRF-safe "
+                "client; refusing to fetch through an unguarded client"
+            )
         headers = {"User-Agent": "Hermes-Fluxer/0.3", "Accept": "*/*"}
-        attachment_host = urlparse(url).netloc.lower()
-        api_host = urlparse(self.api_base_url).netloc.lower()
-        if attachment_host and api_host and attachment_host == api_host:
+        # The URL the token was minted for. The token rides a hop only while that hop
+        # stays on the same origin as this URL (the API base in the normal case).
+        api_origin = url
+        if _same_origin(url, self.api_base_url):
             headers["Authorization"] = f"Bot {self.bot_token}"
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            return response.content
+        # A redirect off the origin is a new origin: the bot token is stripped for
+        # that hop and every hop after it (never restored), while non-credential
+        # headers are preserved.
+        authorized = "Authorization" in headers
+
+        max_bytes = _attachment_max_bytes()
+        # ``follow_redirects`` stays OFF: redirects are walked here so each hop is
+        # re-validated against ``is_safe_url`` before it is followed.
+        async with factory(
+            timeout=30.0,
+            follow_redirects=False,
+            event_hooks={"response": [_fluxer_ssrf_redirect_guard]},
+        ) as client:
+            download_url = url
+            redirect_count = 0
+            while True:
+                if authorized and not _same_origin(download_url, api_origin):
+                    # Sticky: drop it from the shared header dict so no later hop
+                    # can restore it, even one that points back at the API origin.
+                    headers.pop("Authorization", None)
+                    authorized = False
+                async with client.stream("GET", download_url, headers=dict(headers)) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        target = _redirect_target(response)
+                        if not target:
+                            response.raise_for_status()
+                            raise ValueError("Fluxer attachment redirect without a target")
+                        if not is_safe_url(target):
+                            raise ValueError(
+                                f"Blocked unsafe Fluxer attachment redirect: {safe_url_for_log(target)}"
+                            )
+                        if redirect_count >= _MAX_ATTACHMENT_REDIRECTS:
+                            raise ValueError("Too many Fluxer attachment redirects")
+                        download_url = target
+                        redirect_count += 1
+                        continue
+                    response.raise_for_status()
+                    return await _read_capped_body(response, max_bytes)
 
     async def _cache_attachment(self, att: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
         url = _attachment_url(att)
@@ -3241,12 +4924,21 @@ class FluxerAdapter(BasePlatformAdapter):
         if self._allowed_channel_ids and channel_id not in self._allowed_channel_ids:
             # A thread this adapter created inherits its parent channel's
             # allowlist status, so an allowlisted parent does not silently
-            # exclude the thread the bot just opened underneath it.
+            # exclude the thread the bot just opened underneath it. A thread a
+            # human created inherits nothing: the parent's allowlist entry was
+            # never consent for a conversation the operator did not start. Only a
+            # CONFIRMED bot-owned thread inherits -- an ownership that is unknown
+            # (cold cache, failed lookup) fails closed rather than widening the
+            # allowlist on a parent that was merely recorded alongside it.
             parent_id = self._thread_parents.get(str(channel_id))
+            if self._thread_is_bot_owned(str(channel_id)) is not True:
+                parent_id = None
             if not (parent_id and parent_id in self._allowed_channel_ids):
                 logger.debug("Fluxer ignoring message in a channel outside the allowed set")
                 return False, text
         parent_channel_id = self._thread_parents.get(str(channel_id))
+        if self._thread_is_bot_owned(str(channel_id)) is not True:
+            parent_channel_id = None
         if (
             channel_id in self._free_response_channels
             or channel_id in self._home_channel_ids
@@ -3267,6 +4959,13 @@ class FluxerAdapter(BasePlatformAdapter):
         ):
             return True, text
         if not self._require_mention:
+            return True, text
+        # A command typed as plain text is an address in its own right. Fluxer
+        # registers no native application commands, so /new, /help, /stop and
+        # /title only ever arrive this way, and a mention gate that drops them
+        # makes the whole command pipeline unreachable in exactly the channels
+        # the gate protects -- silently, with no reply to tell the user why.
+        if _is_text_command(text):
             return True, text
 
         is_mentioned = self._message_mentions_bot(data, text)
@@ -3341,7 +5040,11 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _send_heartbeat(self) -> None:
         if self._ws is None:
             return
-        self._last_heartbeat_sent_at = time.monotonic()
+        # Only the FIRST un-acked heartbeat starts the watchdog window. Resetting
+        # the timestamp on every tick made the elapsed time never exceed one
+        # interval, so a dead gateway was never noticed.
+        if not self._awaiting_heartbeat_ack:
+            self._last_heartbeat_sent_at = time.monotonic()
         self._awaiting_heartbeat_ack = True
         await self._ws.send(json.dumps({"op": 1, "d": self._last_seq}))
 
@@ -3479,6 +5182,10 @@ class FluxerAdapter(BasePlatformAdapter):
         emoji = _reaction_emoji_from_event(data)
         if not message_id or not emoji:
             return
+        # A card that has outlived the host's approval TTL must be gone BEFORE it is
+        # read: pruning only at registration left an old card live, so its tap could
+        # still resolve a newer request.
+        self._prune_pending_cards()
         action = self._pending_reaction_actions.get(f"{message_id}:{emoji}")
         if not action:
             return
@@ -3490,8 +5197,11 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.info("Fluxer reaction action ignored for unauthorized user %s", user_id or "<missing>")
             return
         action_channel_id = str(action.get("channel_id") or "")
-        if action_channel_id and channel_id and channel_id != action_channel_id:
-            logger.warning("Fluxer reaction action ignored for mismatched channel %s", channel_id)
+        # Fail closed: the event must name the same channel the card was posted in.
+        # An absent channel id in the event is not a match — it is an unidentified
+        # event, and resolving on it would be resolving an action we cannot place.
+        if not action_channel_id or not channel_id or channel_id != action_channel_id:
+            logger.warning("Fluxer reaction action ignored for unmatched channel %s", channel_id or "<missing>")
             return
         if action.get("kind") == "exec_approval":
             await self._resolve_exec_approval_action(action, user_id=user_id)
@@ -3501,6 +5211,8 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _handle_component_interaction(self, data: Dict[str, Any]) -> None:
         interaction_data = data.get("data") or {}
         custom_id = str(interaction_data.get("custom_id") or "")
+        # Same TTL rule as a reaction: an expired card must not be readable.
+        self._prune_pending_cards()
         action = self._pending_component_actions.get(custom_id)
         if not action:
             return
@@ -3510,19 +5222,51 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         interaction_message_id = str(((data.get("message") or {}).get("id")) or "")
         action_message_id = str(action.get("message_id") or "")
-        if action_message_id and interaction_message_id and interaction_message_id != action_message_id:
-            logger.warning("Fluxer component action %s ignored for mismatched message %s", custom_id, interaction_message_id)
+        # Fail closed on both required ids: an interaction that does not name the
+        # card's message and channel is not this card's interaction.
+        if not action_message_id or not interaction_message_id or interaction_message_id != action_message_id:
+            logger.warning("Fluxer component action %s ignored for unmatched message %s", custom_id, interaction_message_id or "<missing>")
             return
         interaction_channel_id = str(data.get("channel_id") or ((data.get("channel") or {}).get("id")) or "")
         action_channel_id = str(action.get("channel_id") or "")
-        if action_channel_id and interaction_channel_id and interaction_channel_id != action_channel_id:
-            logger.warning("Fluxer component action %s ignored for mismatched channel %s", custom_id, interaction_channel_id)
+        if not action_channel_id or not interaction_channel_id or interaction_channel_id != action_channel_id:
+            logger.warning("Fluxer component action %s ignored for unmatched channel %s", custom_id, interaction_channel_id or "<missing>")
             return
         self._pending_component_actions.pop(custom_id, None)
         if action.get("kind") == "exec_approval":
             await self._resolve_exec_approval_action(action, user_id=user_id, interaction=data)
         elif action.get("kind") == "slash_confirm":
             await self._resolve_slash_confirm_action(action, user_id=user_id, interaction=data)
+
+    async def _render_approval_card_status(
+        self,
+        action: Dict[str, Any],
+        interaction: Optional[Dict[str, Any]],
+        message_id: str,
+        pending: Optional[Dict[str, Any]],
+        content: str,
+    ) -> None:
+        """Update an approval card in place (or answer the interaction) with ``content``."""
+        try:
+            if interaction:
+                await self._respond_to_interaction(interaction, content=content, components=[])
+            elif message_id:
+                await self.edit_message(
+                    str((pending or {}).get("channel_id") or action.get("channel_id") or ""),
+                    message_id,
+                    content,
+                )
+        except Exception as exc:
+            logger.debug("Fluxer approval card status response failed: %s", exc)
+
+    def _drop_card_registrations(self, message_id: str) -> None:
+        """Drop every button/reaction registration belonging to ``message_id``."""
+        for cid, state in list(self._pending_component_actions.items()):
+            if state.get("message_id") == message_id:
+                self._pending_component_actions.pop(cid, None)
+        for rid, state in list(self._pending_reaction_actions.items()):
+            if state.get("message_id") == message_id:
+                self._pending_reaction_actions.pop(rid, None)
 
     async def _resolve_exec_approval_action(self, action: Dict[str, Any], *, user_id: str, interaction: Optional[Dict[str, Any]] = None) -> None:
         message_id = str(action.get("message_id") or (((interaction or {}).get("message") or {}).get("id")) or "")
@@ -3532,28 +5276,67 @@ class FluxerAdapter(BasePlatformAdapter):
         pending["resolved"] = True
         session_key = str(action.get("session_key") or pending.get("session_key") or "")
         choice = str(action.get("choice") or "deny")
+        # The gateway ``request_id`` this card belongs to. It is captured when the
+        # card is posted and carried on the action too. WITHOUT it there is no way
+        # to name the request a tap means, and the host's FIFO fallback would let a
+        # stale/unbound card resolve whatever happens to be pending — so an unbound
+        # card resolves NOTHING and says so.
+        request_id = str(action.get("request_id") or pending.get("request_id") or "").strip() or None
+        if not request_id:
+            self._drop_card_registrations(message_id)
+            logger.warning(
+                "Fluxer approval card %s is not bound to a gateway request; refusing to resolve (user=%s)",
+                message_id,
+                user_id,
+            )
+            await self._render_approval_card_status(
+                action,
+                interaction,
+                message_id,
+                pending,
+                f"{pending.get('content') or 'Command approval required'}\n\n"
+                "This card is not bound to a gateway request, so it cannot resolve anything. "
+                "Use the text commands: `/approve once`, `/approve session`, `/approve always`, or `/deny`.",
+            )
+            return
+
+        count: Optional[int] = None
+        failure: Optional[Exception] = None
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, choice)
-            logger.info("Fluxer approval action resolved %d approval(s) for session %s (choice=%s user=%s)", count, session_key, choice, user_id)
+            count = resolve_gateway_approval(session_key, choice, request_id=request_id)
         except Exception as exc:
+            failure = exc
             logger.error("Fluxer component approval resolve failed: %s", exc)
-        for cid, state in list(self._pending_component_actions.items()):
-            if state.get("message_id") == message_id:
-                self._pending_component_actions.pop(cid, None)
-        for rid, state in list(self._pending_reaction_actions.items()):
-            if state.get("message_id") == message_id:
-                self._pending_reaction_actions.pop(rid, None)
-        label = {"once": "approved once", "session": "approved for session", "always": "approved permanently", "deny": "denied"}.get(choice, choice)
-        resolved_content = f"{pending.get('content') or 'Command approval required'}\n\nResolved: {label} by <@{user_id}>."
-        try:
-            if interaction:
-                await self._respond_to_interaction(interaction, content=resolved_content, components=[])
-            else:
-                await self.edit_message(str(pending.get("channel_id") or action.get("channel_id") or ""), message_id, resolved_content)
-        except Exception as exc:
-            logger.debug("Fluxer approval resolution response failed: %s", exc)
+
+        self._drop_card_registrations(message_id)
+
+        if failure is not None:
+            status = (
+                "Could not resolve this approval (resolution error). "
+                "Use the text commands: `/approve once`, `/approve session`, `/approve always`, or `/deny`."
+            )
+        elif not count:
+            # The card was live but its request is gone (already answered, timed out,
+            # or withdrawn). Never fall back to FIFO — that could resolve an unrelated
+            # pending request for the same session.
+            logger.info(
+                "Fluxer approval card %s: request %s no longer pending; not falling back to FIFO",
+                message_id,
+                request_id,
+            )
+            status = "Nothing pending for this approval any more — it was already answered or has expired."
+        else:
+            label = {"once": "approved once", "session": "approved for session", "always": "approved permanently", "deny": "denied"}.get(choice, choice)
+            status = f"Resolved: {label} by <@{user_id}>."
+        await self._render_approval_card_status(
+            action,
+            interaction,
+            message_id,
+            pending,
+            f"{pending.get('content') or 'Command approval required'}\n\n{status}",
+        )
 
     async def _resolve_slash_confirm_action(self, action: Dict[str, Any], *, user_id: str, interaction: Optional[Dict[str, Any]] = None) -> None:
         session_key = str(action.get("session_key") or "")
@@ -3608,13 +5391,35 @@ class FluxerAdapter(BasePlatformAdapter):
         channel_id = str(data.get("channel_id") or channel.get("id") or "")
         if not channel_id:
             return
+        # The native path is routed through the SAME contract as a text message, so
+        # a native command cannot key a different container than the message path
+        # (Fluxer registers no native application commands on this deployment, so
+        # the path is cold -- but a second, divergent routing contract would grow
+        # here otherwise).
+        interaction_chat_type = _chat_type(data.get("channel_type") or channel.get("type"))
+        if not (data.get("channel_type") or channel.get("type")):
+            known_kind = self._classify_untyped_event(channel_id)
+            if known_kind is None:
+                known_kind = await self._resolve_channel_kind(channel_id)
+            if known_kind:
+                interaction_chat_type = known_kind
+        # A native command is a command: it addresses the turn already running in
+        # this chat, so it keeps the channel's session. Presenting the resolved text
+        # to the resolver lets the SAME command rule that guards the text path apply
+        # here, instead of a second rule that would drift from it.
+        source_chat_id, source_chat_type, parent_chat_id, pending_parent = await self._resolve_thread_source(
+            {**data, "content": text, "id": ""}, channel_id, interaction_chat_type
+        )
+        if pending_parent:
+            self._threads_pending[source_chat_id] = pending_parent
         source = self.build_source(
-            chat_id=channel_id,
+            chat_id=source_chat_id,
             chat_name=channel.get("name"),
-            chat_type=_chat_type(channel.get("type")),
+            chat_type=source_chat_type,
             user_id=user_id or None,
             user_name=_author_name(user),
             guild_id=data.get("guild_id"),
+            parent_chat_id=parent_chat_id,
             message_id=str(data.get("id") or "") or None,
         )
         try:
@@ -3822,14 +5627,25 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         pending["resolved"] = True
         session_key = str(pending.get("session_key") or "")
+        request_id = str(pending.get("request_id") or "").strip() or None
+        if not request_id:
+            # An unbound prompt cannot name the request it belongs to, and the host's
+            # FIFO fallback would deny whatever happens to be pending. Deny NOTHING;
+            # the host's own approval timeout remains the authority on the request.
+            logger.warning(
+                "Fluxer deleted approval prompt %s is not bound to a gateway request; refusing to deny via FIFO",
+                message_id,
+            )
+            return
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, "deny")
+            count = resolve_gateway_approval(session_key, "deny", request_id=request_id)
             logger.info(
-                "Fluxer deleted approval prompt denied %d approval(s) for session %s",
+                "Fluxer deleted approval prompt denied %d approval(s) for session %s (request_id=%s)",
                 count,
                 session_key,
+                request_id,
             )
         except Exception as exc:
             logger.error("Fluxer deleted approval prompt deny failed: %s", exc)
@@ -3848,8 +5664,14 @@ class FluxerAdapter(BasePlatformAdapter):
             return
 
         text = data.get("content") or ""
-        media_urls, media_types = await self._extract_attachments(data)
-        if not text and not media_urls:
+        # Attachment BYTES are not fetched here. A message's admission is decided
+        # by its channel and mention, and fetching before that gate meant every
+        # dropped message still triggered outbound network I/O (and, on a
+        # mention-gated channel, an unauthenticated fetch of a stranger's link).
+        # A media-only message stays eligible using metadata alone; the download
+        # happens after the gate below.
+        has_attachments = _message_has_attachments(data)
+        if not text and not has_attachments:
             return
 
         channel_id = str(data.get("channel_id") or (data.get("channel") or {}).get("id") or "")
@@ -3857,7 +5679,36 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         self._known_channel_ids.add(channel_id)
         reply_to_message_id, reply_to_text = await self._resolve_reply_context(data, channel_id)
-        chat_type = _chat_type(data.get("channel_type") or (data.get("channel") or {}).get("type"))
+        channel_type = data.get("channel_type")
+        if channel_type is None:
+            channel_type = (data.get("channel") or {}).get("type")
+        chat_type = _chat_type(channel_type)
+        # Fluxer's own MESSAGE_CREATE carries no ``channel_type`` and no nested
+        # channel object -- only ``channel_id`` -- so a raw event classified itself
+        # as a plain channel even when it arrived inside a thread. That keyed an
+        # in-thread follow-up to a different session than the turn that opened the
+        # thread, which is the split this routing contract exists to remove. The
+        # kind is settled from what the adapter already knows, then from one API
+        # read; a lookup that fails leaves the event exactly as it arrived.
+        untyped = channel_type is None
+        if untyped:
+            known_kind = self._classify_untyped_event(channel_id)
+            if known_kind is None:
+                known_kind = await self._resolve_channel_kind(channel_id)
+            if known_kind:
+                chat_type = known_kind
+            else:
+                logger.warning(
+                    "Fluxer cannot classify untyped container %s after lookup failure; dropping event",
+                    channel_id,
+                )
+                return
+        # A follow-up in a thread the bot opened has to be admitted by the same rules
+        # as the channel it hangs under, so the parent/owner are resolved BEFORE the
+        # admission gate rather than after it. A cold process has neither in memory;
+        # one lookup restores both, and it is cached for the rest of the process.
+        if chat_type == "thread" and self._thread_parents.get(str(channel_id)) is None:
+            await self._resolve_thread_info(channel_id, expect_thread=True)
         should_process, text = self._should_process_message(
             channel_id=channel_id,
             chat_type=chat_type,
@@ -3867,6 +5718,20 @@ class FluxerAdapter(BasePlatformAdapter):
         )
         if not should_process:
             return
+        # Now that the message is admitted, fetch its attachment bytes. An
+        # attachment that fails to cache (unsafe URL, SSRF-blocked redirect,
+        # oversize body, network error) is dropped and the turn proceeds on text
+        # alone, exactly as before — the move only changes WHEN the fetch happens.
+        media_urls, media_types = await self._extract_attachments(data)
+        # One resolver decides the session container for this message: an in-thread
+        # follow-up is keyed on the thread, a channel message that will open a thread
+        # is keyed on the anchor that names it. Registered only now that the message
+        # is admitted, so a rejected message never leaves a pending thread behind.
+        source_chat_id, source_chat_type, parent_chat_id, pending_parent = await self._resolve_thread_source(
+            data, channel_id, chat_type
+        )
+        if pending_parent:
+            self._threads_pending[source_chat_id] = pending_parent
         if msg_id:
             self._last_inbound_by_chat[channel_id] = msg_id
             self._last_inbound_by_chat.move_to_end(channel_id)
@@ -3885,12 +5750,13 @@ class FluxerAdapter(BasePlatformAdapter):
             while len(self._inbound_author_by_message) > self._inbound_text_by_message_max:
                 self._inbound_author_by_message.popitem(last=False)
         source = self.build_source(
-            chat_id=channel_id,
+            chat_id=source_chat_id,
             chat_name=(data.get("channel") or {}).get("name"),
-            chat_type=chat_type,
+            chat_type=source_chat_type,
             user_id=author_id or None,
             user_name=_author_name(author),
             guild_id=data.get("guild_id"),
+            parent_chat_id=parent_chat_id,
             message_id=msg_id or None,
         )
 
