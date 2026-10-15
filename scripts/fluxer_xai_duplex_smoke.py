@@ -56,8 +56,13 @@ def _safe_room_snapshot(room: Any) -> dict[str, Any]:
     }
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+HERMES_ROOT = Path(os.getenv("HERMES_AGENT_ROOT", str(Path.home() / ".hermes" / "hermes-agent")))
+# Insert the host root first so the plugin root ends up ahead of it (the plugin's
+# own top-level modules must win). No plugin ``tools`` package exists, so this
+# cannot shadow the host's ``tools`` package.
+for candidate in (HERMES_ROOT, ROOT):
+    if str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
 
 from adapter import FluxerAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402

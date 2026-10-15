@@ -20,6 +20,8 @@ import types
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 
 # Tests instantiate real Hermes BasePlatformAdapter when the Hermes checkout is
 # importable. Its _mark_connected/_mark_disconnected helpers write
@@ -29,8 +31,65 @@ _hermes_test_home = tempfile.mkdtemp(prefix="fluxer-platform-test-home-")
 atexit.register(shutil.rmtree, _hermes_test_home, ignore_errors=True)
 os.environ["HERMES_HOME"] = _hermes_test_home
 
+# The plugin's adapters and voice scripts read `FLUXER_*` / STT env vars BEFORE
+# any config file or `extra` mapping, so a shell that sourced the operator's
+# `~/.hermes/.env` (any live probe does) silently re-points the suite at the
+# operator's deployment: the home-guild, free-response and mention gates then
+# assert against the wrong ids and four `test_plugin_package.py` tests fail as a
+# phantom regression. The tests never need real credentials — they set what they
+# need with `monkeypatch.setenv` — so the whole `FLUXER_*` / STT surface is
+# cleared at import time and the operator's real secrets are never read.
+_ENV_LEAK_PREFIXES = ("FLUXER_",)
+_ENV_LEAK_EXACT = (
+    "HERMES_LOCAL_STT_COMMAND",
+    "ELEVENLABS_API_KEY",
+    "ELEVENLABS_STT_BASE_URL",
+    "GROQ_API_KEY",
+    "GROQ_BASE_URL",
+    "XAI_API_KEY",
+    "XAI_STT_BASE_URL",
+)
+
+# The voice scripts resolve `--env-file` at PARSE time from `HERMES_ENV_FILE`,
+# else `~/.hermes/.env`. Left alone, a test that calls `parse_args` without
+# `--env-file` inherits the operator's real env file and `load_env_file` then
+# mutates `os.environ` with their live secrets. Pin the default at an empty file
+# inside the throwaway test home so the resolution is deterministic and harmless.
+ISOLATED_ENV_FILE = Path(_hermes_test_home) / "isolated.env"
+
+for _key in list(os.environ):
+    if _key.startswith(_ENV_LEAK_PREFIXES) or _key in _ENV_LEAK_EXACT:
+        os.environ.pop(_key, None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fluxer_env(monkeypatch):
+    """Keep the leak surface clean for every test, and prove no real secret is read.
+
+    A test may set `FLUXER_*` / STT vars with `monkeypatch.setenv`; those are
+    reverted per test. Anything the suite needs is synthetic, so no operator
+    credential in `~/.hermes/.env` or the ambient shell is ever consumed.
+    """
+
+    for key in list(os.environ):
+        if key.startswith(_ENV_LEAK_PREFIXES) or key in _ENV_LEAK_EXACT:
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HERMES_ENV_FILE", str(ISOLATED_ENV_FILE))
+    yield
+
 
 try:  # Prefer the real Hermes gateway package when the test runner has it.
+    # The voice scripts put the Hermes root on `sys.path` themselves, which makes
+    # `hermes_state` / `hermes_constants` importable even when the runner did not.
+    # Resolve that same root here BEFORE the gateway probe, so `gateway` and
+    # `hermes_state` always agree: both real, or both stubbed. A mixed pair
+    # (stubbed `gateway` + real `hermes_state`) silently fails the host-integration
+    # tests with `AttributeError: set_owner_profile`.
+    _hermes_root = Path(
+        os.getenv("HERMES_AGENT_ROOT", str(Path.home() / ".hermes" / "hermes-agent"))
+    )
+    if _hermes_root.is_dir() and str(_hermes_root) not in sys.path:
+        sys.path.append(str(_hermes_root))
     import gateway.config  # type: ignore[import-not-found]  # noqa: F401
     import gateway.platforms.base  # type: ignore[import-not-found]  # noqa: F401
 except ModuleNotFoundError:

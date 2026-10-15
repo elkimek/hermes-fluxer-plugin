@@ -22,6 +22,8 @@ This repo is not Fluxer itself and it is not a full Hermes fork. It is the adapt
 | `adapter.py` | The Fluxer platform adapter: REST sends, gateway receive loop, message gating, approvals, media handling, backlog recovery, and channel discovery. |
 | `__init__.py` | Registration shim loaded by Hermes when the plugin is enabled. |
 | `pyproject.toml` | Python package metadata and runtime dependencies. |
+| `fluxer_plugin_tools/` | Plugin-private STT helpers and the secure scratch-file helper used by the voice scripts. Deliberately **not** named `tools`: a plugin-local `tools` package would shadow the host's own `tools` package for the voice scripts, which put the plugin root ahead of the Hermes root on `sys.path`. |
+| `scripts/` | Standalone voice-loop scripts (`fluxer_stt_voice_loop.py`, `fluxer_voice_auto_join.py`, the xAI room loop and smoke scripts). Not part of the installed wheel; the supervisor is normally plugin-managed. |
 | `after-install.md` | Short post-install checklist shown after plugin installation. |
 | `CHANGELOG.md` | User-facing release notes for plugin updates, fixes, and new capabilities. |
 | `AGENTS.md` | Safety and execution contract for AI agents working in this repo. |

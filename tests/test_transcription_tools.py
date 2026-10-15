@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "transcription_tools.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "fluxer_plugin_tools" / "transcription_tools.py"
 SPEC = importlib.util.spec_from_file_location("fluxer_standalone_transcription_tools", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 transcription_tools = importlib.util.module_from_spec(SPEC)
@@ -15,11 +15,11 @@ SPEC.loader.exec_module(transcription_tools)
 def test_elevenlabs_helper_reuses_shared_endpoint(monkeypatch):
     monkeypatch.setenv("ELEVENLABS_STT_BASE_URL", "https://shared.example.test/v1")
     common_path = MODULE_PATH.with_name("transcription_common.py")
-    common_spec = importlib.util.spec_from_file_location("tools.transcription_common", common_path)
+    common_spec = importlib.util.spec_from_file_location("fluxer_plugin_tools.transcription_common", common_path)
     assert common_spec is not None and common_spec.loader is not None
     common = importlib.util.module_from_spec(common_spec)
     common_spec.loader.exec_module(common)
-    monkeypatch.setitem(sys.modules, "tools.transcription_common", common)
+    monkeypatch.setitem(sys.modules, "fluxer_plugin_tools.transcription_common", common)
 
     # A second getenv/default definition would pick a different endpoint.
     monkeypatch.setenv("ELEVENLABS_STT_BASE_URL", "https://independent.example.test/v1")
@@ -55,3 +55,23 @@ def test_local_stt_command_quotes_input_and_output_placeholders(monkeypatch, tmp
 
     assert result["success"] is True
     assert result["transcript"] == "audio with spaces.wav"
+
+
+def test_multipart_form_sanitizes_injected_filename(tmp_path):
+    """A filename carrying a quote or CRLF must not inject a second multipart
+    header (or terminate the header block early)."""
+
+    evil_name = 'evil"; name="injected\r\nX-Injected: 1.wav'
+    audio = tmp_path / evil_name
+    audio.write_bytes(b"RIFF")
+
+    body, boundary = transcription_tools._multipart_form({"model": "m"}, "file", str(audio))
+
+    assert b"\r\nX-Injected" not in body
+    marker = b'name="file"; filename="'
+    assert body.count(marker) == 1
+    disposition = body.split(marker, 1)[1].split(b'"\r\n', 1)[0]
+    assert b'"' not in disposition
+    assert b"\r" not in disposition and b"\n" not in disposition
+    assert b"----fluxer-stt-boundary" in body
+

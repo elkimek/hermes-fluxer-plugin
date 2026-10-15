@@ -653,7 +653,7 @@ def test_current_hermes_plugin_compat_scan_has_no_deprecated_imports():
 def test_standalone_voice_loop_has_local_public_stt_common_module():
     import importlib.util
 
-    module_path = ROOT / "tools" / "transcription_common.py"
+    module_path = ROOT / "fluxer_plugin_tools" / "transcription_common.py"
     assert module_path.exists()
     spec = importlib.util.spec_from_file_location("fluxer_standalone_transcription_common", module_path)
     assert spec is not None and spec.loader is not None
@@ -663,7 +663,7 @@ def test_standalone_voice_loop_has_local_public_stt_common_module():
     assert module.ELEVENLABS_STT_BASE_URL
 
 
-def test_voice_loop_uses_public_stt_constant_import():
+def test_voice_loop_uses_plugin_private_stt_constant_import():
     import ast
 
     source = (ROOT / "scripts" / "fluxer_stt_voice_loop.py").read_text()
@@ -674,8 +674,50 @@ def test_voice_loop_uses_public_stt_constant_import():
         for alias in node.names
     }
 
-    assert ("tools.transcription_common", "ELEVENLABS_STT_BASE_URL") in imports
-    assert ("tools.transcription_tools", "ELEVENLABS_STT_BASE_URL") not in imports
+    assert ("fluxer_plugin_tools.transcription_common", "ELEVENLABS_STT_BASE_URL") in imports
+    assert ("fluxer_plugin_tools.transcription_tools", "ELEVENLABS_STT_BASE_URL") not in imports
+
+
+def test_plugin_does_not_ship_a_top_level_tools_package():
+    """A plugin-local ``tools`` package shadows the host's ``tools`` package when
+    the plugin root precedes the Hermes root on ``sys.path`` — which is exactly
+    the order the voice scripts need for their own top-level modules. The
+    helpers live under the private ``fluxer_plugin_tools`` name instead."""
+
+    assert not (ROOT / "tools").exists()
+    assert (ROOT / "fluxer_plugin_tools" / "transcription_tools.py").exists()
+    assert (ROOT / "fluxer_plugin_tools" / "transcription_common.py").exists()
+
+    for path in ROOT.rglob("*.py"):
+        if ".git" in path.parts or "__pycache__" in path.parts:
+            continue
+        if path.name == "test_plugin_package.py":
+            continue  # this module quotes the strings it forbids
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        assert "from tools.transcription" not in text, f"stale host-tools import in {path.relative_to(ROOT)}"
+        assert "import tools.transcription" not in text, f"stale host-tools import in {path.relative_to(ROOT)}"
+
+
+def test_voice_loop_puts_plugin_root_ahead_of_hermes_root():
+    """The plugin's own top-level modules must win; the host root is inserted
+    first so the plugin root ends up ahead of it."""
+
+    import ast
+
+    source = (ROOT / "scripts" / "fluxer_stt_voice_loop.py").read_text()
+    tree = ast.parse(source)
+    loop = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Tuple)
+        and any(isinstance(elt, ast.Name) and elt.id == "HERMES_ROOT" for elt in node.iter.elts)
+    )
+
+    ordered = [elt.id for elt in loop.iter.elts if isinstance(elt, ast.Name)]
+    assert ordered == ["HERMES_ROOT", "ROOT"]
+    assert "insert(0" in source
+
 
 
 def test_fluxer_adapter_advertises_markdown_code_blocks():
