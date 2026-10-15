@@ -1361,6 +1361,23 @@ class FluxerAdapter(BasePlatformAdapter):
         # indicator and the approval prompt all have to be routed to it --
         # creating it on first use.
         self._threads_pending: Dict[str, str] = {}
+        # The kind of a channel id learned from the API (``thread`` / ``channel``).
+        # Fluxer's own MESSAGE_CREATE payload carries no ``channel_type`` and no
+        # nested channel object, so the raw event cannot classify itself; without
+        # this a follow-up typed inside a thread was read as a channel message and
+        # keyed to a different session than the turn that opened the thread.
+        self._channel_kinds: OrderedDict[str, str] = OrderedDict()
+        # Anchor message ids that must NOT open a thread of their own: a text
+        # command typed in a thread-enabled channel. The command addresses the turn
+        # already running in that chat, so threading its own message creates a
+        # container with no session behind it (live artefact: an active thread
+        # named ``/stop``).
+        self._no_thread_anchors: set = set()
+        # Containers delivery found deleted: the container to use instead. A
+        # deleted thread's id never comes back, so the redirect holds for the rest
+        # of the process and every later send for that turn lands in the parent
+        # instead of failing against the same missing thread.
+        self._dead_containers: Dict[str, str] = {}
         # Routing belongs to the executing event, not the channel's newest
         # message or the typing lifetime. Child tasks inherit the context;
         # queued turns rebind it when their processing actually begins.
@@ -1778,6 +1795,8 @@ class FluxerAdapter(BasePlatformAdapter):
                         )
                         self._forget_thread(auto_thread_id)
                         self._disable_turn_thread(chat_id, reply_to, metadata)
+                        self._remember_dead_container(auto_thread_id, fallback_chat)
+                        self._remember_dead_container(chat_id, fallback_chat)
                         auto_thread_id = None
                         target_chat_id = str(fallback_chat)
                         self._known_channel_ids.add(target_chat_id)
@@ -2218,6 +2237,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._thread_owners.pop(tid, None)
         self._thread_info_cache.pop(tid, None)
         self._threads_pending.pop(tid, None)
+        self._channel_kinds.pop(tid, None)
         self._mentioned_threads.pop(tid, None)
         for key in [k for k, v in self._threads_by_anchor.items() if v == tid]:
             self._threads_by_anchor.pop(key, None)
@@ -2318,6 +2338,11 @@ class FluxerAdapter(BasePlatformAdapter):
         thread exists on the server but this process no longer remembers it.
         """
         key = (str(chat_id), str(message_id))
+        # An anchor this adapter recorded as a command never opens a thread: the
+        # command addresses the turn already running in that chat, and a thread on
+        # its own message id would key a container with no session behind it.
+        if key in self._no_thread_anchors:
+            return None
         existing = self._threads_by_anchor.get(key)
         if existing:
             return existing
@@ -2717,17 +2742,19 @@ class FluxerAdapter(BasePlatformAdapter):
 
 
     async def _fetch_thread_info(self, thread_id: str) -> Dict[str, Any]:
-        """Read a thread channel's parent and owner from the API.
+        """Read a channel's parent, owner and kind from the API.
 
         Fluxer returns a thread as a channel whose ``parent_id`` is the channel it
         hangs under; the thread's creator is the message author, so a thread the
-        bot opened can be told apart from one a human created. The id itself is the
-        anchor message id, which the caller already knows, so only these two fields
-        are read.
+        bot opened can be told apart from one a human created. ``type`` is the same
+        channel-type integer ``_chat_type`` reads. The id itself is the anchor
+        message id, which the caller already knows, so only these fields are read.
         """
         data = await self._request("GET", f"/channels/{_quote_id(thread_id)}", warn_on_error=False)
         info: Dict[str, Any] = {}
         if isinstance(data, Mapping):
+            if data.get("type") is not None:
+                info["type"] = data["type"]
             parent = data.get("parent_id") or data.get("parent_chat_id")
             if parent:
                 info["parent_id"] = str(parent)
@@ -2736,8 +2763,50 @@ class FluxerAdapter(BasePlatformAdapter):
                 info["owner_id"] = str(owner)
         return info
 
-    async def _resolve_thread_info(self, thread_id: str) -> Dict[str, Any]:
-        """Cached ``_fetch_thread_info``; a failed lookup is never cached."""
+    def _remember_channel_kind(self, channel_id: str, info: Mapping[str, Any]) -> None:
+        """Cache a channel id's kind from an API read, bounded like the other maps."""
+        cid = str(channel_id or "").strip()
+        if not cid or info.get("type") is None:
+            return
+        self._channel_kinds[cid] = _chat_type(info.get("type"))
+        self._channel_kinds.move_to_end(cid)
+        while len(self._channel_kinds) > self._threads_by_anchor_max:
+            self._channel_kinds.popitem(last=False)
+
+    async def _resolve_channel_kind(self, channel_id: str) -> Optional[str]:
+        """The kind of ``channel_id`` (``thread`` / ``channel`` / ``dm``), or ``None``.
+
+        An event that classifies itself (``channel_type``, or a nested channel
+        object) never reaches here. Fluxer's real MESSAGE_CREATE carries neither, so
+        the kind is learned from the API once and remembered; a lookup that fails
+        returns ``None`` and the caller keeps the event exactly as it arrived rather
+        than guessing "channel" and splitting the session.
+        """
+        cid = str(channel_id or "").strip()
+        if not cid:
+            return None
+        known = self._channel_kinds.get(cid)
+        if known is not None:
+            return known
+        # A thread this adapter opened already names its kind and its parent.
+        if cid in self._thread_parents or self._thread_is_bot_owned(cid) is not None:
+            self._remember_channel_kind(cid, {"type": 11})
+            return "thread"
+        if self._threads_pending.get(cid):
+            return "thread"
+        info = await self._resolve_thread_info(cid)
+        if info.get("type") is None:
+            return None
+        return self._channel_kinds.get(cid)
+
+    async def _resolve_thread_info(self, thread_id: str, *, expect_thread: bool = False) -> Dict[str, Any]:
+        """Cached ``_fetch_thread_info``; a failed lookup is never cached.
+
+        ``expect_thread`` states that the caller already knows the channel is a
+        thread (its message arrived in one). Only then is a parent recorded when the
+        API read omits ``type``: the plain kind-resolution path must not mistake a
+        text channel's category for a parent channel.
+        """
         tid = str(thread_id or "").strip()
         if not tid:
             return {}
@@ -2756,10 +2825,12 @@ class FluxerAdapter(BasePlatformAdapter):
         if not isinstance(info, Mapping):
             return {}
         info = dict(info)
-        parent = info.get("parent_id")
-        if parent:
-            self._thread_parents[tid] = str(parent)
+        # The kind comes first: a thread this adapter did not open must be decided
+        # BEFORE its parent is recorded, or an unknown-owner thread would inherit
+        # the parent channel's hard allowlist the moment the parent is cached.
+        self._remember_channel_kind(tid, info)
         owner = info.get("owner_id")
+        owned = self._thread_is_bot_owned(tid)
         if owner is not None and self.bot_user_id is not None:
             owned = str(owner) == str(self.bot_user_id)
             self._thread_owners[tid] = owned
@@ -2769,6 +2840,19 @@ class FluxerAdapter(BasePlatformAdapter):
             # bot's own thread into a mention-gated drop zone.
             if owned and not self._strict_mention:
                 self._remember_mentioned_thread(tid)
+        # The parent is recorded for a THREAD only, and only when the API read says
+        # the channel is one. This method is also reached from channel *kind*
+        # resolution, where ``parent_id`` is a category rather than a parent
+        # channel; caching that in the map the thread fallbacks read would send a
+        # fallback to a category. Inheritance of the parent's admission rules is a
+        # separate decision, gated on confirmed ownership in
+        # ``_should_process_message``.
+        parent = info.get("parent_id")
+        known_thread = expect_thread or self._channel_kinds.get(tid) == "thread"
+        if parent and known_thread:
+            self._thread_parents[tid] = str(parent)
+        elif known_thread:
+            self._thread_parents.pop(tid, None)
         self._thread_info_cache[tid] = info
         # Bounded like the other per-adapter caches: a long-lived process must not
         # grow one entry per thread it has ever seen.
@@ -2781,6 +2865,37 @@ class FluxerAdapter(BasePlatformAdapter):
         tid = str(thread_id or "").strip()
         if tid:
             self._thread_owners[tid] = bool(owned)
+
+    def _remember_no_thread_anchor(self, chat_id: str, anchor: str) -> None:
+        """Mark ``(chat_id, anchor)`` as a turn that must never open a thread.
+
+        A text command addresses the turn already running in its chat, so the
+        container it resolves to is that chat -- not a thread opened on the
+        command's own message id. The anchor is recorded because the typing
+        indicator and the reply both derive their container from the turn anchor,
+        and each would otherwise open a thread of its own for the command.
+        """
+        key = (str(chat_id or ""), str(anchor or ""))
+        if not key[0] or not key[1]:
+            return
+        self._no_thread_anchors.add(key)
+        while len(self._no_thread_anchors) > self._threads_by_anchor_max:
+            self._no_thread_anchors.pop()
+
+    def _remember_dead_container(self, container_id: str, fallback: str) -> None:
+        """Redirect every later send for a deleted container to ``fallback``.
+
+        A deleted thread's id never comes back, so recording the redirect is what
+        keeps the rest of the turn (and the typing indicator) from re-addressing
+        the same missing thread and failing.
+        """
+        cid = str(container_id or "").strip()
+        target = str(fallback or "").strip()
+        if not cid or not target or cid == target:
+            return
+        self._dead_containers[cid] = target
+        while len(self._dead_containers) > self._threads_by_anchor_max:
+            self._dead_containers.pop(next(iter(self._dead_containers)), None)
 
     def _thread_is_bot_owned(self, thread_id: str) -> Optional[bool]:
         """Whether ``thread_id`` is the bot's own thread, or ``None`` if unknown."""
@@ -2812,17 +2927,27 @@ class FluxerAdapter(BasePlatformAdapter):
         if chat_type == "thread":
             # Parent/owner come from the create that opened the thread, or are read
             # back once after a restart; an unresolvable thread keeps its own id.
+            # The parent is reported whatever the owner is -- the host uses it for
+            # profile routing and branching -- while inheritance of the parent's
+            # admission rules stays gated on confirmed ownership in
+            # ``_should_process_message``.
             parent = self._thread_parents.get(str(channel_id))
             if parent is None:
-                info = await self._resolve_thread_info(channel_id)
+                info = await self._resolve_thread_info(channel_id, expect_thread=True)
                 parent = info.get("parent_id")
             return channel_id, chat_type, (str(parent) if parent else None), None
         if not self._thread_replies_enabled_for(channel_id):
             return channel_id, chat_type, None, None
         # A plain-text command addresses the turn already running in this chat, so
         # it keeps the channel's session: auto-threading it would key it on the
-        # command's own message id and the stop would never reach its target.
+        # command's own message id and the stop would never reach its target. The
+        # anchor is recorded as never-threadable so the typing indicator and the
+        # reply -- which both resolve their container from the turn anchor -- do not
+        # open a thread on the command's own message either.
         if _is_text_command(str(data.get("content") or "")):
+            anchor = str(data.get("id") or "").strip()
+            if anchor:
+                self._remember_no_thread_anchor(channel_id, anchor)
             return channel_id, chat_type, None, None
         anchor = str(data.get("id") or "").strip()
         if not anchor:
@@ -2832,6 +2957,26 @@ class FluxerAdapter(BasePlatformAdapter):
             self._threads_pending.pop(next(iter(self._threads_pending)), None)
         return anchor, "thread", str(channel_id), str(channel_id)
 
+    def _classify_untyped_event(self, channel_id: str) -> Optional[str]:
+        """Kind of ``channel_id`` from state already in hand, else ``None``.
+
+        Fluxer's own MESSAGE_CREATE payload carries no ``channel_type`` and no nested
+        channel object, so a raw event cannot classify itself. Everything the adapter
+        has *learned* about the id -- a thread it opened, a thread it is about to
+        open, a kind a previous lookup recorded -- decides it here with no I/O.
+        """
+        cid = str(channel_id or "").strip()
+        if not cid:
+            return None
+        known = self._channel_kinds.get(cid)
+        if known is not None:
+            return known
+        if cid in self._thread_parents or self._thread_is_bot_owned(cid) is not None:
+            return "thread"
+        if self._threads_pending.get(cid):
+            return "thread"
+        return None
+
     def _typing_target_sync(self, chat_id: str, metadata=None) -> tuple[str, bool]:
         """``(container, needs_creation)`` for a typing indicator.
 
@@ -2839,10 +2984,21 @@ class FluxerAdapter(BasePlatformAdapter):
         has to refresh the thread -- a parent-channel indicator is what a user
         watching the thread sees as "nothing happening". A prospective thread that
         does not exist yet reports ``needs_creation``; the caller opens it first.
+
+        Precedence matches the delivery resolver: an explicit container wins, then a
+        container this adapter already knows, then the prospective thread this turn
+        will open, then the caller's chat id.
         """
         cid = str(chat_id or "")
         if not cid:
             return "", False
+        # A container delivery already found deleted is never addressed again.
+        redirect = self._dead_containers.get(cid)
+        if redirect:
+            return str(redirect), False
+        explicit = str((metadata or {}).get("thread_id") or "").strip()
+        if explicit:
+            return explicit, False
         # Already a container of its own: a thread the adapter opened, or a thread
         # whose parent/owner is known. Post straight into it.
         if cid in self._thread_parents or self._thread_is_bot_owned(cid) is not None:
@@ -2858,6 +3014,8 @@ class FluxerAdapter(BasePlatformAdapter):
         existing = self._threads_by_anchor.get((cid, anchor))
         if existing:
             return existing, False
+        if self._no_thread_anchors and (cid, anchor) in self._no_thread_anchors:
+            return cid, False
         if self._threads_pending.get(cid) == anchor or self._thread_replies_enabled_for(cid):
             return anchor, True
         return cid, False
@@ -2873,34 +3031,46 @@ class FluxerAdapter(BasePlatformAdapter):
             or str(chat_id)
         )
         created = await self._start_thread_from_message(str(parent), target)
-        return created or str(chat_id)
+        # A thread that could not be opened is not a container: refresh the parent
+        # channel rather than posting a typing indicator at a channel that is not
+        # there (the prospective id names a thread that does not exist yet).
+        return created or str(parent)
 
     async def _resolve_thread_container(
         self, chat_id: str, metadata=None, session_key: Optional[str] = None
     ) -> str:
         """The container a non-message operation (approval, confirm) belongs in.
 
-        An explicit ``thread_id`` wins. Otherwise a session keyed on a thread names
+        An explicit ``thread_id`` wins. A container delivery already found deleted
+        is redirected to its parent. Otherwise a session keyed on a thread names
         its container in the key itself, so an approval prompt posted while a
         thread-keyed turn is waiting for input lands in that thread -- and a thread
-        that does not exist yet is created under its parent first.
+        that does not exist yet is created under its parent first. A creation that
+        fails falls back to the parent channel: aiming the prompt at a container
+        that is not there 404s, and the waiting turn can then never be answered.
         """
         explicit = str((metadata or {}).get("thread_id") or "").strip()
         if explicit:
             return explicit
+        redirect = self._dead_containers.get(str(chat_id))
+        if redirect:
+            return str(redirect)
         candidate = _thread_id_from_session_key(session_key, str(self.platform.value))
         if candidate:
+            redirect = self._dead_containers.get(str(candidate))
+            if redirect:
+                return str(redirect)
             pending_parent = self._threads_pending.get(candidate)
             if pending_parent:
                 created = await self._start_thread_from_message(str(pending_parent), candidate)
-                if created:
-                    return created
+                # The parent is where the prompt has to land when the thread could
+                # not be opened: a prospective id names a channel that does not exist.
+                return created or str(pending_parent)
             return candidate
         pending_parent = self._threads_pending.get(str(chat_id))
         if pending_parent:
             created = await self._start_thread_from_message(str(pending_parent), str(chat_id))
-            if created:
-                return created
+            return created or str(pending_parent)
         return str(chat_id)
 
     async def _resolve_outbound_target(
@@ -2925,17 +3095,32 @@ class FluxerAdapter(BasePlatformAdapter):
         auto_thread_id: Optional[str] = None
         explicit_thread_id = str((metadata or {}).get("thread_id") or "").strip()
         started_thread = False
-        if explicit_thread_id:
+        # A container delivery already found deleted is never addressed again: the
+        # redirect is what keeps the rest of the turn in the parent channel instead
+        # of failing against the same missing thread.
+        dead_redirect = self._dead_containers.get(str(chat_id))
+        if dead_redirect:
+            target_chat_id = str(dead_redirect)
+        elif explicit_thread_id:
             target_chat_id = explicit_thread_id
+        elif str(chat_id) in self._thread_parents or self._thread_is_bot_owned(str(chat_id)) is not None:
+            # The caller's chat id IS a thread this adapter already opened. It has to
+            # count as an auto-chosen container, not a plain channel: a thread opened
+            # earlier in the turn (by the typing indicator or a progress send) can be
+            # deleted before the reply, and only an ``auto_thread_id`` gets the
+            # parent-channel fallback instead of a failed send.
+            target_chat_id = str(chat_id)
+            auto_thread_id = str(chat_id)
         else:
-            anchor = self._turn_key(chat_id, reply_to, metadata)[1]
+            turn_key = self._turn_key(chat_id, reply_to, metadata)
+            anchor = turn_key[1]
             # A prospective thread: the session container IS the anchor message, and
             # Fluxer will give the thread that same id, so creating it here is what
             # puts the reply inside the thread the session was keyed on. A creation
             # failure still has to deliver, so it falls back to the parent channel.
             pending_parent = self._threads_pending.get(str(chat_id))
             if pending_parent:
-                if self._turn_key(chat_id, reply_to, metadata) in self._turn_thread_disabled:
+                if turn_key in self._turn_thread_disabled:
                     target_chat_id = str(pending_parent)
                 else:
                     new_thread_id = await self._start_thread_from_message(str(pending_parent), str(chat_id))
@@ -2946,13 +3131,15 @@ class FluxerAdapter(BasePlatformAdapter):
                     else:
                         self._disable_turn_thread(chat_id, reply_to, metadata)
                         target_chat_id = str(pending_parent)
-            elif self._thread_replies_enabled_for(chat_id) and self._turn_key(chat_id, reply_to, metadata) not in self._turn_thread_disabled:
+            elif self._thread_replies_enabled_for(chat_id) and turn_key not in self._turn_thread_disabled:
                 # The gateway sets ``reply_to`` only for a few platforms and supplies
                 # no thread id for Fluxer. Prefer the trigger in hand, then the anchor
                 # pinned when this turn started -- the channel's latest inbound message
                 # can move while a reply is still being produced, and using it here
-                # would split one turn across two threads.
-                if anchor:
+                # would split one turn across two threads. An anchor this adapter
+                # recorded as a command keeps the channel: a thread opened on the
+                # command's own message keys the reply to a session with no run.
+                if anchor and (chat_id, anchor) not in self._no_thread_anchors:
                     new_thread_id = await self._start_thread_from_message(chat_id, anchor)
                     if new_thread_id:
                         target_chat_id = new_thread_id
@@ -3273,6 +3460,8 @@ class FluxerAdapter(BasePlatformAdapter):
                     )
                     self._forget_thread(auto_thread_id)
                     self._disable_turn_thread(chat_id, reply_to, metadata)
+                    self._remember_dead_container(auto_thread_id, fallback_chat)
+                    self._remember_dead_container(chat_id, fallback_chat)
                     auto_thread_id = None
                     target_chat_id = str(fallback_chat)
                     self._known_channel_ids.add(target_chat_id)
@@ -3679,15 +3868,18 @@ class FluxerAdapter(BasePlatformAdapter):
             # allowlist status, so an allowlisted parent does not silently
             # exclude the thread the bot just opened underneath it. A thread a
             # human created inherits nothing: the parent's allowlist entry was
-            # never consent for a conversation the operator did not start.
+            # never consent for a conversation the operator did not start. Only a
+            # CONFIRMED bot-owned thread inherits -- an ownership that is unknown
+            # (cold cache, failed lookup) fails closed rather than widening the
+            # allowlist on a parent that was merely recorded alongside it.
             parent_id = self._thread_parents.get(str(channel_id))
-            if self._thread_is_bot_owned(str(channel_id)) is False:
+            if self._thread_is_bot_owned(str(channel_id)) is not True:
                 parent_id = None
             if not (parent_id and parent_id in self._allowed_channel_ids):
                 logger.debug("Fluxer ignoring message in a channel outside the allowed set")
                 return False, text
         parent_channel_id = self._thread_parents.get(str(channel_id))
-        if self._thread_is_bot_owned(str(channel_id)) is False:
+        if self._thread_is_bot_owned(str(channel_id)) is not True:
             parent_channel_id = None
         if (
             channel_id in self._free_response_channels
@@ -4057,13 +4249,35 @@ class FluxerAdapter(BasePlatformAdapter):
         channel_id = str(data.get("channel_id") or channel.get("id") or "")
         if not channel_id:
             return
+        # The native path is routed through the SAME contract as a text message, so
+        # a native command cannot key a different container than the message path
+        # (Fluxer registers no native application commands on this deployment, so
+        # the path is cold -- but a second, divergent routing contract would grow
+        # here otherwise).
+        interaction_chat_type = _chat_type(data.get("channel_type") or channel.get("type"))
+        if not (data.get("channel_type") or channel.get("type")):
+            known_kind = self._classify_untyped_event(channel_id)
+            if known_kind is None:
+                known_kind = await self._resolve_channel_kind(channel_id)
+            if known_kind:
+                interaction_chat_type = known_kind
+        # A native command is a command: it addresses the turn already running in
+        # this chat, so it keeps the channel's session. Presenting the resolved text
+        # to the resolver lets the SAME command rule that guards the text path apply
+        # here, instead of a second rule that would drift from it.
+        source_chat_id, source_chat_type, parent_chat_id, pending_parent = await self._resolve_thread_source(
+            {**data, "content": text, "id": ""}, channel_id, interaction_chat_type
+        )
+        if pending_parent:
+            self._threads_pending[source_chat_id] = pending_parent
         source = self.build_source(
-            chat_id=channel_id,
+            chat_id=source_chat_id,
             chat_name=channel.get("name"),
-            chat_type=_chat_type(channel.get("type")),
+            chat_type=source_chat_type,
             user_id=user_id or None,
             user_name=_author_name(user),
             guild_id=data.get("guild_id"),
+            parent_chat_id=parent_chat_id,
             message_id=str(data.get("id") or "") or None,
         )
         try:
@@ -4307,12 +4521,26 @@ class FluxerAdapter(BasePlatformAdapter):
         self._known_channel_ids.add(channel_id)
         reply_to_message_id, reply_to_text = await self._resolve_reply_context(data, channel_id)
         chat_type = _chat_type(data.get("channel_type") or (data.get("channel") or {}).get("type"))
+        # Fluxer's own MESSAGE_CREATE carries no ``channel_type`` and no nested
+        # channel object -- only ``channel_id`` -- so a raw event classified itself
+        # as a plain channel even when it arrived inside a thread. That keyed an
+        # in-thread follow-up to a different session than the turn that opened the
+        # thread, which is the split this routing contract exists to remove. The
+        # kind is settled from what the adapter already knows, then from one API
+        # read; a lookup that fails leaves the event exactly as it arrived.
+        untyped = not (data.get("channel_type") or (data.get("channel") or {}).get("type"))
+        if untyped:
+            known_kind = self._classify_untyped_event(channel_id)
+            if known_kind is None:
+                known_kind = await self._resolve_channel_kind(channel_id)
+            if known_kind:
+                chat_type = known_kind
         # A follow-up in a thread the bot opened has to be admitted by the same rules
         # as the channel it hangs under, so the parent/owner are resolved BEFORE the
         # admission gate rather than after it. A cold process has neither in memory;
         # one lookup restores both, and it is cached for the rest of the process.
         if chat_type == "thread" and self._thread_parents.get(str(channel_id)) is None:
-            await self._resolve_thread_info(channel_id)
+            await self._resolve_thread_info(channel_id, expect_thread=True)
         should_process, text = self._should_process_message(
             channel_id=channel_id,
             chat_type=chat_type,
