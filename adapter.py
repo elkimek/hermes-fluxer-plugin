@@ -2218,6 +2218,8 @@ class FluxerAdapter(BasePlatformAdapter):
                 self._threads_by_anchor.popitem(last=False)
             created_name = str((data or {}).get("name") or thread_name)
             self._record_auto_thread(chat_id, thread_id, created_name, author_id)
+            if author_id:
+                await self._add_thread_member(thread_id, str(author_id))
             if created_name != placeholder:
                 self._note_renamed_thread(thread_id, created_name)
             if not title:
@@ -2225,6 +2227,24 @@ class FluxerAdapter(BasePlatformAdapter):
         return thread_id
 
     # ── session-title naming for a thread this adapter opened ───────────────────
+
+    async def _add_thread_member(self, thread_id: str, user_id: str) -> None:
+        """Best-effort add of a guild member to a thread this adapter opened.
+
+        Fluxer threads are member-scoped and do not inherit the author of the
+        message the thread was started from (unlike Discord, where the anchor's
+        author is implicitly a member). Adding the author keeps the reply thread
+        visible to the person who triggered the turn. Failures never block
+        delivery; the documented route is Thread members, Add thread member.
+        """
+        try:
+            await self._request(
+                "PUT",
+                f"/channels/{thread_id}/thread-members/{user_id}",
+                warn_on_error=False,
+            )
+        except Exception:
+            logger.debug("Fluxer thread member add failed for %s", thread_id)
 
     def _record_auto_thread(
         self, chat_id: str, thread_id: str, name: str, user_id: Optional[str] = None

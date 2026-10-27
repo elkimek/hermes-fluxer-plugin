@@ -10,6 +10,14 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+### Added
+
+- Automatic thread replies now also add the message author who triggered the turn as a member of the new thread (`PUT /channels/{thread_id}/thread-members/{user_id}`). Fluxer threads are member-scoped, so without this the person who asked could not see the reply thread opened for them (Discord adds the anchor's author implicitly). The add is best-effort and never blocks delivery.
+
+### Verification
+
+- Regression tests cover the member add on auto-thread creation and continued delivery when the member route fails.
+
 ## [0.5.1] - 2026-10-13
 
 ### Fixed
