@@ -2254,7 +2254,12 @@ class FluxerAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 if not _thread_already_exists_for_message(exc):
-                    logger.debug("Fluxer thread start failed for %s/%s: %s", chat_id, message_id, exc)
+                    # AGENTS.md forbids private IDs in logs; report the failure
+                    # class only, never the chat/anchor ids or the response body.
+                    logger.debug(
+                        "Fluxer thread start failed (%s); delivering to the channel",
+                        type(exc).__name__,
+                    )
                     return None
                 # The refusal names the thread: Fluxer anchors a thread to its
                 # message and gives it that message's id. Adopt it -- falling back
