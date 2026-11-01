@@ -1534,10 +1534,21 @@ async def test_reconnect_restarts_voice_supervisor(monkeypatch):
     adapter = fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra={"bot_token": "app.secret"}))
     adapter._voice_supervisor = FakeSupervisor()  # type: ignore[assignment]
     monkeypatch.setattr(fluxer_adapter.asyncio, "sleep", AsyncMock(return_value=None))
-    adapter._connect_gateway_once = AsyncMock(return_value=None)
+
+    async def connect_with_live_listener():
+        # A real connect leaves a running listener behind; a reconnect attempt that
+        # does not is a failed attempt and must not reach voice-supervisor restart.
+        async def live_listener():
+            await asyncio.sleep(3600)
+
+        adapter._listener_task = asyncio.get_running_loop().create_task(live_listener())
+
+    adapter._connect_gateway_once = connect_with_live_listener
     adapter._mark_connected = lambda: starts.append("mark_connected")
 
     await adapter._reconnect_loop("test")
+    if adapter._listener_task is not None:
+        adapter._listener_task.cancel()
 
     assert starts == ["mark_connected", "start"]
 
