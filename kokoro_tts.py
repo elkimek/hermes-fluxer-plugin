@@ -173,24 +173,37 @@ class KokoroSpeechClient:
         # `with` block then closes the response.
         stop = threading.Event()
         pending_puts: set[concurrent.futures.Future[None]] = set()
+        # Guards the create-then-register step against the consumer's teardown:
+        # a put future that neither reached `pending_puts` nor saw `closed` would
+        # never be cancelled, and the worker thread would block in result()
+        # forever once the queue is full.
+        put_lock = threading.Lock()
+        closed = False
         result = KokoroSpeechResult(transcript=text, events_seen=["kokoro_speech_request"])
 
         def _put_blocking(item: Any) -> bool:
             """Wait for queue space from the producer thread; False once stopped."""
-            while not stop.is_set():
+            while True:
+                with put_lock:
+                    if closed:
+                        return False
                 try:
                     future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
                 except RuntimeError:  # the event loop is gone
                     return False
-                pending_puts.add(future)
+                with put_lock:
+                    if closed:
+                        future.cancel()
+                        return False
+                    pending_puts.add(future)
                 try:
                     future.result()
                     return True
                 except (concurrent.futures.CancelledError, RuntimeError):
                     return False
                 finally:
-                    pending_puts.discard(future)
-            return False
+                    with put_lock:
+                        pending_puts.discard(future)
 
         def _produce() -> None:
             try:
@@ -245,8 +258,11 @@ class KokoroSpeechClient:
             result.events_seen.append("kokoro_speech_complete")
             return result
         finally:
-            stop.set()
-            for future in list(pending_puts):
+            with put_lock:
+                closed = True
+                stop.set()
+                pending = list(pending_puts)
+            for future in pending:
                 # A producer waiting for space must not outlive the consumer.
                 future.cancel()
             if not producer.done():
