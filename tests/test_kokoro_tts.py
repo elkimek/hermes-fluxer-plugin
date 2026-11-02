@@ -61,7 +61,7 @@ def test_streams_pcm_chunks_to_sink(monkeypatch):
         async def sink(data: bytes) -> None:
             chunks.append(data)
 
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1")
+        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
         result = await client.text_response_to_sink("hello", sink, timeout=5.0)
         return result, chunks
 
@@ -89,7 +89,7 @@ def test_force_message_to_sink_shares_streaming_path(monkeypatch):
         async def sink(data: bytes) -> None:
             chunks.append(data)
 
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1")
+        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
         result = await client.force_message_to_sink("hello", sink, timeout=5.0)
         return result, chunks
 
@@ -100,7 +100,7 @@ def test_force_message_to_sink_shares_streaming_path(monkeypatch):
 
 
 def test_empty_text_is_rejected():
-    client = KokoroSpeechClient(base_url="http://kokoro.test/v1")
+    client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
 
     async def _run():
         async def sink(data: bytes) -> None:  # pragma: no cover - never called
@@ -120,10 +120,20 @@ def test_rejects_a_sample_rate_kokoro_cannot_serve():
     import pytest
 
     with pytest.raises(ValueError, match="cannot\\s+resample"):
-        KokoroSpeechClient(sample_rate=16_000)
+        KokoroSpeechClient(
+            base_url="http://kokoro.test/v1", voice="test-voice", sample_rate=16_000
+        )
     # 24 kHz is what the service emits, so the default and an explicit value pass.
-    assert KokoroSpeechClient(sample_rate=24_000).sample_rate == 24_000
-    assert KokoroSpeechClient().sample_rate == 24_000
+    assert (
+        KokoroSpeechClient(
+            base_url="http://kokoro.test/v1", voice="test-voice", sample_rate=24_000
+        ).sample_rate
+        == 24_000
+    )
+    assert (
+        KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice").sample_rate
+        == 24_000
+    )
 
 
 def test_a_stream_that_stalls_after_the_first_chunk_fails_the_reply(monkeypatch):
@@ -153,7 +163,7 @@ def test_a_stream_that_stalls_after_the_first_chunk_fails_the_reply(monkeypatch)
     )
 
     async def _run():
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1")
+        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
         written: list[bytes] = []
 
         async def _sink(chunk: bytes) -> None:
@@ -194,7 +204,7 @@ def test_cancelling_stops_the_producer_at_the_next_chunk(monkeypatch):
     )
 
     async def _run():
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1")
+        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
 
         async def _sink(chunk: bytes) -> None:
             await asyncio.sleep(0.5)  # a sink that never keeps up
@@ -214,3 +224,61 @@ def test_cancelling_stops_the_producer_at_the_next_chunk(monkeypatch):
     # The stop flag ends the request at the next chunk boundary instead of the
     # producer reading to EOF into a queue nobody drains.
     assert after <= before
+
+
+def test_requires_a_url_and_a_voice(monkeypatch):
+    import pytest
+
+    for name in ("FLUXER_VOICE_KOKORO_URL", "FLUXER_VOICE_KOKORO_VOICE"):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ValueError, match="FLUXER_VOICE_KOKORO_URL"):
+        KokoroSpeechClient()
+    with pytest.raises(ValueError, match="FLUXER_VOICE_KOKORO_VOICE"):
+        KokoroSpeechClient(base_url="http://kokoro.test/v1")
+
+    # Nothing deployment-specific is compiled in: the env values are what runs.
+    monkeypatch.setenv("FLUXER_VOICE_KOKORO_URL", "http://tts.example/v1/")
+    monkeypatch.setenv("FLUXER_VOICE_KOKORO_VOICE", "some-voice")
+    client = KokoroSpeechClient()
+    assert client.base_url == "http://tts.example/v1"
+    assert client.voice == "some-voice"
+
+
+def test_a_slow_sink_loses_no_audio_when_the_queue_fills(monkeypatch):
+    chunks = [bytes([index]) * 4096 for index in range(8)]
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.remaining = list(chunks)
+
+        def read(self, size: int = -1) -> bytes:
+            return self.remaining.pop(0) if self.remaining else b""
+
+        def __enter__(self) -> "_Stream":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "kokoro_tts.urllib.request.urlopen",
+        lambda request, timeout=None: _Stream(),
+    )
+    # One slot: the producer has to wait for the slow sink instead of dropping.
+    monkeypatch.setattr("kokoro_tts._QUEUE_CHUNKS", 1)
+
+    async def _run():
+        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
+        received: list[bytes] = []
+
+        async def _sink(chunk: bytes) -> None:
+            await asyncio.sleep(0.005)
+            received.append(chunk)
+
+        return await client.text_response_to_sink("hello", _sink, timeout=5.0), received
+
+    result, received = asyncio.run(_run())
+    assert received == chunks
+    assert "kokoro_speech_complete" in result.events_seen
+    assert result.bytes_written == sum(len(chunk) for chunk in chunks)

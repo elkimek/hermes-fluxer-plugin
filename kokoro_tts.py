@@ -9,6 +9,7 @@ logic stays unchanged.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -20,26 +21,44 @@ from typing import Any, Awaitable, Callable, Optional
 logger = logging.getLogger("fluxer_kokoro_tts")
 
 # Kokoro emits mono PCM16 at 24 kHz; FLUXER_VOICE_SAMPLE_RATE must match.
-DEFAULT_KOKORO_URL = "http://kokoro.kokoro.svc.cluster.local:8000/v1"
+# The endpoint and the voice carry no default: both are deployment choices
+# (which service, which language), so FLUXER_VOICE_KOKORO_URL and
+# FLUXER_VOICE_KOKORO_VOICE must name them.
 DEFAULT_KOKORO_MODEL = "kokoro"
-DEFAULT_KOKORO_VOICE = "af_bella"
 KOKORO_SAMPLE_RATE = 24_000
 _READ_CHUNK_BYTES = 4096
-# 256 chunks is about 21 s of 24 kHz mono PCM16: enough headroom for a slow
-# sink, small enough that a reader that stops consuming cannot grow it forever.
+# 256 chunks is about 21 s of 24 kHz mono PCM16. The producer waits for space
+# rather than dropping audio when it fills, so this is backpressure, not a cap.
 _QUEUE_CHUNKS = 256
+# Marks the end of the stream; distinct from a chunk so a falsy item cannot be
+# mistaken for it.
+_END = object()
+
+
+def env_value(name: str) -> str:
+    return (os.getenv(name) or "").strip()
 
 
 def kokoro_base_url() -> str:
-    return (os.getenv("FLUXER_VOICE_KOKORO_URL") or DEFAULT_KOKORO_URL).strip().rstrip("/")
+    url = env_value("FLUXER_VOICE_KOKORO_URL").rstrip("/")
+    if not url:
+        raise ValueError(
+            "FLUXER_VOICE_KOKORO_URL is not set: name the OpenAI-compatible TTS endpoint"
+        )
+    return url
 
 
 def kokoro_model() -> str:
-    return (os.getenv("FLUXER_VOICE_KOKORO_MODEL") or DEFAULT_KOKORO_MODEL).strip()
+    return env_value("FLUXER_VOICE_KOKORO_MODEL") or DEFAULT_KOKORO_MODEL
 
 
 def kokoro_voice() -> str:
-    return (os.getenv("FLUXER_VOICE_KOKORO_VOICE") or DEFAULT_KOKORO_VOICE).strip()
+    voice = env_value("FLUXER_VOICE_KOKORO_VOICE")
+    if not voice:
+        raise ValueError(
+            "FLUXER_VOICE_KOKORO_VOICE is not set: name a voice the TTS service offers"
+        )
+    return voice
 
 
 def build_kokoro_speech_request(
@@ -149,26 +168,29 @@ class KokoroSpeechClient:
         )
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=_QUEUE_CHUNKS)
-        # urllib's read() blocks in a worker thread that asyncio cannot cancel,
-        # so the producer watches this flag and stops at the next chunk boundary;
-        # leaving the `with` block then closes the response.
+        # urllib's read() blocks in a worker thread asyncio cannot cancel, so the
+        # producer watches this flag and stops at the next chunk boundary; the
+        # `with` block then closes the response.
         stop = threading.Event()
+        pending_puts: set[concurrent.futures.Future[None]] = set()
         result = KokoroSpeechResult(transcript=text, events_seen=["kokoro_speech_request"])
 
-        def _deliver(item: Any) -> None:
-            try:
-                queue.put_nowait(item)
-            except asyncio.QueueFull:
-                # The consumer stopped reading (barge-in, cancellation): stop
-                # the request instead of buffering audio nobody plays.
-                stop.set()
-
-        def _deliver_from_thread(item: Any) -> None:
-            try:
-                loop.call_soon_threadsafe(_deliver, item)
-            except RuntimeError:
-                # The event loop is gone; nobody will read the queue again.
-                stop.set()
+        def _put_blocking(item: Any) -> bool:
+            """Wait for queue space from the producer thread; False once stopped."""
+            while not stop.is_set():
+                try:
+                    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+                except RuntimeError:  # the event loop is gone
+                    return False
+                pending_puts.add(future)
+                try:
+                    future.result()
+                    return True
+                except (concurrent.futures.CancelledError, RuntimeError):
+                    return False
+                finally:
+                    pending_puts.discard(future)
+            return False
 
         def _produce() -> None:
             try:
@@ -178,12 +200,19 @@ class KokoroSpeechClient:
                         chunk = response.read(_READ_CHUNK_BYTES)
                         if not chunk:
                             break
-                        _deliver_from_thread(chunk)
+                        # Backpressure, not a cap: a sink slower than the stream
+                        # must not cost audio, so wait for space instead of
+                        # dropping the chunk.
+                        if not _put_blocking(chunk):
+                            return
             except Exception as exc:  # surfaced to the caller via the queue
                 if not stop.is_set():
-                    _deliver_from_thread(exc)
+                    _put_blocking(exc)
             finally:
-                _deliver_from_thread(None)
+                # Never dropped: a healthy stream that filled the queue must
+                # still deliver the end marker, or the reply would time out.
+                if not stop.is_set():
+                    _put_blocking(_END)
 
         producer = asyncio.create_task(asyncio.to_thread(_produce), name="kokoro-speech-producer")
         started = loop.time()
@@ -205,7 +234,7 @@ class KokoroSpeechClient:
                     raise RuntimeError(
                         self._timeout_message(result, timeout, first_audio_timeout)
                     ) from exc
-                if item is None:
+                if item is _END:
                     break
                 if isinstance(item, BaseException):
                     raise RuntimeError(f"Kokoro speech request failed: {item}") from item
@@ -217,6 +246,9 @@ class KokoroSpeechClient:
             return result
         finally:
             stop.set()
+            for future in list(pending_puts):
+                # A producer waiting for space must not outlive the consumer.
+                future.cancel()
             if not producer.done():
                 producer.cancel()
 
