@@ -152,7 +152,26 @@ def _voice_child_process_env() -> dict[str, str]:
         multiplexed = bool(is_multiplex_active())
         scope = current_secret_scope() if multiplexed else None
     if multiplexed and scope is None:
-        raise RuntimeError("Fluxer voice child environment requires an active Hermes profile scope")
+        # Only a task serving a ROUTED (foreign) profile must not fall back to
+        # os.environ: that env belongs to the launch profile. The launch
+        # profile's own adapter construction (gateway connect, no scope bound)
+        # falls back to os.environ — the same resolution get_scoped_secret
+        # applies when get_secret fails closed with UnscopedSecretError.
+        routed = False
+        try:
+            from hermes_constants import (
+                get_hermes_home_override,
+                get_routing_process_hermes_home,
+                hermes_home_key,
+            )
+
+            own = hermes_home_key(get_routing_process_hermes_home())
+            override = get_hermes_home_override()
+            routed = override is not None and hermes_home_key(override) != own
+        except Exception:
+            routed = False
+        if routed:
+            raise RuntimeError("Fluxer voice child environment requires an active Hermes profile scope")
 
     try:
         from tools.environments.local import build_subprocess_env
