@@ -75,7 +75,7 @@ try:  # Moved out of transcription_tools in the Sep-2026 Hermes decomposition.
     from tools.transcription_cloud import _extract_transcript_text  # noqa: E402
 except ImportError:  # Standalone plugin surface: the local shim ships both.
     from tools.transcription_tools import _extract_transcript_text, get_env_value  # noqa: E402
-from kokoro_tts import KokoroSpeechClient  # noqa: E402
+from kokoro_tts import KOKORO_SAMPLE_RATE, KokoroSpeechClient  # noqa: E402
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
 logger = logging.getLogger("fluxer_stt_voice_loop")
@@ -709,6 +709,13 @@ async def run_stt_voice_loop(args: argparse.Namespace) -> dict[str, Any]:
     xai_api_key = os.getenv("XAI_API_KEY", "").strip()
     if not xai_api_key and voice_output_requires_xai(args):
         raise RuntimeError("XAI_API_KEY is required for the configured xAI providers")
+    if not xai_api_key and args.sample_rate != KOKORO_SAMPLE_RATE:
+        # Kokoro streams 24 kHz PCM16 and the loop publishes whatever it is
+        # told, so a different rate would play every reply slow and low.
+        raise RuntimeError(
+            f"the Kokoro voice client streams {KOKORO_SAMPLE_RATE} Hz; set "
+            f"FLUXER_VOICE_SAMPLE_RATE={KOKORO_SAMPLE_RATE} or provide XAI_API_KEY"
+        )
 
     voice_context_cache = load_voice_context_cache(args.voice_context_file)
     args.voice_system_prompt = compose_system_prompt(voice_context_cache=voice_context_cache)

@@ -114,3 +114,103 @@ def test_empty_text_is_rejected():
         assert "empty" in str(exc)
     else:  # pragma: no cover - defensive
         raise AssertionError("expected ValueError for empty text")
+
+
+def test_rejects_a_sample_rate_kokoro_cannot_serve():
+    import pytest
+
+    with pytest.raises(ValueError, match="cannot\\s+resample"):
+        KokoroSpeechClient(sample_rate=16_000)
+    # 24 kHz is what the service emits, so the default and an explicit value pass.
+    assert KokoroSpeechClient(sample_rate=24_000).sample_rate == 24_000
+    assert KokoroSpeechClient().sample_rate == 24_000
+
+
+def test_a_stream_that_stalls_after_the_first_chunk_fails_the_reply(monkeypatch):
+    import pytest
+    import time
+
+    class _Stalling:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                return b"\x00\x01" * 32
+            time.sleep(0.6)
+            return b""
+
+        def __enter__(self) -> "_Stalling":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "kokoro_tts.urllib.request.urlopen",
+        lambda request, timeout=None: _Stalling(),
+    )
+
+    async def _run():
+        client = KokoroSpeechClient(base_url="http://kokoro.test/v1")
+        written: list[bytes] = []
+
+        async def _sink(chunk: bytes) -> None:
+            written.append(chunk)
+
+        with pytest.raises(RuntimeError, match="did not finish within"):
+            await client.text_response_to_sink("hello", _sink, timeout=0.15)
+        return written
+
+    # The first chunk was delivered, so this is a partial reply, not silence.
+    assert asyncio.run(_run())
+
+
+def test_cancelling_stops_the_producer_at_the_next_chunk(monkeypatch):
+    import time
+
+    class _Counting:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                return b"\x00\x01" * 32
+            time.sleep(0.25)
+            return b"\x00\x01" * 32
+
+        def __enter__(self) -> "_Counting":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    response = _Counting()
+    monkeypatch.setattr(
+        "kokoro_tts.urllib.request.urlopen",
+        lambda request, timeout=None: response,
+    )
+
+    async def _run():
+        client = KokoroSpeechClient(base_url="http://kokoro.test/v1")
+
+        async def _sink(chunk: bytes) -> None:
+            await asyncio.sleep(0.5)  # a sink that never keeps up
+
+        task = asyncio.create_task(client.text_response_to_sink("hello", _sink, timeout=30.0))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        calls_after_cancel = response.calls
+        await asyncio.sleep(0.4)
+        return calls_after_cancel, response.calls
+
+    before, after = asyncio.run(_run())
+    # The stop flag ends the request at the next chunk boundary instead of the
+    # producer reading to EOF into a queue nobody drains.
+    assert after <= before

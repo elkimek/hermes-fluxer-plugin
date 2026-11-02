@@ -1731,7 +1731,9 @@ class FluxerAdapter(BasePlatformAdapter):
                         responses[-1] = {**data, "delivery_verified": True, "delivery_readback": verified}
                     else:
                         responses[-1] = {**data, "delivery_verified": False}
-                    await self._attach_keycap_reactions(chat_id, message_id, chunk_payload["content"])
+                    await self._attach_keycap_reactions(
+                        target_chat_id, message_id, chunk_payload["content"]
+                    )
 
             return SendResult(
                 success=True,
@@ -3548,10 +3550,15 @@ class FluxerAdapter(BasePlatformAdapter):
         message_id = str(result.message_id or "") if result.success else ""
         if not message_id:
             return result
+        # A reply may land in a thread rather than the caller's channel; the
+        # reactions and the saved card have to name where the message actually
+        # is, or Fluxer reports the thread id back and the answer is rejected as
+        # a channel mismatch.
+        destination = self._destination_for_message(message_id, chat_id)
         self._register_clarify_card(
             clarify_id=clarify_id,
             message_id=message_id,
-            chat_id=str(chat_id),
+            chat_id=str(destination),
             content=text,
             emojis=emojis,
         )
@@ -3562,10 +3569,10 @@ class FluxerAdapter(BasePlatformAdapter):
                 "session_key": session_key or "",
                 "choice": str(choice),
                 "message_id": message_id,
-                "channel_id": str(chat_id),
+                "channel_id": str(destination),
             }
             try:
-                await self._add_reaction(chat_id, message_id, emoji)
+                await self._add_reaction(destination, message_id, emoji)
             except Exception:
                 # Missing affordance is cosmetic; the typed reply path still resolves.
                 logger.debug("Fluxer clarify reaction could not be added")

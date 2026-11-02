@@ -3695,3 +3695,83 @@ async def test_reaction_forward_guards(monkeypatch):
     )
 
     assert forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_send_attaches_keycap_reactions_in_the_thread_it_replied_into(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "delivery_verification": False,
+            },
+        )
+    )
+    adapter._request = AsyncMock(side_effect=[{"id": "msg-ask"}, {}, {}])
+
+    result = await adapter.send(
+        "chan-1", "→ 1️⃣ re-run · 2️⃣ skip", metadata={"thread_id": "thread-7"}
+    )
+
+    assert result.success is True
+    calls = [(call.args[0], call.args[1]) for call in adapter._request.await_args_list]
+    assert calls[0] == ("POST", "/channels/thread-7/messages")
+    # The reactions have to land where the message is, or Fluxer reports the
+    # thread id back and the tap never resolves the ask.
+    assert all(path.startswith("/channels/thread-7/") for _, path in calls[1:])
+
+
+@pytest.mark.asyncio
+async def test_send_clarify_saves_the_thread_the_card_lives_in(monkeypatch):
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+
+    async def fake_send(chat_id, content, reply_to=None, metadata=None):
+        # send() records where the message landed; here it landed in a thread.
+        adapter._remember_message_destination("m-1", "thread-7")
+        return fluxer_adapter.SendResult(success=True, message_id="m-1")
+
+    reacted = []
+
+    async def fake_add_reaction(chat_id, message_id, emoji):
+        reacted.append((chat_id, message_id, emoji))
+
+    monkeypatch.setattr(adapter, "send", fake_send)
+    monkeypatch.setattr(adapter, "_add_reaction", fake_add_reaction)
+
+    class NullContext:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    awaiting = []
+    stub = type(sys)("tools.clarify_gateway")
+    stub.mark_awaiting_text = awaiting.append
+    stub._entries = {}
+    stub._lock = NullContext()
+    tools_pkg = type(sys)("tools")
+    tools_pkg.__path__ = []
+    monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+    monkeypatch.setitem(sys.modules, "tools.clarify_gateway", stub)
+
+    result = await adapter.send_clarify(
+        chat_id="chan-1",
+        question="Which way?",
+        choices=["dig", "you take it"],
+        clarify_id="c-1",
+        session_key="sess-1",
+        metadata=None,
+    )
+
+    assert result.success is True
+    assert {r[0] for r in reacted} == {"thread-7"}
+    actions = adapter._pending_reaction_actions
+    assert {actions[key]["channel_id"] for key in actions} == {"thread-7"}
+    assert adapter._pending_clarify_cards["c-1"]["chat_id"] == "thread-7"

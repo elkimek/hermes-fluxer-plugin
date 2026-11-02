@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
@@ -22,7 +23,11 @@ logger = logging.getLogger("fluxer_kokoro_tts")
 DEFAULT_KOKORO_URL = "http://kokoro.kokoro.svc.cluster.local:8000/v1"
 DEFAULT_KOKORO_MODEL = "kokoro"
 DEFAULT_KOKORO_VOICE = "af_bella"
+KOKORO_SAMPLE_RATE = 24_000
 _READ_CHUNK_BYTES = 4096
+# 256 chunks is about 21 s of 24 kHz mono PCM16: enough headroom for a slow
+# sink, small enough that a reader that stops consuming cannot grow it forever.
+_QUEUE_CHUNKS = 256
 
 
 def kokoro_base_url() -> str:
@@ -92,6 +97,12 @@ class KokoroSpeechClient:
         ).strip()
         self.model = model or kokoro_model()
         self.voice = voice or kokoro_voice()
+        if sample_rate != KOKORO_SAMPLE_RATE:
+            raise ValueError(
+                f"Kokoro streams mono PCM16 at {KOKORO_SAMPLE_RATE} Hz and cannot "
+                f"resample; got sample_rate={sample_rate}. Set "
+                "FLUXER_VOICE_SAMPLE_RATE=24000 (or use the xAI client) instead."
+            )
         self.sample_rate = sample_rate
 
     async def text_response_to_sink(
@@ -137,37 +148,63 @@ class KokoroSpeechClient:
             api_key=self.api_key,
         )
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[Any] = asyncio.Queue()
+        queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=_QUEUE_CHUNKS)
+        # urllib's read() blocks in a worker thread that asyncio cannot cancel,
+        # so the producer watches this flag and stops at the next chunk boundary;
+        # leaving the `with` block then closes the response.
+        stop = threading.Event()
         result = KokoroSpeechResult(transcript=text, events_seen=["kokoro_speech_request"])
+
+        def _deliver(item: Any) -> None:
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                # The consumer stopped reading (barge-in, cancellation): stop
+                # the request instead of buffering audio nobody plays.
+                stop.set()
+
+        def _deliver_from_thread(item: Any) -> None:
+            try:
+                loop.call_soon_threadsafe(_deliver, item)
+            except RuntimeError:
+                # The event loop is gone; nobody will read the queue again.
+                stop.set()
 
         def _produce() -> None:
             try:
                 with urllib.request.urlopen(request, timeout=timeout) as response:
                     result.events_seen.append(f"http_{getattr(response, 'status', 0)}")
-                    while True:
+                    while not stop.is_set():
                         chunk = response.read(_READ_CHUNK_BYTES)
                         if not chunk:
                             break
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
+                        _deliver_from_thread(chunk)
             except Exception as exc:  # surfaced to the caller via the queue
-                loop.call_soon_threadsafe(queue.put_nowait, exc)
+                if not stop.is_set():
+                    _deliver_from_thread(exc)
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                _deliver_from_thread(None)
 
         producer = asyncio.create_task(asyncio.to_thread(_produce), name="kokoro-speech-producer")
+        started = loop.time()
+        deadline = started + timeout
+        first_deadline = deadline
+        if first_audio_timeout:
+            first_deadline = min(deadline, started + first_audio_timeout)
         try:
             while True:
-                wait = timeout
-                if not result.bytes_written and first_audio_timeout:
-                    wait = min(timeout, first_audio_timeout)
+                # One deadline for the whole reply: a chunk arriving just inside
+                # the per-chunk wait must not extend the turn indefinitely.
+                limit = deadline if result.bytes_written else first_deadline
+                wait = limit - loop.time()
+                if wait <= 0:
+                    raise RuntimeError(self._timeout_message(result, timeout, first_audio_timeout))
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=wait)
                 except (TimeoutError, asyncio.TimeoutError) as exc:
-                    if not result.bytes_written:
-                        raise RuntimeError(
-                            f"Kokoro speech produced no audio within {wait}s"
-                        ) from exc
-                    break
+                    raise RuntimeError(
+                        self._timeout_message(result, timeout, first_audio_timeout)
+                    ) from exc
                 if item is None:
                     break
                 if isinstance(item, BaseException):
@@ -179,5 +216,18 @@ class KokoroSpeechClient:
             result.events_seen.append("kokoro_speech_complete")
             return result
         finally:
+            stop.set()
             if not producer.done():
                 producer.cancel()
+
+    @staticmethod
+    def _timeout_message(
+        result: KokoroSpeechResult,
+        timeout: float,
+        first_audio_timeout: Optional[float],
+    ) -> str:
+        if not result.bytes_written:
+            return f"Kokoro speech produced no audio within {first_audio_timeout or timeout}s"
+        # Partial audio is a failed reply, not a short one: the voice loop must
+        # not report a truncated turn as complete.
+        return f"Kokoro speech did not finish within {timeout}s"
