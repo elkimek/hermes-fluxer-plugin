@@ -92,7 +92,16 @@ async def test_naming_failure_does_not_block_outbound_reply(
         assert result.message_id == "reply-1"
         name = "Existing title" if fault == "healthy" else "Synthetic trigger"
         adapter.create_thread.assert_awaited_once_with("channel-1", name, message_id="trigger-1")
-        adapter._request.assert_awaited_once()
+        calls = adapter._request.await_args_list
+        if thread_available:
+            # The reply thread is opened for its triggering author first, then the
+            # reply is posted into it (member add is best-effort and non-blocking).
+            assert [c.args for c in calls] == [
+                ("PUT", "/channels/thread-1/thread-members/user-1"),
+                ("POST", "/channels/thread-1/messages"),
+            ]
+        else:
+            assert [c.args for c in calls] == [("POST", "/channels/channel-1/messages")]
         call = adapter._request.await_args
         assert call is not None
         destination = "thread-1" if thread_available else "channel-1"
