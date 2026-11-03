@@ -24,6 +24,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Replies and attachments stay in their intended conversation when references become stale, a thread already exists, or several people talk at once. A genuinely deleted automatic thread still has a safe parent-channel fallback.
 - Thread titles, typing indicators, progress, approval prompts, `/title`, `/stop` and goal controls follow the correct participant and session. Human thread names and explicit destinations are respected.
+- Cancelling an optional membership request no longer abandons the new thread's pending title update.
 - Dead receive listeners and heartbeat failures trigger recovery instead of silently leaving Fluxer deaf. Connection replacement and shutdown clean up old tasks and sockets.
 - Scheduled notifications and bare-platform sends accept Hermes' structured YAML home-channel settings.
 - Read tools no longer silently discard longer answers. Scope checks, redirect handling, bounded responses and diagnostics protect profile boundaries and private data.
@@ -32,11 +33,12 @@ This project uses simple semantic versioning while the plugin is young:
 ### Verification
 
 - Supported Python and actual Hermes-host suites cover the combined release, including concurrent turns, every embed/reference/thread fallback order, profile authorization, real loopback WebSocket/HTTP cleanup, and built-wheel imports.
+- Live checks cover text and attachment delivery, human-origin tool progress and replies, provider message/thread actions, and human-confirmed audible voice replies.
 
 ### Compatibility notes
 
 - Threads and voice remain opt-in. Read tools require adding `fluxer` to the existing platform toolset list; their authority is the bot's configured guild access, not the requesting user's individual permissions. Search indexing, audit access and server-side features depend on the deployment.
-- Voice/E2EE protocol and SDK checks are automated evidence, not certification of audible encrypted calls or secrecy from the signalling server. Human voice acceptance is tracked separately.
+- Voice remains experimental: basic capture and audible replies passed live acceptance, but clean recovery after interruption is not certified. The validation room did not issue an E2EE key; E2EE is source/SDK tested, not live-certified or a promise of secrecy from the signalling server. Keep auto-join disabled until your own room's acceptance succeeds.
 - Removing choice reactions after typed answers or timeouts depends on the Hermes host's retirement callback. Retired reaction answers are rejected even on older hosts.
 
 Thanks to @gwyntel-git, @xanoryx, @andrew-manger and @FMB128 for the contributions.

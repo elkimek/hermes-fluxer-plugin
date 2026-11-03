@@ -111,7 +111,13 @@ Protocol review is grounded in [Fluxer source at `8cc485cf`](https://github.com/
 - The bridge passes the **key string's UTF-8 bytes**, without base64 decoding, to `RoomOptions.encryption = E2EEOptions(key_provider_options=KeyProviderOptions(shared_key=...))`. This matches the web client's string input to `ExternalE2EEKeyProvider.setKey`: PBKDF2 with salt `LKFrameEncryptionKey`. Offline construction was also checked against the declared minimum Python SDK, LiveKit 1.1.10. The SDK retains the crypto material as required for encryption; the adapter's safe update, return value, and diagnostics contain no key or token.
 - Guild room keys are created on demand, retained while a voice state or pending capable join exists, and forgotten when fully idle. A joiner's grant is not a demonstrated rekey notification for every existing participant.
 
-Diagnostics: `has_e2ee_key` and the bridge's `e2ee=True` log report local configuration only. They do **not** prove successful remote decryption, audible bidirectional speech, privacy against the signalling server that supplies the shared key, or a particular deployment's E2EE rollout. No live voice-room acceptance was performed during this review. A consenting human must still verify encrypted join → targeted capture → STT → reply playback, plus interruption and reconnect/key lifecycle.
+Diagnostics: `has_e2ee_key` and the bridge's `e2ee=True` log report local configuration only. They do **not** prove successful remote decryption, audible bidirectional speech, privacy against the signalling server that supplies the shared key, or a particular deployment's E2EE rollout. A consenting human must verify encrypted join → targeted capture → STT → reply playback, plus interruption and reconnect/key lifecycle, on their own deployment.
+
+### Release 0.6.0 acceptance status
+
+- Targeted microphone capture, transcription, response generation and audible reply playback were verified with a consenting human on hosted Fluxer using the configured xAI path.
+- Interruption was detected after testing a shorter duration trigger, but clean follow-up recovery was not certified. Voice remains experimental; the validation deployment was left with auto-join paused rather than presenting this as a complete production-voice pass.
+- The validation room supplied no E2EE key. Its successful speech exchange is therefore not an encrypted-call acceptance test. E2EE construction/protocol evidence remains offline; other providers, room policies and key lifecycles require their own acceptance.
 
 ## Open questions
 
