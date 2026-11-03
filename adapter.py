@@ -5849,3 +5849,14 @@ def register(ctx) -> None:
             "and voice/video. Prefer normal Markdown for structured replies."
         ),
     )
+    try:
+        # Package import in the gateway (hermes_plugins.fluxer_platform.adapter);
+        # top-level when the tests import adapter.py directly.
+        try:
+            from . import agent_tools  # noqa: PLC0415
+        except ImportError:  # pragma: no cover - flat-import test env
+            import agent_tools  # noqa: PLC0415
+        count = agent_tools.register(ctx)
+        logger.info("Fluxer agent tools registered: %s (toolset=fluxer)", count)
+    except Exception as exc:
+        logger.warning("Fluxer agent tools not registered (%s)", type(exc).__name__)

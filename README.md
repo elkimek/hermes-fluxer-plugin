@@ -237,6 +237,46 @@ Install elkimek/hermes-fluxer-plugin into my Hermes setup. Read INSTALL_FOR_AGEN
 
 ## Configuration reference
 
+### Optional agent read tools
+
+The `fluxer` toolset adds four read-only tools: `flux_recall` (recent channel messages),
+`flux_search` (channel message search), `flux_members` (home-guild members), and
+`flux_audit` (recent home-guild audit entries). To expose them, append `fluxer` to
+your existing `platform_toolsets.fluxer` list. Do not replace the list or enable
+shell, Discord, or other unrelated toolsets just to enable these readers.
+
+Credentials and policy come from the active profile's `FLUXER_*` secret scope;
+tools do not fall back to another profile's adapter or load credentials from
+`platforms.fluxer.extra`. Extra-only configurations remain unsupported for these
+tools. Keep the bot token and read policy in the same profile scope.
+
+The default policy permits **bot-visible channels in the home guild**, not every
+channel the bot can see. Set `FLUXER_HOME_GUILD_ID`, or let the tools derive it
+from `FLUXER_HOME_CHANNEL`. The effective target (including a default channel)
+must resolve into that guild; DMs and unresolved guilds are refused. Guild
+membership is checked afresh for each read. `FLUXER_TOOL_SCOPE=global` is an
+explicit operator opt-in that permits reads beyond the home guild, including
+DMs the bot can access. Members and audit tools always use the home guild.
+
+These tools act with the **bot's** permissions, not the requesting user's Fluxer
+permissions. Only give this toolset to trusted agent users. The adapter's user,
+mention, and allowed-response-channel gates still govern inbound activation;
+`FLUXER_ALLOWED_CHANNELS` is not a per-user read ACL. Home-guild scope does not
+prevent an authorized user from reading another bot-visible channel in that guild.
+
+Recall supports `before` for older messages. All four tools return one limited
+page, not an exhaustive export. Message text and line breaks, embeds, attachment
+details, and audit changes are retained up to a 48,000-character total output
+budget; omissions are marked. Reduce `limit` or narrow the query/range when
+output is truncated. Search accepts 1–1024 characters and up to 25 hits, and
+reports an indexing delay as retryable rather than as no matches. Search needs
+an instance search backend; audit reads need the bot's audit-log permission.
+Neither feature is certified solely by a connected Gateway.
+
+API responses are limited to 16 MiB and authenticated requests never follow
+redirects. Configure the final HTTP(S) API root directly; use HTTPS except for
+deliberate local/self-hosted HTTP deployments.
+
 ### Required
 
 | Env var | Meaning |
