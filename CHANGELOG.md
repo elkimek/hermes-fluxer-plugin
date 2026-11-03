@@ -10,44 +10,36 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-03
+
 ### Added
 
-- Choice prompts and plain-message option asks expose keycap reactions. Clarify actions are registered before reactions appear and follow the message's final destination; ordinary reaction-answer forwarding is limited to allowed users reacting to this bot in a REST-confirmed one-to-one DM.
-- An explicitly configured OpenAI-compatible Kokoro endpoint provides 24 kHz streaming TTS when the voice loop does not use an xAI key. Endpoint, voice, model and optional key have manifest and YAML configuration; providers retain their own credential requirements.
-- Voice sessions advertise E2EE capability and configure LiveKit from the server grant's key string. Offline protocol and SDK checks verify configuration, not audible encryption or protection from the signalling server.
-- Read-only `flux_recall`, `flux_search`, `flux_members` and `flux_audit` tools use profile-scoped credentials and fresh home-guild authorization. Append `fluxer` to the existing platform toolset list; only an explicit `FLUXER_TOOL_SCOPE=global` widens the guild boundary.
-- Outbound messages and edits support rich embeds through `metadata["embeds"]`, with `FLUXER_OUTBOUND_EMBEDS` as an off switch. Unsupported builds fall back to text without duplicating ambiguous sends.
-- Automatic replies add the admitted triggering user to a bot-owned reply thread. Membership is best-effort within a two-second total budget, so unavailable member routes do not hold up delivery.
+- Rich message cards for outbound messages and edits, with a text fallback on servers that do not support embeds.
+- Four opt-in, read-only tools for channel history, message search, guild members and audit logs. Reads use the active profile's credentials and stay inside its home guild by default.
+- Tappable numbered reactions for choice prompts, with the answer routed back to the correct conversation.
+- Automatic membership for the person receiving a bot-owned thread reply, so the reply is easier to find. An unavailable membership route does not hold the reply back for minutes.
+- Optional Kokoro speech output, local-only transcription safeguards, voice catch-up after reconnect, and LiveKit E2EE configuration support.
 
 ### Fixed
 
-- Adoption discards stale cached ownership and mention privileges before reading the server. Thread naming, typing and reaction-answer diagnostics retain outcome reasons without logging private identifiers, titles or selected answer text.
-- Structured YAML home-channel settings now reach scheduled notifications and bare-platform sends, retaining environment precedence, scalar compatibility and profile isolation.
-- Replies recover from a stale message reference in the same destination. Text, split replies and uploads drop a rejected reference once; only a genuinely deleted thread falls back to its parent.
-- Automatic thread titles, title polling, typing and `/title` use the triggering thread's session instead of an unrelated parent-channel session. Per-participant routing keeps concurrent conversations separate.
-- `/stop` and goal controls sent from the parent reach the user's own active or paused goal thread. A new goal, its continuations and its notices share one container, while ambiguous destinations are never guessed.
-- Typing, progress and approval prompts share a single thread creator per anchor. Waiting sends retain their lock, and a failed creation keeps later output in the parent for that turn without overriding explicit destinations.
-- Threads that already exist after a restart or cache eviction are adopted instead of abandoned. Their current display name is kept separate from the rename guard, protecting human names while allowing an untouched placeholder to receive its session title. Adoption reads server ownership before granting parent-channel admission or automatic fallback.
-
-- Gateway receive and heartbeat failures reconnect instead of silently losing inbound traffic. Setup, replacement and shutdown retire old sockets and join their tasks without reconnect churn or resource leaks.
-
-- Embed text is shortened at Unicode-aware Fluxer limits. Embed rejection composes with deleted-thread recovery and disables embeds only when the response identifies them as unsupported.
-
-- Read tools preserve bounded message, embed, attachment and audit content, label partial pages, reject invalid identifiers, oversized or malformed responses and credential-bearing redirects, and keep provider errors private.
-
-- Kokoro cancellation closes stalled HTTP streams; playback backpressure preserves audio and the total deadline includes the sink. Local-only STT uses a local backend or fails without uploading to a cloud provider.
-- Initial guild voice states restore opt-in auto-join after reconnect. Voice scripts log to stdout for supervisors, and wheels include those scripts without bundling Hermes-owned namespaces.
-- Clarify cards show every choice, reject missing or wrong channels, and cannot be replayed through DM forwarding after retirement. Typed-answer/timeout affordance cleanup remains dependent on host retirement callbacks.
+- Replies and attachments stay in their intended conversation when references become stale, a thread already exists, or several people talk at once. A genuinely deleted automatic thread still has a safe parent-channel fallback.
+- Thread titles, typing indicators, progress, approval prompts, `/title`, `/stop` and goal controls follow the correct participant and session. Human thread names and explicit destinations are respected.
+- Dead receive listeners and heartbeat failures trigger recovery instead of silently leaving Fluxer deaf. Connection replacement and shutdown clean up old tasks and sockets.
+- Scheduled notifications and bare-platform sends accept Hermes' structured YAML home-channel settings.
+- Read tools no longer silently discard longer answers. Scope checks, redirect handling, bounded responses and diagnostics protect profile boundaries and private data.
+- Voice cancellation closes stalled speech requests; slow playback does not drop audio. Explicit local transcription never silently uploads audio to a cloud provider, and installed wheels include the voice sidecars.
 
 ### Verification
 
-- Offline voice and loopback HTTP tests cover stream cancellation, deadlines, STT privacy, E2EE options, configuration parity and built-wheel imports. No live voice-room, provider or audible encrypted-voice certification is claimed.
-- Regression suites cover reference recovery, deleted-thread fallback, concurrent creation and cancellation, bounded lock eviction, thread adoption and ownership, title ownership and guarded renames, queued turns, and goal pause/resume/clear lifecycles. Host-backed tests exercise Hermes routing as well as standalone adapter behavior.
-- Gateway lifecycle tests include real loopback WebSocket Identify/READY/heartbeat traffic, connection replacement, recovery after server close, and joined shutdown.
-- Membership tests cover admitted authors, concurrent participants, failure and timeout delivery, caller cancellation, and ID-free diagnostics.
-- Embed regressions cover normalization, first-chunk placement, concurrent support flags, rejection ordering, reference modes, and no duplicate sends after timeouts or server failures.
-- Tool tests exercise real-host registration, context-local profile isolation, fresh scope checks, argument and response validation, HTTP redirect rejection and bounded output. Search and audit availability remain deployment-dependent.
-- Home-channel regressions cover structured and scalar settings, missing IDs, environment seeding and precedence, profile isolation, and list-based access controls.
+- Supported Python and actual Hermes-host suites cover the combined release, including concurrent turns, every embed/reference/thread fallback order, profile authorization, real loopback WebSocket/HTTP cleanup, and built-wheel imports.
+
+### Compatibility notes
+
+- Threads and voice remain opt-in. Read tools require adding `fluxer` to the existing platform toolset list; their authority is the bot's configured guild access, not the requesting user's individual permissions. Search indexing, audit access and server-side features depend on the deployment.
+- Voice/E2EE protocol and SDK checks are automated evidence, not certification of audible encrypted calls or secrecy from the signalling server. Human voice acceptance is tracked separately.
+- Removing choice reactions after typed answers or timeouts depends on the Hermes host's retirement callback. Retired reaction answers are rejected even on older hosts.
+
+Thanks to @gwyntel-git, @xanoryx, @andrew-manger and @FMB128 for the contributions.
 
 ## [0.5.1] - 2026-10-13
 
