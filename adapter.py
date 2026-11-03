@@ -1577,7 +1577,9 @@ class FluxerAdapter(BasePlatformAdapter):
         return self._outbound_message_payload(content, embeds=embeds)
 
     def _record_outbound_embed_rejection(self, exc: BaseException) -> None:
-        self._outbound_embeds_supported = _body_mentions(exc, "embed") is False
+        # A late unrelated rejection must not undo a sibling's session disable.
+        if _body_mentions(exc, "embed") is not False:
+            self._outbound_embeds_supported = False
         # HTTP exception strings include request URLs; keep deployment IDs,
         # credentials and response text out of compatibility diagnostics.
         logger.warning(
@@ -1753,82 +1755,41 @@ class FluxerAdapter(BasePlatformAdapter):
                     # "all" mirrors the Discord adapter's every-chunk reference.
                     chunk_payload.pop("message_reference", None)
 
-                try:
-                    data = await self._request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        json=chunk_payload,
-                    )
-                except Exception as exc:
-                    thread_gone = bool(auto_thread_id) and _is_missing_channel_error(exc)
-                    if (
-                        index == 0
-                        and "embeds" in chunk_payload
-                        and not thread_gone
-                        and _is_body_rejection(exc)
-                    ):
-                        # Gate on this payload, not the session flag: a concurrent
-                        # sibling may already have flipped ``_outbound_embeds_supported``
-                        # while this request (still carrying embeds) is in flight.
-                        # Embeds are disabled for the session only when the body
-                        # blames them (or is unreadable) — an unrelated 400 must
-                        # not silence embeds. Transient failures (429/5xx/timeout)
-                        # propagate untouched instead.
-                        self._record_outbound_embed_rejection(exc)
-                        chunk_payload.pop("embeds", None)
+                # Each explicit rejection consumes one fallback dimension:
+                # abandon the automatic thread or drop embeds, at most once each.
+                # Re-enter the same handler so either failure order composes.
+                while True:
+                    try:
                         data = await self._request(
                             "POST",
                             f"/channels/{_quote_id(target_chat_id)}/messages",
                             json=chunk_payload,
                         )
-                    elif not thread_gone:
+                        break
+                    except Exception as exc:
+                        if auto_thread_id and _is_missing_channel_error(exc):
+                            logger.info("Fluxer automatic thread is gone; falling back to parent channel")
+                            self._forget_thread(auto_thread_id)
+                            self._disable_turn_thread(chat_id, reply_to, metadata)
+                            auto_thread_id = None
+                            target_chat_id = str(chat_id)
+                            self._known_channel_ids.add(target_chat_id)
+                            if reply_to and self._reply_to_mode != "off":
+                                # Restore the shared reference for later chunks too;
+                                # the configured mode still decides its placement.
+                                payload["message_reference"] = {"message_id": str(reply_to)}
+                                chunk_payload["message_reference"] = {"message_id": str(reply_to)}
+                                if index > 0 and self._reply_to_mode != "all":
+                                    chunk_payload.pop("message_reference", None)
+                            continue
+                        if "embeds" in chunk_payload and _is_body_rejection(exc):
+                            # Use this payload, not the shared session flag: another
+                            # send may have disabled embeds while this one was in flight.
+                            # Never retry an ambiguous timeout, 429 or 5xx here.
+                            self._record_outbound_embed_rejection(exc)
+                            chunk_payload = {key: value for key, value in chunk_payload.items() if key != "embeds"}
+                            continue
                         raise
-                    else:
-                        # A thread this adapter chose can be deleted between the
-                        # progress bubble and the reply. Abandon it and post to the
-                        # parent channel rather than losing the message.
-                        logger.info(
-                            "Fluxer thread %s is gone; falling back to channel %s",
-                            auto_thread_id,
-                            chat_id,
-                        )
-                        self._forget_thread(auto_thread_id)
-                        self._disable_turn_thread(chat_id, reply_to, metadata)
-                        auto_thread_id = None
-                        target_chat_id = str(chat_id)
-                        self._known_channel_ids.add(target_chat_id)
-                        if reply_to and self._reply_to_mode != "off":
-                            # Restore the reference in the shared payload as well: the
-                            # remaining chunks of a split reply are rebuilt from it, so
-                            # patching only this chunk would leave every later one
-                            # unlinked after a fallback. The mode still decides where
-                            # the reference lands.
-                            payload["message_reference"] = {"message_id": str(reply_to)}
-                            chunk_payload["message_reference"] = {"message_id": str(reply_to)}
-                            if index > 0 and self._reply_to_mode != "all":
-                                chunk_payload.pop("message_reference", None)
-                        try:
-                            data = await self._request(
-                                "POST",
-                                f"/channels/{_quote_id(target_chat_id)}/messages",
-                                json=chunk_payload,
-                            )
-                        except Exception as parent_exc:
-                            # Parent retry still carries embeds when the thread 404'd
-                            # first; apply the same content-only fallback so a build
-                            # that rejects embeds does not lose the message.
-                            if not (
-                                "embeds" in chunk_payload
-                                and _is_body_rejection(parent_exc)
-                            ):
-                                raise
-                            self._record_outbound_embed_rejection(parent_exc)
-                            chunk_payload.pop("embeds", None)
-                            data = await self._request(
-                                "POST",
-                                f"/channels/{_quote_id(target_chat_id)}/messages",
-                                json=chunk_payload,
-                            )
                 responses.append(data)
                 if data.get("id"):
                     message_id = str(data["id"])

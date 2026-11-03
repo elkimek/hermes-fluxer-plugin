@@ -18,11 +18,13 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Embed-rejection diagnostics no longer expose request URLs or raw error details, and accurately report whether embeds remain enabled.
 - Long embed text, including image alt text, is shortened using Fluxer's Unicode length limits so emoji cannot make an otherwise valid card get rejected.
+- Replies still reach the parent channel when embeds are rejected just before an automatic thread disappears. Concurrent failures no longer re-enable embeds after another request disabled them.
 
 ### Verification
 
 - Regression tests cover private embed-rejection diagnostics for direct sends and parent-channel retries.
 - Boundary tests cover every embed text cap, whole emoji, field counts and unchanged caller metadata.
+- Fallback tests cover both failure orders, split replies in every reference mode, sticky thread abandonment, and no extra retries after fallback is exhausted or delivery is ambiguous.
 - Focused embeds suite covers normalization, first-chunk placement, junk-edit guard, body-blame discrimination, concurrent flag races, and thread-gone parent degrade.
 - Live probe: create + edit with embeds → 200 on the self-hosted build.
 
