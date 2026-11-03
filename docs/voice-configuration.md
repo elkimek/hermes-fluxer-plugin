@@ -287,8 +287,10 @@ Check turn timing logs if enabled, then tune in this order:
 
 ### The bot keeps talking over the user
 
-Raise barge-in reliability by reducing playback echo and tuning VAD:
+Keep voice disabled until a bounded, consenting-human check succeeds. Capture and audible replies alone do not certify interruption or recovery. The 0.6.0 validation observed interruption with a shorter trigger but did not certify clean follow-up recovery; see [acceptance status](../REALTIME_VOICE.md#release-060-acceptance-status).
 
 - use headphones where possible during tests
-- raise `vad.energy_threshold` if speaker playback is triggering capture
-- raise `vad.min_segment_ms` to ignore short echo bursts
+- tune `barge_in.energy_threshold`, `barge_in.min_ms` and `barge_in.window_ms` for interruption, rather than confusing them with the normal turn-capture VAD settings
+- compare measured voiced duration with the configured duration trigger; a short stop utterance may never cross a longer trigger
+- shorter triggers respond faster but can mistake playback echo for an interruption, so verify the audible stop and the next complete answer before retaining a change
+- keep `barge_in.after_first_audio_only` enabled during proof runs so the original prompt's trailing audio cannot count as successful interruption

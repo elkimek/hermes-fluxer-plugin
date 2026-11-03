@@ -1,7 +1,7 @@
 name: fluxer-platform
 label: Fluxer
 kind: platform
-version: 0.5.1
+version: 0.6.0
 description: >
   Fluxer gateway adapter for Hermes Agent. Native Fluxer integration using
   Fluxer's bot REST API for outbound messages, Gateway WebSocket events for
@@ -14,6 +14,13 @@ description: >
   buttons are deployment-dependent and approval prompts include visible slash-command
   fallback text; native slash commands are also deployment-dependent.
 author: Hermes Fluxer Plugin Contributors
+provides_hooks:
+  - pre_command
+provides_tools:
+  - flux_recall
+  - flux_search
+  - flux_members
+  - flux_audit
 requires_env:
   - name: FLUXER_BOT_TOKEN
     description: "Fluxer bot token (<applicationId>.<secret>)"
