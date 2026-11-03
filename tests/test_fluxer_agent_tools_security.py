@@ -248,15 +248,15 @@ def test_host_context_profiles_never_share_guild_authorization(monkeypatch, tmp_
 
     monkeypatch.setattr(agent_tools, "_fluxer_request", request)
     for name, expected in [("a", GUILD), ("b", FOREIGN)]:
-        secret_token = scope.set_secret_scope({"FLUXER_BOT_TOKEN": f"profile-{name}",
+        secret_binding = scope.set_secret_scope({"FLUXER_BOT_TOKEN": f"profile-{name}",
                                               "FLUXER_HOME_CHANNEL": CHANNEL})
-        home_token = constants.set_hermes_home_override(tmp_path / name)
+        home_binding = constants.set_hermes_home_override(tmp_path / name)
         try:
             assert agent_tools._resolve() == ("https://api.fluxer.app/v1", f"profile-{name}", CHANNEL, expected)
             assert not agent_tools._channel_allowed(CHANNEL, BASE, f"profile-{name}", "")
         finally:
-            constants.reset_hermes_home_override(home_token)
-            scope.reset_secret_scope(secret_token)
+            constants.reset_hermes_home_override(home_binding)
+            scope.reset_secret_scope(secret_binding)
     assert requests == ["profile-a", "profile-b"]
 
 
@@ -264,13 +264,13 @@ def test_unscoped_multiplex_calls_fail_closed_without_raw_error(monkeypatch):
     scope = pytest.importorskip("agent.secret_scope")
     monkeypatch.setattr(scope, "_MULTIPLEX_ACTIVE", True)
     monkeypatch.setenv("FLUXER_BOT_TOKEN", "wrong-process-token")
-    scope_token = scope.set_secret_scope(None)
+    scope_binding = scope.set_secret_scope(None)
     try:
         out = agent_tools._flux_recall({})
         assert "unavailable" in out
         assert "get_secret" not in out
     finally:
-        scope.reset_secret_scope(scope_token)
+        scope.reset_secret_scope(scope_binding)
 
 
 def test_host_registry_exposes_usable_function_parameters(monkeypatch):
