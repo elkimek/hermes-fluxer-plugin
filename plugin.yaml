@@ -80,6 +80,10 @@ optional_env:
     description: "Reply-reference placement: off, first (default; first split chunk only), or all (every chunk). Matches the Discord adapter's reply_to_mode"
     prompt: "Reply reference mode (off/first/all)"
     password: false
+  - name: FLUXER_OUTBOUND_EMBEDS
+    description: "Allow metadata[\"embeds\"] to send rich embeds on outbound sends/edits (true/false; default true). A build that rejects embeds disables them for the session automatically"
+    prompt: "Allow outbound rich embeds?"
+    password: false
   - name: FLUXER_THREAD_REPLIES
     description: "Post replies in a thread started from the triggering message, in every channel (true/false)"
     prompt: "Reply in threads everywhere?"
