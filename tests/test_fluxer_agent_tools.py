@@ -6,12 +6,8 @@ import agent_tools
 
 
 @pytest.fixture(autouse=True)
-def _clear_tool_caches():
-    agent_tools._CHANNEL_GUILD_CACHE.clear()
-    agent_tools._HOME_GUILD_CACHE.clear()
-    yield
-    agent_tools._CHANNEL_GUILD_CACHE.clear()
-    agent_tools._HOME_GUILD_CACHE.clear()
+def _isolate_tool_secrets(monkeypatch):
+    monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": default)
 
 
 class RecordingCtx:
@@ -48,10 +44,12 @@ def test_full_register_path_includes_agent_tools(monkeypatch):
 
 def test_flux_recall_formats_and_defaults_home(monkeypatch):
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
     seen = {}
 
     def fake_request(method, path, base, token, params=None, body=None, timeout=15):
+        if not path.endswith("/messages"):
+            return {"id": "111111111111111111", "guild_id": "222222222222222222"}
         seen.update(method=method, path=path, params=params)
         return [
             {"id": "1", "timestamp": "t", "author": {"username": "op"},
@@ -62,9 +60,9 @@ def test_flux_recall_formats_and_defaults_home(monkeypatch):
 
     monkeypatch.setattr(agent_tools, "_fluxer_request", fake_request)
     out = agent_tools._flux_recall({})
-    assert seen["path"] == "/channels/home-ch/messages"
+    assert seen["path"] == "/channels/111111111111111111/messages"
     assert seen["params"]["limit"] == 20
-    assert "op: hello world" in out
+    assert "op: hello\nworld" in out
     assert "embeds=1" in out
 
 
@@ -75,24 +73,26 @@ def test_flux_recall_reports_unconfigured(monkeypatch):
 
 def test_flux_search_extracts_hits(monkeypatch):
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
     seen = {}
 
     def fake_request(method, path, base, token, params=None, body=None, timeout=15):
+        if method == "GET":
+            return {"id": "111111111111111111", "guild_id": "222222222222222222"}
         seen.update(body=body)
         return {"hits": [{"id": "9", "timestamp": "t",
                           "author": {"username": "op"}, "content": "needle"}]}
 
     monkeypatch.setattr(agent_tools, "_fluxer_request", fake_request)
     out = agent_tools._flux_search({"query": "needle", "limit": 5})
-    assert seen["body"]["context_channel_id"] == "home-ch"
+    assert seen["body"]["context_channel_id"] == "111111111111111111"
     assert seen["body"]["hits_per_page"] == 5
     assert "needle" in out
 
 
 def test_flux_members_formats(monkeypatch):
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
     monkeypatch.setattr(agent_tools, "_fluxer_request", lambda *a, **k: [
         {"user": {"id": "u1", "username": "terahertz", "global_name": "Tera"}, "nick": None},
     ])
@@ -102,7 +102,7 @@ def test_flux_members_formats(monkeypatch):
 
 def test_flux_audit_formats_entries(monkeypatch):
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
     monkeypatch.setattr(agent_tools, "_fluxer_request", lambda *a, **k: {
         "audit_log_entries": [
             {"id": "e1", "action_type": 73, "user_id": "u1",
@@ -111,19 +111,20 @@ def test_flux_audit_formats_entries(monkeypatch):
         "users": [{"id": "u1", "username": "hermes-bot"}],
     })
     out = agent_tools._flux_audit({"limit": 3})
-    assert "action=73 actor=hermes-bot target=msg-9 reason=probe cleanup" in out
+    assert "action=73 actor=hermes-bot target=? reason=probe cleanup" in out
+    assert '"new_value": "msg-9"' in out
 
 
 def test_flux_recall_kwargs_override_positional_dict(monkeypatch):
     """Direct kwargs (tests) win over the gateway-style positional dict."""
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
     seen = {}
 
     def fake_request(method, path, base, token, params=None, body=None, timeout=15):
         seen.update(params=params, path=path)
         if "/messages" not in path:  # scoping's channel lookup
-            return {"id": "123456789012345678", "guild_id": "guild-1"}
+            return {"id": "123456789012345678", "guild_id": "222222222222222222"}
         return []
 
     monkeypatch.setattr(agent_tools, "_fluxer_request", fake_request)
@@ -148,7 +149,7 @@ def test_missing_secret_scope_degrades_to_unconfigured(monkeypatch):
 
 def test_recall_refuses_channel_outside_home_guild(monkeypatch):
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
 
     def fake_request(method, path, base, token, params=None, body=None, timeout=15):
         assert path == "/channels/999888777666555"
@@ -161,7 +162,7 @@ def test_recall_refuses_channel_outside_home_guild(monkeypatch):
 
 def test_recall_scope_global_widens(monkeypatch):
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
     monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": "global" if key == "FLUXER_TOOL_SCOPE" else default)
     seen = {}
 
@@ -178,7 +179,7 @@ def test_recall_scope_global_widens(monkeypatch):
 def test_scoping_fails_closed_without_home_guild(monkeypatch):
     """No FLUXER_HOME_GUILD_ID and no derivable guild: reads are refused."""
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", ""))
+        "http://fluxer.local", "tok", "111111111111111111", ""))
     monkeypatch.setattr(agent_tools, "_derive_home_guild", lambda *a: "")
     monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": "" if key == "FLUXER_TOOL_SCOPE" else default)
     out = agent_tools._flux_recall({"channel_id": "123456789012345678"})
@@ -186,24 +187,22 @@ def test_scoping_fails_closed_without_home_guild(monkeypatch):
 
 
 def test_home_guild_derived_from_home_channel(monkeypatch):
-    monkeypatch.setattr(agent_tools, "_derive_home_guild", lambda base, token, home: "guild-derived")
-    monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": "" if key == "FLUXER_TOOL_SCOPE" else default)
-    monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", agent_tools._derive_home_guild("b", "t", "home-ch")))
+    secrets = {"FLUXER_BOT_TOKEN": "tok", "FLUXER_HOME_CHANNEL": "111111111111111111"}
+    monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": secrets.get(key, default))
 
     def fake_request(method, path, base, token, params=None, body=None, timeout=15):
         if "/messages" in path:
             return [{"id": "9", "timestamp": "t", "author": {"username": "x"}, "content": "hi"}]
-        return {"id": "999888777666555", "guild_id": "guild-derived"}
+        return {"id": path.rsplit("/", 1)[-1], "guild_id": "222222222222222222"}
 
     monkeypatch.setattr(agent_tools, "_fluxer_request", fake_request)
     out = agent_tools._flux_recall({"channel_id": "999888777666555"})
-    assert "outside the home guild" not in out
+    assert "x: hi" in out
 
 
 def test_search_channel_scoping_refuses_foreign_guild(monkeypatch):
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
     monkeypatch.setattr(agent_tools, "_get_secret", lambda key, default="": "" if key == "FLUXER_TOOL_SCOPE" else default)
     monkeypatch.setattr(agent_tools, "_fluxer_request",
                         lambda *a, **k: {"id": "c", "guild_id": "other"})
@@ -213,7 +212,7 @@ def test_search_channel_scoping_refuses_foreign_guild(monkeypatch):
 
 def test_non_snowflake_channel_id_rejected(monkeypatch):
     monkeypatch.setattr(agent_tools, "_resolve", lambda: (
-        "http://fluxer.local", "tok", "home-ch", "guild-1"))
+        "http://fluxer.local", "tok", "111111111111111111", "222222222222222222"))
     called = []
     monkeypatch.setattr(agent_tools, "_fluxer_request", lambda *a, **k: called.append(a))
     out = agent_tools._flux_recall({"channel_id": "../../admin"})
@@ -244,7 +243,7 @@ def test_request_url_uses_resolved_api_base(monkeypatch):
         seen.append(req.full_url)
         return _Resp()
 
-    monkeypatch.setattr(agent_tools.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(agent_tools.urllib.request.OpenerDirector, "open", lambda self, req, timeout=15: fake_urlopen(req, timeout))
 
     agent_tools._fluxer_request("GET", "/channels/1", "https://api.fluxer.app/v1", "tok")
     agent_tools._fluxer_request("GET", "/channels/1", "https://fluxer.example/api", "tok")
@@ -273,25 +272,21 @@ def test_scheme_refusal(monkeypatch):
     with pytest.raises(ValueError):
         agent_tools._fluxer_request("GET", "/x", "file:///etc", "tok")
 
-def test_guild_caches_are_scoped_by_base_and_profile(monkeypatch):
+def test_guild_lookups_are_fresh_across_deployments(monkeypatch):
     """Identical channel ids on two deployments must not share a guild mapping."""
-    agent_tools._HOME_GUILD_CACHE.clear()
-    agent_tools._CHANNEL_GUILD_CACHE.clear()
     calls = []
 
     def fake_request(method, path, base, token, params=None, body=None, timeout=15):
         calls.append(base)
         if base.endswith("/a"):
-            return {"id": "same-ch", "guild_id": "guild-a"}
-        return {"id": "same-ch", "guild_id": "guild-b"}
+            return {"id": "123456789012345678", "guild_id": "444444444444444444"}
+        return {"id": "123456789012345678", "guild_id": "555555555555555555"}
 
     monkeypatch.setattr(agent_tools, "_fluxer_request", fake_request)
-    monkeypatch.setenv("HERMES_HOME", "/tmp/profile-a")
-    assert agent_tools._derive_home_guild("https://fluxer.example/a", "tok", "123456789012345678") == "guild-a"
-    monkeypatch.setenv("HERMES_HOME", "/tmp/profile-b")
-    assert agent_tools._derive_home_guild("https://fluxer.example/b", "tok", "123456789012345678") == "guild-b"
+    assert agent_tools._derive_home_guild("https://fluxer.example/a", "tok", "123456789012345678") == "444444444444444444"
+    assert agent_tools._derive_home_guild("https://fluxer.example/b", "tok", "123456789012345678") == "555555555555555555"
     assert len(calls) == 2  # second profile/base must not reuse the first cache entry
     assert agent_tools._channel_allowed(
-        "123456789012345678", "https://fluxer.example/b", "tok", "guild-b"
+        "123456789012345678", "https://fluxer.example/b", "tok", "555555555555555555"
     )
 

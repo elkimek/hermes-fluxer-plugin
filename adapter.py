@@ -4376,4 +4376,4 @@ def register(ctx) -> None:
         count = agent_tools.register(ctx)
         logger.info("Fluxer agent tools registered: %s (toolset=fluxer)", count)
     except Exception as exc:
-        logger.warning("Fluxer agent tools not registered: %s", exc)
+        logger.warning("Fluxer agent tools not registered (%s)", type(exc).__name__)

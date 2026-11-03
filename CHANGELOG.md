@@ -12,12 +12,17 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Added
 
-- Agent tools `flux_recall`, `flux_search`, `flux_members`, and `flux_audit` for read-only Fluxer guild/channel access. Reads are home-guild scoped by default (`FLUXER_TOOL_SCOPE=global` widens). Guild lookup caches are keyed by API base and Hermes profile home so multiplexed deployments do not reuse each other's mappings. Sessions see the tools once `fluxer` is listed in `platform_toolsets` (keep `[hermes-discord, fluxer]`).
+- Agent tools `flux_recall`, `flux_search`, `flux_members`, and `flux_audit` for read-only Fluxer guild/channel access. Reads, including the default channel, are home-guild scoped by default (`FLUXER_TOOL_SCOPE=global` explicitly widens). Append `fluxer` to the existing `platform_toolsets.fluxer` list without enabling unrelated toolsets.
+
+### Fixed
+
+- Read tools now register their arguments correctly with Hermes. Profile changes and changed channel membership cannot reuse stale guild permissions; each authorization lookup is fresh.
+- Recall and search retain full message text, line breaks, embeds, and attachment details within a marked total output limit. Audit results retain the real target and all changes. Page-limited results are labeled as partial rather than implying a complete directory or log.
+- Invalid identifiers, malformed responses, oversized replies, and credential-bearing redirects are refused. Failures no longer disclose raw provider or credential details. Search uses the documented query/page-size bounds and reports indexing delays separately from empty results.
 
 ### Verification
 
-- Focused agent-tools suite covers registration, scoping, snowflake checks, URL normalization, and cache isolation across bases/profiles.
-- Live probes against the self-hosted build: all four tools → 200.
+- Regression tests cover registration through the real host registry, context-local profile isolation, default-channel scoping, argument/response validation, local HTTP redirect rejection, private errors, and complete bounded output. The repaired head has not been live-verified; search availability, audit permission, and deployment-specific response shapes still need acceptance on the target server.
 
 ## [0.5.1] - 2026-10-13
 
