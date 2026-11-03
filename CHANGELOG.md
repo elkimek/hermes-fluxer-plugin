@@ -12,6 +12,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Added
 
+- Read-only `flux_recall`, `flux_search`, `flux_members` and `flux_audit` tools use profile-scoped credentials and fresh home-guild authorization. Append `fluxer` to the existing platform toolset list; only an explicit `FLUXER_TOOL_SCOPE=global` widens the guild boundary.
 - Outbound messages and edits support rich embeds through `metadata["embeds"]`, with `FLUXER_OUTBOUND_EMBEDS` as an off switch. Unsupported builds fall back to text without duplicating ambiguous sends.
 - Automatic replies add the admitted triggering user to a bot-owned reply thread. Membership is best-effort within a two-second total budget, so unavailable member routes do not hold up delivery.
 
@@ -28,12 +29,15 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Embed text is shortened at Unicode-aware Fluxer limits. Embed rejection composes with deleted-thread recovery and disables embeds only when the response identifies them as unsupported.
 
+- Read tools preserve bounded message, embed, attachment and audit content, label partial pages, reject invalid identifiers, oversized or malformed responses and credential-bearing redirects, and keep provider errors private.
+
 ### Verification
 
 - Regression suites cover reference recovery, deleted-thread fallback, concurrent creation and cancellation, bounded lock eviction, thread adoption and ownership, title ownership and guarded renames, queued turns, and goal pause/resume/clear lifecycles. Host-backed tests exercise Hermes routing as well as standalone adapter behavior.
 - Gateway lifecycle tests include real loopback WebSocket Identify/READY/heartbeat traffic, connection replacement, recovery after server close, and joined shutdown.
 - Membership tests cover admitted authors, concurrent participants, failure and timeout delivery, caller cancellation, and ID-free diagnostics.
 - Embed regressions cover normalization, first-chunk placement, concurrent support flags, rejection ordering, reference modes, and no duplicate sends after timeouts or server failures.
+- Tool tests exercise real-host registration, context-local profile isolation, fresh scope checks, argument and response validation, HTTP redirect rejection and bounded output. Search and audit availability remain deployment-dependent.
 
 ## [0.5.1] - 2026-10-13
 

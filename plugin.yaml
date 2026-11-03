@@ -20,6 +20,10 @@ requires_env:
     prompt: "Fluxer bot token"
     password: true
 optional_env:
+  - name: FLUXER_TOOL_SCOPE
+    description: "Agent read-tool scope: home (default, reads restricted to the home guild) or global"
+    prompt: "Read-tool scope (home/global)"
+    password: false
   - name: FLUXER_BASE_URL
     description: "Fluxer API base URL for self-hosted instances; defaults to https://api.fluxer.app/v1"
     prompt: "Fluxer base URL"
