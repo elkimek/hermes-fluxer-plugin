@@ -727,7 +727,8 @@ def _command_name_and_args(text: str) -> tuple[str, str]:
     stripped = str(text or "").lstrip()
     if not _is_text_command(stripped):
         return "", ""
-    head, _sep, rest = stripped.partition(" ")
+    parts = stripped.split(maxsplit=1)
+    head, rest = parts[0], parts[1] if len(parts) > 1 else ""
     return head[1:].split("@", 1)[0].lower(), rest.strip()
 
 
@@ -747,8 +748,10 @@ def _starts_own_session(text: str) -> bool:
     name, args = _command_name_and_args(text)
     if name not in _SESSION_STARTING_COMMANDS:
         return False
-    first = args.split(None, 1)[0].lower() if args else ""
-    return first not in _GOAL_CONTROL_WORDS
+    lower = args.lower()
+    # Exact verbs are controls, not any objective whose first word happens to
+    # match one. The host treats `/goal clear stale tasks` as a NEW objective.
+    return lower not in _GOAL_CONTROL_WORDS and not lower.startswith(("wait ", "gate "))
 
 
 def _addresses_active_goal(text: str) -> bool:
@@ -779,8 +782,7 @@ def _goal_control_ends_goal(text: str) -> bool:
     name, args = _command_name_and_args(text)
     if name not in _SESSION_STARTING_COMMANDS or _starts_own_session(text):
         return False
-    first = args.split(None, 1)[0].lower() if args else ""
-    return first in _GOAL_ENDING_WORDS
+    return args.lower() in _GOAL_ENDING_WORDS
 
 
 def _thread_id_from_session_key(session_key: Optional[str], platform: str) -> Optional[str]:
@@ -1406,6 +1408,10 @@ class FluxerAdapter(BasePlatformAdapter):
         # each creating its own.
         self._threads_by_anchor: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._threads_by_anchor_max = 1000
+        # Typing, progress and approvals may all open the same prospective
+        # container concurrently. Keep one creator, with waiters pinning its lock.
+        self._thread_create_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        self._thread_create_lock_users: Dict[tuple[str, str], int] = {}
         # Parent channel of every thread this adapter created, so a thread
         # inherits its parent's allowlist status and can seed mention memory.
         # Only a thread the adapter owns lands here: a thread a human created
@@ -2506,9 +2512,11 @@ class FluxerAdapter(BasePlatformAdapter):
         user_id = _author_id_from_data(data)
         if not user_id:
             return None
-        target = self._active_auto_thread_for_user(str(channel_id), user_id)
-        if not target and goal_control:
-            target = self._goal_thread_for(channel_id, user_id)
+        # A saved goal identifies its session more precisely than the live-turn
+        # index: this user may be working in another thread while the goal waits.
+        target = self._goal_thread_for(channel_id, user_id) if goal_control else None
+        if not target:
+            target = self._active_auto_thread_for_user(str(channel_id), user_id)
         if _goal_control_ends_goal(content):
             # Resolve BEFORE forgetting: the ending command itself still has to reach
             # the goal's session, and a paused goal has no live turn to point at it.
@@ -2573,46 +2581,58 @@ class FluxerAdapter(BasePlatformAdapter):
         existing = self._threads_by_anchor.get(key)
         if existing:
             return existing
-        # Two-phase naming, same as Discord: the placeholder comes from the message
-        # that triggered the turn; the thread is renamed to the session title as
-        # soon as the session has one. The title is usually already there (the
-        # titler runs early in the turn, the thread is opened at send time), in
-        # which case the thread is born with its final name and no rename follows.
-        placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
-        author_id = self._inbound_author_by_message.get(str(message_id)) or None
-        # The anchor message id is the origin to look up, never the parent channel:
-        # Fluxer gives the thread that id, and a thread session is stored with
-        # ``chat_id`` = the thread id. A parent-channel lookup resolves whatever
-        # long-lived channel session happens to be live there -- on a busy channel a
-        # session from weeks ago -- and names a brand-new thread after it.
-        title = await asyncio.to_thread(self._session_title_for_chat, str(message_id), author_id)
-        thread_name = _collapse_thread_name(title or "") or placeholder
+        async with self._thread_creation_slot(key):
+            existing = self._threads_by_anchor.get(key)
+            if existing:
+                return existing
+            # A creator ahead of us may have chosen parent fallback while this
+            # caller was waiting. Do not undo that decision with a second POST.
+            logical_chat = str(message_id) if self._threads_pending.get(str(message_id)) == str(chat_id) else str(chat_id)
+            if self._turn_key(logical_chat) in self._turn_thread_disabled or key in self._turn_thread_disabled:
+                return None
+            # Two-phase naming: only the anchor's own session may name its thread.
+            placeholder = _derive_auto_thread_name(self._inbound_text_by_message.get(str(message_id), ""))
+            author_id = self._inbound_author_by_message.get(str(message_id)) or None
+            title = await asyncio.to_thread(self._session_title_for_chat, str(message_id), author_id)
+            thread_name = _collapse_thread_name(title or "") or placeholder
+            try:
+                data = await self.create_thread(
+                    str(chat_id), thread_name, message_id=str(message_id)
+                )
+            except Exception as exc:
+                logger.info(
+                    "Fluxer thread start failed for anchor %s in %s (%s); delivering to the channel",
+                    message_id, chat_id, type(exc).__name__,
+                )
+                return None
+            thread_id = self._remember_thread_id(data, chat_id)
+            if thread_id:
+                self._threads_by_anchor[key] = thread_id
+                self._threads_by_anchor.move_to_end(key)
+                while len(self._threads_by_anchor) > self._threads_by_anchor_max:
+                    self._threads_by_anchor.popitem(last=False)
+                created_name = str((data or {}).get("name") or thread_name)
+                self._record_auto_thread(chat_id, thread_id, created_name, author_id)
+                if created_name != placeholder:
+                    self._note_renamed_thread(thread_id, created_name)
+                if not title:
+                    self._schedule_title_rename(str(message_id), thread_id, created_name, author_id)
+            return thread_id
+
+    @contextlib.asynccontextmanager
+    async def _thread_creation_slot(self, key: tuple[str, str]):
+        """One creator per anchor; retain the lock until its last waiter leaves."""
+        lock = self._thread_create_locks.setdefault(key, asyncio.Lock())
+        users = self._thread_create_lock_users
+        users[key] = users.get(key, 0) + 1
         try:
-            data = await self.create_thread(
-                str(chat_id), thread_name, message_id=str(message_id)
-            )
-        except Exception as exc:
-            logger.info(
-                "Fluxer thread start failed for anchor %s in %s (%s); delivering to the channel",
-                message_id, chat_id, type(exc).__name__,
-            )
-            return None
-        thread_id = self._remember_thread_id(data, chat_id)
-        if thread_id:
-            self._threads_by_anchor[key] = thread_id
-            self._threads_by_anchor.move_to_end(key)
-            while len(self._threads_by_anchor) > self._threads_by_anchor_max:
-                self._threads_by_anchor.popitem(last=False)
-            created_name = str((data or {}).get("name") or thread_name)
-            self._record_auto_thread(chat_id, thread_id, created_name, author_id)
-            if created_name != placeholder:
-                self._note_renamed_thread(thread_id, created_name)
-            if not title:
-                # Watch the anchor's session, not the parent's: the thread belongs
-                # to the turn that triggered it, and only that session's title may
-                # name it.
-                self._schedule_title_rename(str(message_id), thread_id, created_name, author_id)
-        return thread_id
+            async with lock:
+                yield
+        finally:
+            users[key] -= 1
+            if not users[key]:
+                users.pop(key)
+                self._thread_create_locks.pop(key, None)
 
     # ── session-title naming for a thread this adapter opened ───────────────────
 
@@ -3274,13 +3294,13 @@ class FluxerAdapter(BasePlatformAdapter):
         cid = str(chat_id or "")
         if not cid:
             return "", False
-        # A container delivery already found deleted is never addressed again.
-        redirect = self._dead_containers.get(cid)
-        if redirect:
-            return str(redirect), False
         explicit = str((metadata or {}).get("thread_id") or "").strip()
         if explicit:
             return explicit, False
+        # Automatic redirects cannot override a caller's explicit destination.
+        redirect = self._dead_containers.get(cid)
+        if redirect:
+            return str(redirect), False
         # Already a container of its own: a thread the adapter opened, or a thread
         # whose parent/owner is known. Post straight into it.
         if cid in self._thread_parents or self._thread_is_bot_owned(cid) is not None:
@@ -3316,6 +3336,8 @@ class FluxerAdapter(BasePlatformAdapter):
             or str(chat_id)
         )
         created = await self._start_thread_from_message(str(parent), target)
+        if not created:
+            self._disable_turn_thread(chat_id, metadata=metadata)
         # A thread that could not be opened is not a container: refresh the parent
         # channel rather than posting a typing indicator at a channel that is not
         # there (the prospective id names a thread that does not exist yet).
@@ -3347,14 +3369,22 @@ class FluxerAdapter(BasePlatformAdapter):
                 return str(redirect)
             pending_parent = self._threads_pending.get(candidate)
             if pending_parent:
+                if self._turn_key(candidate) in self._turn_thread_disabled:
+                    return str(pending_parent)
                 created = await self._start_thread_from_message(str(pending_parent), candidate)
+                if not created:
+                    self._disable_turn_thread(candidate)
                 # The parent is where the prompt has to land when the thread could
                 # not be opened: a prospective id names a channel that does not exist.
                 return created or str(pending_parent)
             return candidate
         pending_parent = self._threads_pending.get(str(chat_id))
         if pending_parent:
+            if self._turn_key(chat_id) in self._turn_thread_disabled:
+                return str(pending_parent)
             created = await self._start_thread_from_message(str(pending_parent), str(chat_id))
+            if not created:
+                self._disable_turn_thread(chat_id)
             return created or str(pending_parent)
         return str(chat_id)
 
@@ -3384,10 +3414,10 @@ class FluxerAdapter(BasePlatformAdapter):
         # redirect is what keeps the rest of the turn in the parent channel instead
         # of failing against the same missing thread.
         dead_redirect = self._dead_containers.get(str(chat_id))
-        if dead_redirect:
-            target_chat_id = str(dead_redirect)
-        elif explicit_thread_id:
+        if explicit_thread_id:
             target_chat_id = explicit_thread_id
+        elif dead_redirect:
+            target_chat_id = str(dead_redirect)
         elif str(chat_id) in self._thread_parents or self._thread_is_bot_owned(str(chat_id)) is not None:
             # The caller's chat id IS a thread this adapter already opened. It has to
             # count as an auto-chosen container, not a plain channel: a thread opened
