@@ -24,7 +24,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional
 from urllib.parse import quote, urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
@@ -101,6 +101,9 @@ _GATEWAY_WATCHDOG_INTERVAL_SECONDS = 60.0
 _REST_RATE_LIMIT_MAX_ATTEMPTS = 3
 _REST_RATE_LIMIT_MAX_DELAY = 60.0
 _THREAD_MEMBER_ADD_TIMEOUT_SECONDS = 2.0
+# One budget for an entire optional affordance/retirement batch, including REST
+# retries. Explicit react/unreact actions retain the normal request contract.
+_OPTIONAL_UI_TIMEOUT_SECONDS = 2.0
 _PRESENCE_STATUSES = frozenset({"online", "idle", "dnd", "invisible", "offline"})
 _DEFAULT_PRESENCE_STATUS = "online"
 _DEFAULT_BACKLOG_LIMIT = 25
@@ -2014,6 +2017,30 @@ class FluxerAdapter(BasePlatformAdapter):
             f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(message_id)}/reactions/{_quote_id(emoji)}/@me",
         )
 
+    async def _run_optional_ui(self, operation: Awaitable[Any]) -> None:
+        """Await best-effort UI within one deadline; cancel and drain on expiry.
+
+        Do not shield or detach the operation: wait_for lets the HTTP client's
+        context manager close before returning and propagates caller cancellation.
+        """
+        try:
+            await asyncio.wait_for(operation, timeout=_OPTIONAL_UI_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.debug("Fluxer optional prompt UI failed (%s)", type(exc).__name__)
+
+    async def _add_optional_reactions(self, chat_id: str, message_id: str, emojis: List[str]) -> None:
+        if not emojis:
+            return
+
+        async def attach() -> None:
+            for emoji in emojis:
+                try:
+                    await self._add_reaction(chat_id, message_id, emoji)
+                except Exception as exc:
+                    logger.debug("Fluxer optional reaction failed (%s)", type(exc).__name__)
+
+        await self._run_optional_ui(attach())
+
     async def _attach_keycap_reactions(self, chat_id: str, message_id: str, content: str) -> None:
         """Make a plain-message decision ask tappable.
 
@@ -2022,11 +2049,7 @@ class FluxerAdapter(BasePlatformAdapter):
         one tap (forwarded via ``_maybe_forward_reaction_answer``). Best effort
         only: failures are logged and never affect the send.
         """
-        for emoji in _keycap_emojis_in_text(content):
-            try:
-                await self._add_reaction(chat_id, message_id, emoji)
-            except Exception as exc:  # noqa: BLE001 - affordance must not break sends
-                logger.debug("Fluxer keycap auto-reaction failed (%s)", type(exc).__name__)
+        await self._add_optional_reactions(chat_id, message_id, _keycap_emojis_in_text(content))
 
     async def add_reaction(
         self,
@@ -2299,7 +2322,9 @@ class FluxerAdapter(BasePlatformAdapter):
                     "channel_id": target_id,
                     "choice": choice,
                 }
-                await self._add_reaction(target_id, message_id, emoji)
+            await self._add_optional_reactions(
+                target_id, message_id, [emoji for emoji, _choice, _label in _EXEC_APPROVAL_REACTIONS]
+            )
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
             logger.warning("Fluxer exec approval prompt failed: %s", exc)
@@ -2354,7 +2379,9 @@ class FluxerAdapter(BasePlatformAdapter):
                     "channel_id": target_id,
                     "choice": choice,
                 }
-                await self._add_reaction(target_id, message_id, emoji)
+            await self._add_optional_reactions(
+                target_id, message_id, [emoji for emoji, _choice, _label in _SLASH_CONFIRM_REACTIONS]
+            )
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
             logger.warning("Fluxer slash confirm prompt failed: %s", exc)
@@ -4989,12 +5016,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 "message_id": message_id,
                 "channel_id": str(destination),
             }
-        for emoji in emojis:
-            try:
-                await self._add_reaction(destination, message_id, emoji)
-            except Exception:
-                # Missing affordance is cosmetic; the typed reply path still resolves.
-                logger.debug("Fluxer clarify reaction could not be added")
+        await self._add_optional_reactions(destination, message_id, emojis)
         return result
 
     @staticmethod
@@ -5050,21 +5072,24 @@ class FluxerAdapter(BasePlatformAdapter):
         message_id = str(card.get("message_id") or "")
         if not card_chat_id or not message_id:
             return
-        if notice:
-            try:
-                await self.edit_message(
-                    card_chat_id, message_id, f"{card.get('content') or ''}\n\n{notice}")
-            except Exception:
-                logger.debug("Fluxer clarify card retire edit failed")
-        for emoji in card.get("emojis") or []:
-            try:
-                await self._request(
-                    "DELETE",
-                    f"/channels/{_quote_id(card_chat_id)}/messages/{_quote_id(message_id)}/reactions/{_quote_id(emoji)}/@me",
-                    warn_on_error=False,
-                )
-            except Exception:
-                logger.debug("Fluxer clarify card retire reaction cleanup failed")
+        async def retire_ui() -> None:
+            if notice:
+                try:
+                    await self.edit_message(
+                        card_chat_id, message_id, f"{card.get('content') or ''}\n\n{notice}")
+                except Exception:
+                    logger.debug("Fluxer clarify card retire edit failed")
+            for emoji in card.get("emojis") or []:
+                try:
+                    await self._request(
+                        "DELETE",
+                        f"/channels/{_quote_id(card_chat_id)}/messages/{_quote_id(message_id)}/reactions/{_quote_id(emoji)}/@me",
+                        warn_on_error=False,
+                    )
+                except Exception:
+                    logger.debug("Fluxer clarify card retire reaction cleanup failed")
+
+        await self._run_optional_ui(retire_ui())
 
     async def _resolve_clarify_action(self, action: Dict[str, Any], *, user_id: str) -> None:
         clarify_id = str(action.get("clarify_id") or "")
@@ -5251,9 +5276,13 @@ class FluxerAdapter(BasePlatformAdapter):
         resolved_content = f"{pending.get('content') or 'Command approval required'}\n\nResolved: {label} by <@{user_id}>."
         try:
             if interaction:
-                await self._respond_to_interaction(interaction, content=resolved_content, components=[])
+                await self._run_optional_ui(
+                    self._respond_to_interaction(interaction, content=resolved_content, components=[])
+                )
             else:
-                await self.edit_message(str(pending.get("channel_id") or action.get("channel_id") or ""), message_id, resolved_content)
+                await self._run_optional_ui(
+                    self.edit_message(str(pending.get("channel_id") or action.get("channel_id") or ""), message_id, resolved_content)
+                )
         except Exception as exc:
             logger.debug("Fluxer approval resolution response failed: %s", exc)
 
@@ -5274,9 +5303,13 @@ class FluxerAdapter(BasePlatformAdapter):
         try:
             content = f"Slash confirmation: {choice} by <@{user_id}>."
             if interaction:
-                await self._respond_to_interaction(interaction, content=content, components=[])
+                await self._run_optional_ui(
+                    self._respond_to_interaction(interaction, content=content, components=[])
+                )
             elif message_id:
-                await self.edit_message(str(action.get("channel_id") or ""), message_id, content)
+                await self._run_optional_ui(
+                    self.edit_message(str(action.get("channel_id") or ""), message_id, content)
+                )
         except Exception:
             pass
 
