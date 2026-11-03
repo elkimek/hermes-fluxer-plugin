@@ -2957,8 +2957,6 @@ class FluxerAdapter(BasePlatformAdapter):
                     self._threads_by_anchor.popitem(last=False)
                 created_name = str((data or {}).get("name") or thread_name)
                 self._record_auto_thread(chat_id, thread_id, created_name, author_id)
-                if author_id and self._thread_is_bot_owned(thread_id) is True:
-                    await self._add_thread_member(thread_id, str(author_id))
                 # A guard authorises replacing the server's current name, so it must
                 # be the name this adapter would have written BEFORE any title
                 # rename. For a created thread that is the name just written; for an
@@ -2984,6 +2982,10 @@ class FluxerAdapter(BasePlatformAdapter):
                     self._schedule_title_rename(
                         str(message_id), thread_id, placeholder if adopted else created_name, author_id
                     )
+                # Finish title bookkeeping before optional membership can be
+                # cancelled: later sends reuse this already-cached thread.
+                if author_id and self._thread_is_bot_owned(thread_id) is True:
+                    await self._add_thread_member(thread_id, str(author_id))
             return thread_id
 
     @contextlib.asynccontextmanager
