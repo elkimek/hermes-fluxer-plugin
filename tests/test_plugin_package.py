@@ -685,7 +685,7 @@ def test_fluxer_adapter_advertises_markdown_code_blocks():
 def test_voice_env_surface_is_declared_and_documented():
     code_text = "\n".join(
         (ROOT / path).read_text(encoding="utf-8")
-        for path in ("adapter.py", "scripts/fluxer_voice_auto_join.py", "scripts/fluxer_stt_voice_loop.py")
+        for path in ("adapter.py", "kokoro_tts.py", "scripts/fluxer_voice_auto_join.py", "scripts/fluxer_stt_voice_loop.py")
     )
     used = set(__import__("re").findall(r"FLUXER_VOICE_[A-Z0-9_]+", code_text))
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
@@ -3628,6 +3628,8 @@ async def test_keycap_reaction_on_bot_dm_message_is_forwarded(monkeypatch):
 
     async def fake_request(method, path, **kwargs):
         fetches.append((method, path))
+        if path == "/channels/dm-1":
+            return {"id": "dm-1", "type": 1}
         return {"author": {"id": "bot-1", "bot": True}, "content": "Choose: dig or take it"}
 
     forwarded = []
@@ -3653,7 +3655,7 @@ async def test_keycap_reaction_on_bot_dm_message_is_forwarded(monkeypatch):
     assert "Choose: dig or take it" in event.text
     assert event.source.chat_id == "dm-1"
     assert event.source.chat_type == "dm"
-    assert len([f for f in fetches if f[0] == "GET"]) == 1
+    assert len([f for f in fetches if f[0] == "GET"]) == 2
 
 
 @pytest.mark.asyncio

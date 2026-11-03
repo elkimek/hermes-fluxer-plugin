@@ -62,7 +62,6 @@ except ModuleNotFoundError as exc:
     ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 
 from tools.transcription_tools import (  # noqa: E402
-    _extract_transcript_text,
     _load_stt_config,
     _transcribe_elevenlabs,
     _transcribe_groq,
@@ -75,6 +74,15 @@ try:  # Moved out of transcription_tools in the Sep-2026 Hermes decomposition.
     from tools.transcription_cloud import _extract_transcript_text  # noqa: E402
 except ImportError:  # Standalone plugin surface: the local shim ships both.
     from tools.transcription_tools import _extract_transcript_text, get_env_value  # noqa: E402
+try:
+    from tools.transcription_tools import transcribe_audio_local_fallback  # noqa: E402
+except ImportError:
+    # Older hosts must fail closed rather than silently upload local-only audio
+    # using their globally selected cloud provider.
+    def transcribe_audio_local_fallback(file_path, model=None):
+        return {"success": False, "transcript": "", "provider": "local",
+                "error": "This Hermes host does not expose a local-only STT backend"}
+
 from kokoro_tts import KokoroSpeechClient  # noqa: E402
 from xai_realtime import XAIRealtimeVoiceClient  # noqa: E402
 
@@ -663,7 +671,7 @@ def transcribe_with_provider(
     if provider == "auto":
         return transcribe_audio(file_path, model=model)
     if provider == "local":
-        return transcribe_audio(file_path, model=model)
+        return transcribe_audio_local_fallback(file_path, model=model)
     if provider == "groq":
         groq_model = model if model and model not in {"tiny.en", "base.en", "small.en", "medium.en"} else "whisper-large-v3-turbo"
         return _transcribe_groq(file_path, groq_model)

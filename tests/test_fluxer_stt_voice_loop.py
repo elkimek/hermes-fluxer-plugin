@@ -824,7 +824,8 @@ async def test_stt_voice_loop_fails_before_voice_state_when_gateway_ready_times_
 
 
 @pytest.mark.asyncio
-async def test_stt_voice_loop_barge_in_watcher_cancels_after_first_audio_when_xai_stalls(monkeypatch, tmp_path):
+@pytest.mark.parametrize("use_xai", [True, False], ids=["xai", "kokoro-keyless"])
+async def test_stt_voice_loop_barge_in_watcher_cancels_after_first_audio_when_xai_stalls(monkeypatch, tmp_path, use_xai):
     sends = []
     first_audio_written = asyncio.Event()
 
@@ -933,10 +934,14 @@ async def test_stt_voice_loop_barge_in_watcher_cancels_after_first_audio_when_xa
         return b"\x01\x00" * 24_000
 
     monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
-    monkeypatch.setenv("XAI_API_KEY", "xai")
+    if use_xai:
+        monkeypatch.setenv("XAI_API_KEY", "xai")
+    else:
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop.XAIRealtimeVoiceClient", FakeVoiceClient)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.KokoroSpeechClient", FakeVoiceClient)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop._wait_for_barge_in", fake_barge_in)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop._capture_one_speech_segment", fake_capture)
     monkeypatch.setattr(

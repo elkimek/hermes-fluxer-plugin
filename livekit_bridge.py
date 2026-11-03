@@ -321,8 +321,8 @@ class FluxerLiveKitSmokeBridge:
 
         The input may contain the ephemeral LiveKit token. The token is used only
         as a local argument to `Room.connect(...)`; it is never stored on `self`,
-        returned, or logged. A `e2ee_key` (end-to-end encrypted channels) is used
-        only to configure FrameCryptor locally, with the same guarantees.
+        returned, or logged. An `e2ee_key` configures local FrameCryptor state
+        owned by the SDK; it is excluded from connection info and diagnostics.
         """
 
         endpoint = _string_or_none(update.get("endpoint"))

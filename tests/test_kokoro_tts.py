@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 
 from kokoro_tts import (
@@ -12,22 +11,34 @@ from kokoro_tts import (
 )
 
 
-def _fake_response(data: bytes, status: int = 200):
-    class _Resp:
-        def __init__(self) -> None:
-            self.status = status
-            self._buf = io.BytesIO(data)
+def install_stream(monkeypatch, *, chunks=(), delay=0, status=200):
+    """Exercise the real async HTTP client with a controlled byte stream."""
+    import httpx
 
-        def read(self, size: int = -1) -> bytes:
-            return self._buf.read(size)
+    class Stream(httpx.AsyncByteStream):
+        closed = False
+        calls = 0
 
-        def __enter__(self) -> "_Resp":
-            return self
+        async def __aiter__(self):
+            for chunk in chunks:
+                self.calls += 1
+                if delay:
+                    await asyncio.sleep(delay)
+                yield chunk
 
-        def __exit__(self, *exc: object) -> bool:
-            return False
+        async def aclose(self):
+            self.closed = True
 
-    return _Resp()
+    stream = Stream()
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(status, stream=stream)
+    )
+    client_factory = httpx.AsyncClient
+    monkeypatch.setattr(
+        "kokoro_tts.httpx.AsyncClient",
+        lambda **kwargs: client_factory(transport=transport, **kwargs),
+    )
+    return stream
 
 
 def test_build_kokoro_speech_request_uses_openai_speech_shape():
@@ -50,9 +61,8 @@ def test_build_kokoro_speech_request_uses_openai_speech_shape():
 
 def test_streams_pcm_chunks_to_sink(monkeypatch):
     pcm = bytes(range(256)) * 64
-    monkeypatch.setattr(
-        "kokoro_tts.urllib.request.urlopen",
-        lambda request, timeout=None: _fake_response(pcm),
+    install_stream(
+        monkeypatch, chunks=[pcm[i : i + 4096] for i in range(0, len(pcm), 4096)]
     )
 
     async def _run():
@@ -61,7 +71,9 @@ def test_streams_pcm_chunks_to_sink(monkeypatch):
         async def sink(data: bytes) -> None:
             chunks.append(data)
 
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
+        client = KokoroSpeechClient(
+            base_url="http://kokoro.test/v1", voice="test-voice"
+        )
         result = await client.text_response_to_sink("hello", sink, timeout=5.0)
         return result, chunks
 
@@ -78,9 +90,8 @@ def test_streams_pcm_chunks_to_sink(monkeypatch):
 
 def test_force_message_to_sink_shares_streaming_path(monkeypatch):
     pcm = b"\x00\x01" * 2048
-    monkeypatch.setattr(
-        "kokoro_tts.urllib.request.urlopen",
-        lambda request, timeout=None: _fake_response(pcm),
+    install_stream(
+        monkeypatch, chunks=[pcm[i : i + 4096] for i in range(0, len(pcm), 4096)]
     )
 
     async def _run():
@@ -89,7 +100,9 @@ def test_force_message_to_sink_shares_streaming_path(monkeypatch):
         async def sink(data: bytes) -> None:
             chunks.append(data)
 
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
+        client = KokoroSpeechClient(
+            base_url="http://kokoro.test/v1", voice="test-voice"
+        )
         result = await client.force_message_to_sink("hello", sink, timeout=5.0)
         return result, chunks
 
@@ -131,99 +144,80 @@ def test_rejects_a_sample_rate_kokoro_cannot_serve():
         == 24_000
     )
     assert (
-        KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice").sample_rate
+        KokoroSpeechClient(
+            base_url="http://kokoro.test/v1", voice="test-voice"
+        ).sample_rate
         == 24_000
     )
 
 
 def test_a_stream_that_stalls_after_the_first_chunk_fails_the_reply(monkeypatch):
     import pytest
-    import time
+    import httpx
 
-    class _Stalling:
-        def __init__(self) -> None:
-            self.calls = 0
+    class Stream(httpx.AsyncByteStream):
+        closed = False
 
-        def read(self, size: int = -1) -> bytes:
-            self.calls += 1
-            if self.calls == 1:
-                return b"\x00\x01" * 32
-            time.sleep(0.6)
-            return b""
+        async def __aiter__(self):
+            yield b"\x00\x01" * 32
+            await asyncio.sleep(0.6)
 
-        def __enter__(self) -> "_Stalling":
-            return self
+        async def aclose(self):
+            self.closed = True
 
-        def __exit__(self, *exc: object) -> bool:
-            return False
-
+    stream = Stream()
+    factory = httpx.AsyncClient
     monkeypatch.setattr(
-        "kokoro_tts.urllib.request.urlopen",
-        lambda request, timeout=None: _Stalling(),
+        "kokoro_tts.httpx.AsyncClient",
+        lambda **kw: factory(
+            transport=httpx.MockTransport(
+                lambda req: httpx.Response(200, stream=stream)
+            ),
+            **kw,
+        ),
     )
 
-    async def _run():
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
-        written: list[bytes] = []
+    async def run():
+        written = []
 
-        async def _sink(chunk: bytes) -> None:
+        async def sink(chunk):
             written.append(chunk)
 
+        client = KokoroSpeechClient(
+            base_url="http://kokoro.test/v1", voice="test-voice"
+        )
         with pytest.raises(RuntimeError, match="did not finish within"):
-            await client.text_response_to_sink("hello", _sink, timeout=0.15)
-        return written
+            await client.text_response_to_sink("hello", sink, timeout=0.15)
+        assert written
+        assert stream.closed
 
-    # The first chunk was delivered, so this is a partial reply, not silence.
-    assert asyncio.run(_run())
+    asyncio.run(run())
 
 
-def test_cancelling_stops_the_producer_at_the_next_chunk(monkeypatch):
-    import time
+def test_cancelling_stops_the_transport_without_reading_ahead(monkeypatch):
+    import pytest
 
-    class _Counting:
-        def __init__(self) -> None:
-            self.calls = 0
+    stream = install_stream(monkeypatch, chunks=[b"ab"] * 1000)
 
-        def read(self, size: int = -1) -> bytes:
-            self.calls += 1
-            if self.calls == 1:
-                return b"\x00\x01" * 32
-            time.sleep(0.25)
-            return b"\x00\x01" * 32
+    async def run():
+        entered = asyncio.Event()
 
-        def __enter__(self) -> "_Counting":
-            return self
+        async def sink(chunk):
+            entered.set()
+            await asyncio.sleep(10)
 
-        def __exit__(self, *exc: object) -> bool:
-            return False
-
-    response = _Counting()
-    monkeypatch.setattr(
-        "kokoro_tts.urllib.request.urlopen",
-        lambda request, timeout=None: response,
-    )
-
-    async def _run():
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
-
-        async def _sink(chunk: bytes) -> None:
-            await asyncio.sleep(0.5)  # a sink that never keeps up
-
-        task = asyncio.create_task(client.text_response_to_sink("hello", _sink, timeout=30.0))
-        await asyncio.sleep(0.1)
+        client = KokoroSpeechClient(
+            base_url="http://kokoro.test/v1", voice="test-voice"
+        )
+        task = asyncio.create_task(client.text_response_to_sink("hello", sink))
+        await entered.wait()
         task.cancel()
-        try:
+        with pytest.raises(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
-        calls_after_cancel = response.calls
-        await asyncio.sleep(0.4)
-        return calls_after_cancel, response.calls
+        assert stream.calls == 1
+        assert stream.closed
 
-    before, after = asyncio.run(_run())
-    # The stop flag ends the request at the next chunk boundary instead of the
-    # producer reading to EOF into a queue nobody drains.
-    assert after <= before
+    asyncio.run(run())
 
 
 def test_requires_a_url_and_a_voice(monkeypatch):
@@ -248,28 +242,12 @@ def test_requires_a_url_and_a_voice(monkeypatch):
 def test_a_slow_sink_loses_no_audio_when_the_queue_fills(monkeypatch):
     chunks = [bytes([index]) * 4096 for index in range(8)]
 
-    class _Stream:
-        def __init__(self) -> None:
-            self.remaining = list(chunks)
-
-        def read(self, size: int = -1) -> bytes:
-            return self.remaining.pop(0) if self.remaining else b""
-
-        def __enter__(self) -> "_Stream":
-            return self
-
-        def __exit__(self, *exc: object) -> bool:
-            return False
-
-    monkeypatch.setattr(
-        "kokoro_tts.urllib.request.urlopen",
-        lambda request, timeout=None: _Stream(),
-    )
-    # One slot: the producer has to wait for the slow sink instead of dropping.
-    monkeypatch.setattr("kokoro_tts._QUEUE_CHUNKS", 1)
+    install_stream(monkeypatch, chunks=chunks)
 
     async def _run():
-        client = KokoroSpeechClient(base_url="http://kokoro.test/v1", voice="test-voice")
+        client = KokoroSpeechClient(
+            base_url="http://kokoro.test/v1", voice="test-voice"
+        )
         received: list[bytes] = []
 
         async def _sink(chunk: bytes) -> None:

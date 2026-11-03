@@ -192,6 +192,22 @@ optional_env:
     description: "Realtime TTS voice name used by the configured realtime voice provider"
     prompt: "Realtime TTS voice"
     password: false
+  - name: FLUXER_VOICE_KOKORO_URL
+    description: "OpenAI-compatible Kokoro base URL including /v1; required when XAI_API_KEY is absent"
+    prompt: "Kokoro TTS base URL"
+    password: false
+  - name: FLUXER_VOICE_KOKORO_VOICE
+    description: "Kokoro voice name; required when XAI_API_KEY is absent"
+    prompt: "Kokoro voice"
+    password: false
+  - name: FLUXER_VOICE_KOKORO_MODEL
+    description: "Kokoro model name (default kokoro)"
+    prompt: "Kokoro model"
+    password: false
+  - name: FLUXER_VOICE_KOKORO_API_KEY
+    description: "Optional bearer key for an authenticated Kokoro endpoint"
+    prompt: "Kokoro API key"
+    password: true
   - name: FLUXER_VOICE_CAPTURE_TIMEOUT_SECONDS
     description: "Maximum seconds to wait for a user's voice segment before timing out"
     prompt: "Voice capture timeout seconds"
