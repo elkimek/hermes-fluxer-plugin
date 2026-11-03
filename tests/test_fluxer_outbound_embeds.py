@@ -232,3 +232,46 @@ async def test_unrelated_body_rejection_log_does_not_claim_embeds_disabled(caplo
     assert "disabling" not in caplog.text.lower()
     assert "enabled" in caplog.text.lower()
 
+
+@pytest.mark.parametrize("path,limit", [
+    (("title",), 256),
+    (("description",), 4096),
+    (("footer", "text"), 2048),
+    (("author", "name"), 256),
+    (("fields", 0, "name"), 256),
+    (("fields", 0, "value"), 1024),
+    (("image", "description"), 4096),
+    (("thumbnail", "description"), 4096),
+])
+def test_embed_text_caps_use_utf16_without_mutating_input(path, limit):
+    from copy import deepcopy
+
+    # Leave one UTF-16 unit at the boundary: the next emoji must not be split.
+    text = "x" * (limit - 1) + "😀" * 5
+    source = {
+        "title": "card", "description": "body", "footer": {"text": "footer"},
+        "author": {"name": "author"}, "fields": [{"name": "field", "value": "value"}],
+        "image": {"url": "https://example.invalid/image.png", "description": "image"},
+        "thumbnail": {"url": "https://example.invalid/thumb.png", "description": "thumb"},
+    }
+    target = source
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = text
+    original = deepcopy(source)
+    normalized = fluxer_adapter.FluxerAdapter._normalize_outbound_embeds(source)[0]
+    capped = normalized
+    for key in path:
+        capped = capped[key]
+    assert fluxer_adapter.utf16_len(capped) <= limit
+    assert capped == "x" * (limit - 1)
+    assert source == original
+
+
+def test_embed_field_count_cap_preserves_input():
+    fields = [{"name": "field", "value": "value"} for _ in range(26)]
+    source = {"title": "t", "fields": fields}
+    normalized = fluxer_adapter.FluxerAdapter._normalize_outbound_embeds(source)
+    assert len(normalized[0]["fields"]) == 25
+    assert len(source["fields"]) == 26
+

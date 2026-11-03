@@ -1592,14 +1592,18 @@ class FluxerAdapter(BasePlatformAdapter):
         """Coerce ``metadata["embeds"]`` into safe rich-embed dicts (≤10).
         Only shape work lives here: non-dicts are dropped, a lone dict becomes a
         one-element list, ``type`` is forced to ``rich`` (the only sendable kind),
-        and the documented per-field caps (title 256, description 4096) are
-        clamped so a long field cannot turn one bad embed into a rejected
-        request. Deeper validation stays with the server.
+        and per-field caps use Fluxer's UTF-16 units, including media alt text.
+        Deeper validation stays with the server.
         """
         if isinstance(value, dict):
             value = [value]
         if not isinstance(value, list):
             return []
+
+        def clip(text: str, limit: int) -> str:
+            # Bound the work before encoding and never emit half an emoji.
+            return text[:limit].encode("utf-16-le")[:limit * 2].decode("utf-16-le", errors="ignore")
+
         embeds: List[Dict[str, Any]] = []
         for entry in value[:10]:
             if not isinstance(entry, dict):
@@ -1608,21 +1612,26 @@ class FluxerAdapter(BasePlatformAdapter):
             embed["type"] = "rich"
             embed = dict(embed)  # never mutate the caller's dicts
             if isinstance(embed.get("title"), str):
-                embed["title"] = embed["title"][:256]
+                embed["title"] = clip(embed["title"], 256)
             if isinstance(embed.get("description"), str):
-                embed["description"] = embed["description"][:4096]
+                embed["description"] = clip(embed["description"], 4096)
             if isinstance(embed.get("footer"), dict):
                 embed["footer"] = dict(embed["footer"])
                 if isinstance(embed["footer"].get("text"), str):
-                    embed["footer"]["text"] = embed["footer"]["text"][:2048]
+                    embed["footer"]["text"] = clip(embed["footer"]["text"], 2048)
             if isinstance(embed.get("author"), dict):
                 embed["author"] = dict(embed["author"])
                 if isinstance(embed["author"].get("name"), str):
-                    embed["author"]["name"] = embed["author"]["name"][:256]
+                    embed["author"]["name"] = clip(embed["author"]["name"], 256)
+            for key in ("image", "thumbnail"):
+                if isinstance(embed.get(key), dict):
+                    embed[key] = dict(embed[key])
+                    if isinstance(embed[key].get("description"), str):
+                        embed[key]["description"] = clip(embed[key]["description"], 4096)
             fields = embed.get("fields")
             if isinstance(fields, list):
                 embed["fields"] = [
-                    {k: (v[:256] if k == "name" and isinstance(v, str) else v[:1024] if k == "value" and isinstance(v, str) else v)
+                    {k: (clip(v, 256 if k == "name" else 1024) if k in ("name", "value") and isinstance(v, str) else v)
                      for k, v in f.items() if k in ("name", "value", "inline")}
                     for f in fields[:25] if isinstance(f, dict)
                 ]
