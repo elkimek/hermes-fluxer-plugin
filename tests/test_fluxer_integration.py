@@ -79,3 +79,55 @@ async def test_adoption_adds_only_the_admitted_author_to_a_bot_owned_thread(owne
         adapter._add_thread_member.assert_awaited_once_with("anchor", "admitted-author")
     else:
         adapter._add_thread_member.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["thread", "creation-failed", "deleted", "embed-deleted"])
+async def test_clarify_session_anchor_routes_and_registers_in_the_final_container(monkeypatch, outcome):
+    import sys
+    import types
+
+    # Keep the adapter routing real without requiring the host clarify service.
+    stub = types.ModuleType("tools.clarify_gateway")
+    stub.mark_awaiting_text = lambda cid: None
+    monkeypatch.setitem(sys.modules, "tools.clarify_gateway", stub)
+    adapter = make_adapter()
+    adapter._is_multi_select_clarify = lambda cid: False
+    adapter._threads_pending["anchor"] = "parent"
+    adapter.create_thread = AsyncMock(return_value={"id": "anchor"})
+    adapter._schedule_title_rename = lambda *args: None
+    if outcome == "creation-failed":
+        adapter.create_thread.side_effect = HttpError(403, "forbidden")
+    posts = []
+    failure_steps = ["embed", "deleted"] if outcome == "embed-deleted" else (["deleted"] if outcome == "deleted" else [])
+
+    async def request(method, path, **kwargs):
+        assert method == "POST"
+        posts.append(path)
+        if failure_steps:
+            step = failure_steps.pop(0)
+            if step == "embed":
+                assert "embeds" in kwargs["json"]
+                raise HttpError(400, "embeds unsupported")
+            assert path == "/channels/anchor/messages"
+            raise HttpError(404, "UNKNOWN_CHANNEL")
+        return {"id": "card"}
+
+    adapter._request = request
+    exposed = []
+
+    async def react(chat, message, emoji):
+        assert len(adapter._pending_reaction_actions) == 2
+        exposed.append(chat)
+
+    adapter._add_reaction = react
+    result = await adapter.send_clarify(
+        "parent", "Choose", ["one", "two"], "clarification",
+        "agent:main:fluxer:thread:anchor:user", metadata={"embeds": [{"title": "Card"}]},
+    )
+    assert result.success, result.error
+    adapter.create_thread.assert_awaited_once()
+    expected = "anchor" if outcome == "thread" else "parent"
+    assert posts[-1] == f"/channels/{expected}/messages"
+    assert exposed == [expected, expected]
+    assert adapter._pending_clarify_cards["clarification"]["chat_id"] == expected

@@ -33,6 +33,7 @@ from scripts.fluxer_stt_voice_loop import (
     safe_stt_summary,
     transcribe_with_provider,
     voice_mode_ack,
+    voice_output_requires_xai,
     voice_recall_time_window,
     write_pcm16_wav,
 )
@@ -350,6 +351,11 @@ def test_parse_args_defaults_to_realtime_voice_stack(monkeypatch):
         "FLUXER_VOICE_SAMPLE_RATE",
         "FLUXER_VOICE_FRAME_MS",
         "FLUXER_VOICE_ENERGY_THRESHOLD",
+        "FLUXER_VOICE_STT_PROVIDER",
+        "FLUXER_VOICE_STT_MODEL",
+        "FLUXER_VOICE_BRAIN_PROVIDER",
+        "FLUXER_VOICE_HERMES_URL",
+        "FLUXER_VOICE_HERMES_MODEL",
     ):
         monkeypatch.delenv(key, raising=False)
     args = parse_args(["--channel-id", "voice-room"])
@@ -818,7 +824,8 @@ async def test_stt_voice_loop_fails_before_voice_state_when_gateway_ready_times_
 
 
 @pytest.mark.asyncio
-async def test_stt_voice_loop_barge_in_watcher_cancels_after_first_audio_when_xai_stalls(monkeypatch, tmp_path):
+@pytest.mark.parametrize("use_xai", [True, False], ids=["xai", "kokoro-keyless"])
+async def test_stt_voice_loop_barge_in_watcher_cancels_after_first_audio_when_xai_stalls(monkeypatch, tmp_path, use_xai):
     sends = []
     first_audio_written = asyncio.Event()
 
@@ -927,10 +934,14 @@ async def test_stt_voice_loop_barge_in_watcher_cancels_after_first_audio_when_xa
         return b"\x01\x00" * 24_000
 
     monkeypatch.setenv("FLUXER_BOT_TOKEN", "token")
-    monkeypatch.setenv("XAI_API_KEY", "xai")
+    if use_xai:
+        monkeypatch.setenv("XAI_API_KEY", "xai")
+    else:
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerAdapter", FakeAdapter)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop.FluxerLiveKitSmokeBridge", FakeBridge)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop.XAIRealtimeVoiceClient", FakeVoiceClient)
+    monkeypatch.setattr("scripts.fluxer_stt_voice_loop.KokoroSpeechClient", FakeVoiceClient)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop._wait_for_barge_in", fake_barge_in)
     monkeypatch.setattr("scripts.fluxer_stt_voice_loop._capture_one_speech_segment", fake_capture)
     monkeypatch.setattr(
@@ -1454,3 +1465,11 @@ def test_stt_voice_loop_interrupts_publisher_during_cancellation_cleanup():
     assert "raise" in cancellation_block
     assert "await publisher.close(wait_for_playout=False, flush_remainder=False)" not in cancellation_block
     assert "shutdown_requested.set()\n        finished.set()" not in source
+
+
+def test_voice_output_requires_xai_only_for_xai_providers():
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="local", brain_provider="hermes")) is False
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="elevenlabs", brain_provider="hermes")) is False
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="xai", brain_provider="hermes")) is True
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="local", brain_provider="xai-fast")) is True
+    assert voice_output_requires_xai(argparse.Namespace(stt_provider="local", brain_provider="auto")) is True

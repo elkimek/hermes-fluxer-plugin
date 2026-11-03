@@ -87,6 +87,32 @@ The supervisor is plugin-managed. Do not run `scripts/fluxer_voice_auto_join.py`
 | `context_file` | `FLUXER_VOICE_CONTEXT_FILE` | empty | Optional local text context loaded by fast voice modes. | Use for deployment-local assistant identity or room instructions. Never commit personal context. |
 | `session_db` | `FLUXER_VOICE_SESSION_DB` | empty / Hermes default | Optional Hermes session DB for recall in full-brain mode. | Use only on the machine that owns that Hermes state. |
 
+### Kokoro output without an xAI key
+
+When `XAI_API_KEY` is absent, the STT loop uses Kokoro for speech output.
+Select `brain_provider: hermes` and a non-xAI STT provider; `auto` brain mode
+still requires xAI because its fast path uses xAI. A Hermes brain also needs
+`API_SERVER_KEY`. This does not make cloud STT keyless: explicit cloud providers
+still need their own keys. `stt_provider: local` stays local even if the host's
+global STT selection is cloud; it requires an installed local backend (or
+`HERMES_LOCAL_STT_COMMAND` in the standalone checkout). `auto` STT delegates to
+Hermes' configured selection; it does not override an explicit host selection
+or silently fall back to another cloud provider after an error.
+
+| Dashboard / YAML key | Env var | Default | Meaning |
+| --- | --- | --- | --- |
+| `kokoro_url` | `FLUXER_VOICE_KOKORO_URL` | required | OpenAI-compatible base URL, including `/v1`; the client appends `/audio/speech`. |
+| `kokoro_voice` | `FLUXER_VOICE_KOKORO_VOICE` | required | A voice offered by that service. |
+| `kokoro_model` | `FLUXER_VOICE_KOKORO_MODEL` | `kokoro` | Model sent to the service. |
+| `kokoro_api_key` | `FLUXER_VOICE_KOKORO_API_KEY` | empty | Optional bearer key for authenticated services. Keep it in the environment rather than public config. |
+
+Kokoro must return raw mono PCM16 at **24000 Hz**. Other sample rates are rejected
+at startup. The existing `timeouts.xai_seconds` and
+`timeouts.xai_first_audio_seconds` limits also apply to Kokoro: the total limit
+covers connection, headers, audio reads, and sink backpressure. Cancellation
+closes the async HTTP stream, including a stalled body read. Slow sinks apply
+backpressure without dropping chunks or growing a producer queue.
+
 ### Full Hermes brain mode
 
 These only matter when the voice loop calls the Hermes API for responses.

@@ -432,7 +432,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     _preload_env_file(argv)
     args = parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s:%(name)s:%(message)s", stream=sys.stdout)
     for noisy_secret_logger in ("websockets", "websockets.client", "httpcore", "httpx", "urllib3"):
         logging.getLogger(noisy_secret_logger).setLevel(logging.INFO)
     return asyncio.run(run(args))

@@ -12,7 +12,8 @@ from test_fluxer_integration import HttpError, make_adapter
 async def test_all_rejection_orders_reduce_once_and_keep_the_final_destination(order):
     adapter = make_adapter(reply_to_mode="all")
     adapter._remember_thread_id({"id": "thread"}, "parent")
-    adapter.truncate_message = lambda *args, **kwargs: ["first", "second"]
+    adapter.truncate_message = lambda *args, **kwargs: ["1️⃣ first", "2️⃣ second"]
+    adapter._add_reaction = AsyncMock()
     remaining = list(order)
     calls = []
     successes = []
@@ -44,6 +45,9 @@ async def test_all_rejection_orders_reduce_once_and_keep_the_final_destination(o
     assert result.success, (order, result.error, calls)
     assert successes == ["/channels/parent/messages", "/channels/parent/messages"]
     assert len(calls) == 5  # three explicit rejections and two delivered chunks
+    assert [call.args[:2] for call in adapter._add_reaction.await_args_list] == [
+        ("parent", "message-1"), ("parent", "message-2"),
+    ]
     assert "message_reference" not in calls[-1][1]
     assert "embeds" not in calls[-1][1]
     assert adapter._dead_containers["thread"] == "parent"
