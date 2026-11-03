@@ -18,9 +18,12 @@ This project uses simple semantic versioning while the plugin is young:
 - Typing, progress and approval prompts share a single thread creator per anchor. Waiting sends retain their lock, and a failed creation keeps later output in the parent for that turn without overriding explicit destinations.
 - Threads that already exist after a restart or cache eviction are adopted instead of abandoned. Their current display name is kept separate from the rename guard, protecting human names while allowing an untouched placeholder to receive its session title. Adoption reads server ownership before granting parent-channel admission or automatic fallback.
 
+- Gateway receive and heartbeat failures reconnect instead of silently losing inbound traffic. Setup, replacement and shutdown retire old sockets and join their tasks without reconnect churn or resource leaks.
+
 ### Verification
 
 - Regression suites cover reference recovery, deleted-thread fallback, concurrent creation and cancellation, bounded lock eviction, thread adoption and ownership, title ownership and guarded renames, queued turns, and goal pause/resume/clear lifecycles. Host-backed tests exercise Hermes routing as well as standalone adapter behavior.
+- Gateway lifecycle tests include real loopback WebSocket Identify/READY/heartbeat traffic, connection replacement, recovery after server close, and joined shutdown.
 
 ## [0.5.1] - 2026-10-13
 

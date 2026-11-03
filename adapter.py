@@ -87,6 +87,10 @@ _VOICE_MESSAGE_FLAG = 1 << 13
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _HEARTBEAT_ACK_TIMEOUT_FACTOR = 2.5
+# How often to confirm the receive path is still alive while connected. A dead
+# listener used to go unnoticed indefinitely, so this trades one cheap task-state
+# check every interval for a bounded worst case on silent disconnects.
+_GATEWAY_WATCHDOG_INTERVAL_SECONDS = 60.0
 _REST_RATE_LIMIT_MAX_ATTEMPTS = 3
 _REST_RATE_LIMIT_MAX_DELAY = 60.0
 _PRESENCE_STATUSES = frozenset({"online", "idle", "dnd", "invisible", "offline"})
@@ -1544,6 +1548,10 @@ class FluxerAdapter(BasePlatformAdapter):
         self._listener_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        # Set when a disconnect asks for a reconnect while one is already running,
+        # so the running loop cannot report success over a listener that just died.
+        self._reconnect_requested = False
         self._last_seq: Optional[int] = None
         self._last_heartbeat_sent_at: Optional[float] = None
         self._last_heartbeat_ack_at: Optional[float] = None
@@ -1625,45 +1633,76 @@ class FluxerAdapter(BasePlatformAdapter):
             _LIVE_ADAPTERS.add(self)
             self._mark_connected()
             await self._connect_gateway_once()
+            # Start (or restart) the liveness watch: from here on, an absent
+            # listener must reconnect instead of leaving the platform silently deaf.
+            self._start_watchdog()
             if not is_reconnect:
                 await self._maybe_register_native_commands()
             self._voice_supervisor.start()
             return True
+        except asyncio.CancelledError:
+            # Host connect timeouts cancel this coroutine after the socket and
+            # watchdog may already exist. Cancellation must not orphan them.
+            await self.disconnect()
+            raise
         except Exception as exc:
-            await self._voice_supervisor.stop()
-            self._mark_disconnected()
+            await self.disconnect()
             logger.warning("Fluxer connect failed: %s", exc)
             self._set_fatal_error("connect_failed", f"Fluxer connect failed: {exc}", retryable=True)
             return False
 
     async def disconnect(self) -> None:
-        await self._voice_supervisor.stop()
+        # Close recovery admission before the first await: voice shutdown can
+        # take seconds, during which neither listener nor watchdog may reconnect.
         self._closing = True
         self._running = False
         _LIVE_ADAPTERS.discard(self)
         self._close_session_store()
-        for task in list(self._title_tasks.values()):
-            if task and not task.done():
-                task.cancel()
+        tasks = [*self._title_tasks.values(), *self._typing_tasks.values()]
         self._title_tasks.clear()
-        for task in (self._heartbeat_task, self._listener_task, self._reconnect_task):
-            if task and not task.done():
-                task.cancel()
-        for task in list(self._typing_tasks.values()):
-            if task and not task.done():
-                task.cancel()
         self._typing_tasks.clear()
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
+        tasks.extend(task for task in (self._reconnect_task, self._watchdog_task) if task is not None)
+        self._reconnect_task = None
+        self._watchdog_task = None
+        self._reconnect_requested = False
+        self._gateway_ready_event.clear()
+        try:
+            await self._retire_gateway_connection(*tasks)
+        finally:
+            await self._voice_supervisor.stop()
+            self._mark_disconnected()
+
+    async def _retire_gateway_connection(self, *additional_tasks: asyncio.Task) -> None:
+        """Detach, close and join a connection even if its owner is canceled."""
+        old_ws = self._ws
+        old_tasks = (self._heartbeat_task, self._listener_task, *additional_tasks)
         self._ws = None
         self._heartbeat_task = None
         self._listener_task = None
-        self._reconnect_task = None
-        self._gateway_ready_event.clear()
-        self._mark_disconnected()
+        current = asyncio.current_task()
+        retired_tasks = {task for task in old_tasks if task is not None and task is not current}
+        for task in retired_tasks:
+            if not task.done():
+                task.cancel()
+
+        async def close_and_join() -> None:
+            try:
+                if old_ws is not None:
+                    await old_ws.close()
+            except Exception:
+                pass
+            finally:
+                if retired_tasks:
+                    await asyncio.gather(*retired_tasks, return_exceptions=True)
+
+        # Once detached, disconnect() cannot find these resources again. Keep
+        # their cleanup owned and joined across a host timeout or shutdown cancel.
+        cleanup = asyncio.create_task(close_and_join(), name="fluxer-gateway-retire")
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
 
     async def _connect_gateway_once(self) -> None:
         if not self.gateway_url:
@@ -1674,19 +1713,8 @@ class FluxerAdapter(BasePlatformAdapter):
 
         import websockets
 
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-        current = asyncio.current_task()
-        if self._listener_task and self._listener_task is not current and not self._listener_task.done():
-            self._listener_task.cancel()
-        self._ws = None
-        self._heartbeat_task = None
-        self._listener_task = None
+        # Retired listeners cannot invalidate a replacement from their finally.
+        await self._retire_gateway_connection()
         self._awaiting_heartbeat_ack = False
         self._last_heartbeat_sent_at = None
         self._last_heartbeat_ack_at = None
@@ -1702,20 +1730,60 @@ class FluxerAdapter(BasePlatformAdapter):
         logger.info("Fluxer gateway websocket connected")
         await self._recover_backlog(cutoff=reconnect_cutoff)
 
+    def _start_watchdog(self) -> None:
+        """Ensure exactly one liveness watchdog task is running."""
+        task = self._watchdog_task
+        if task is not None and not task.done():
+            return
+        self._watchdog_task = asyncio.create_task(
+            self._gateway_watchdog_loop(), name="fluxer-gateway-watchdog"
+        )
+
     def _schedule_reconnect(self, reason: str) -> None:
         if self._closing:
             return
         if self._reconnect_task and not self._reconnect_task.done():
+            # A reconnect loop is already running, but it may have created the
+            # very listener that just died (a gateway that closes the socket
+            # straight after READY, or a backlog recovery that outlives the
+            # connection). Dropping the request here is how the platform went
+            # silent for hours: the loop then reported success and nothing was
+            # left to reconnect. Record the request instead and let the loop
+            # re-check liveness before it claims success.
+            self._reconnect_requested = True
             return
+        self._reconnect_requested = False
         logger.warning("Fluxer gateway disconnected (%s); scheduling reconnect", reason)
         self._reconnect_task = asyncio.create_task(self._reconnect_loop(reason), name="fluxer-reconnect")
 
+    def _listener_is_alive(self) -> bool:
+        """True while the current websocket listener task can still receive."""
+        task = self._listener_task
+        return bool(task is not None and not task.done())
+
     async def _reconnect_loop(self, reason: str) -> None:
         delay = _RECONNECT_BASE_DELAY
+        # Publish this loop as the in-flight reconnect for its whole lifetime. A
+        # nested ``_connect_gateway_once`` must never see the slot empty and start a
+        # second loop; the retry stays inside this task.
+        self._reconnect_task = asyncio.current_task()
         while not self._closing:
             try:
                 await asyncio.sleep(delay)
+                self._reconnect_requested = False
                 await self._connect_gateway_once()
+                # The socket connecting is not the same as the listener surviving.
+                # A gateway that drops the session immediately after READY leaves a
+                # closed websocket and a finished listener task, so verify the
+                # receive path before declaring this attempt a success -- otherwise
+                # the adapter publishes "connected" with nothing reading the socket.
+                if not self._listener_is_alive():
+                    raise RuntimeError("listener exited during reconnect")
+                if self._reconnect_requested:
+                    # A disconnect arrived while this attempt was connecting: the
+                    # listener that request referred to may already be gone, so
+                    # keep looping instead of publishing a success over it.
+                    raise RuntimeError("connection dropped while reconnecting")
                 self._mark_connected()
                 self._voice_supervisor.start()
                 logger.info("Fluxer gateway reconnected after %s", reason)
@@ -1725,6 +1793,45 @@ class FluxerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Fluxer reconnect failed: %s; retrying in %.1fs", exc, delay)
                 delay = min(delay * 2, _RECONNECT_MAX_DELAY)
+        # Leaving the loop: release the slot only if it is still ours, so a newer
+        # scheduled reconnect is not clobbered by this one exiting.
+        if self._reconnect_task is asyncio.current_task():
+            self._reconnect_task = None
+
+    async def _gateway_watchdog_loop(self) -> None:
+        """Reconnect when the websocket listener disappears without a trace.
+
+        ``_listen_loop`` reports its own death, but a task can also end while no
+        reconnect was armed (see ``_schedule_reconnect``) or be cancelled by a
+        path that never re-schedules. Nothing else in the adapter notices, so a
+        silent death left Fluxer unreachable for 20 hours with no log line after
+        the reconnect. This loop is the backstop: while the adapter believes it
+        is connected, an absent listener or websocket means reconnect now.
+        """
+        try:
+            while not self._closing:
+                await asyncio.sleep(_GATEWAY_WATCHDOG_INTERVAL_SECONDS)
+                if self._closing:
+                    continue
+                # A reconnect already in flight owns recovery; do not race it.
+                if self._reconnect_task is not None and not self._reconnect_task.done():
+                    continue
+                # Deliberately not gated on ``_running``: a teardown path that
+                # cleared it without re-arming anything is exactly the state that
+                # left Fluxer deaf for 20 hours. An absent socket or listener is
+                # the fact that matters, whatever the flag says.
+                if self._ws is None or not self._listener_is_alive():
+                    logger.warning(
+                        "Fluxer gateway watchdog: receive path is gone (%s); reconnecting",
+                        "no websocket" if self._ws is None else "listener task ended",
+                    )
+                    self._mark_disconnected()
+                    self._schedule_reconnect("watchdog found no live listener")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Fluxer gateway watchdog stopped: %s", type(exc).__name__)
+
 
     def _sanitize_outbound_mentions(self, content: str) -> str:
         """Fail closed for global/role pings in model-generated Fluxer output.
@@ -4471,9 +4578,12 @@ class FluxerAdapter(BasePlatformAdapter):
 
     async def _listen_loop(self) -> None:
         assert self._ws is not None
+        ws = self._ws
         reason = "closed"
         try:
-            async for raw in self._ws:
+            async for raw in ws:
+                if self._ws is not ws:
+                    break
                 payload = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
                 await self._handle_gateway_dispatch(payload)
             reason = "websocket closed"
@@ -4484,10 +4594,15 @@ class FluxerAdapter(BasePlatformAdapter):
                 logger.warning("Fluxer listener stopped: %s", exc)
             reason = str(exc)
         finally:
-            if not self._closing:
+            if not self._closing and self._ws is ws:
                 self._last_disconnect_at = datetime.now(tz=timezone.utc)
                 self._mark_disconnected()
                 self._schedule_reconnect(reason)
+            else:
+                # A listener that ends while the adapter is closing is expected, but
+                # one that ends while we believe we are live must not vanish quietly
+                # -- log it so a shutdown-path cancellation cannot hide a deaf gateway.
+                logger.debug("Fluxer listener ended during shutdown")
 
     async def _send_heartbeat(self) -> None:
         if self._ws is None:
@@ -4581,9 +4696,12 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _heartbeat_loop(self, interval_ms: int) -> None:
         interval_s = max(interval_ms, 1000) / 1000
         ack_timeout_s = interval_s * _HEARTBEAT_ACK_TIMEOUT_FACTOR
+        ws = self._ws
         try:
-            while not self._closing and self._ws is not None:
+            while not self._closing and ws is not None and self._ws is ws:
                 await asyncio.sleep(interval_s)
+                if self._closing or self._ws is not ws:
+                    return
                 if (
                     self._awaiting_heartbeat_ack
                     and self._last_heartbeat_sent_at is not None
@@ -4591,7 +4709,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 ):
                     logger.warning("Fluxer heartbeat ACK timed out; closing websocket to trigger reconnect")
                     try:
-                        await self._ws.close()
+                        await ws.close()
                     except Exception:
                         pass
                     return
@@ -4599,7 +4717,15 @@ class FluxerAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.debug("Fluxer heartbeat stopped: %s", exc)
+            # This loop is the only thing that closes a zombie socket. A silent exit
+            # here leaves the adapter believing it is connected with no heartbeat at
+            # all, so it must be visible at warning level and must reconnect.
+            if not self._closing and ws is not None and self._ws is ws:
+                logger.warning(
+                    "Fluxer heartbeat loop stopped (%s); reconnecting", type(exc).__name__
+                )
+                self._mark_disconnected()
+                self._schedule_reconnect("heartbeat loop stopped")
 
     def _interaction_user_id(self, data: Dict[str, Any]) -> str:
         user = data.get("user") or ((data.get("member") or {}).get("user") or {})
