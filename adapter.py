@@ -1576,6 +1576,17 @@ class FluxerAdapter(BasePlatformAdapter):
             return self._outbound_message_payload(content)
         return self._outbound_message_payload(content, embeds=embeds)
 
+    def _record_outbound_embed_rejection(self, exc: BaseException) -> None:
+        self._outbound_embeds_supported = _body_mentions(exc, "embed") is False
+        # HTTP exception strings include request URLs; keep deployment IDs,
+        # credentials and response text out of compatibility diagnostics.
+        logger.warning(
+            "Fluxer embed request rejected (status=%s, %s); retrying content-only; session embeds %s",
+            getattr(getattr(exc, "response", None), "status_code", None),
+            type(exc).__name__,
+            "enabled" if self._outbound_embeds_supported else "disabled",
+        )
+
     @staticmethod
     def _normalize_outbound_embeds(value: Any) -> List[Dict[str, Any]]:
         """Coerce ``metadata["embeds"]`` into safe rich-embed dicts (≤10).
@@ -1754,11 +1765,7 @@ class FluxerAdapter(BasePlatformAdapter):
                         # blames them (or is unreadable) — an unrelated 400 must
                         # not silence embeds. Transient failures (429/5xx/timeout)
                         # propagate untouched instead.
-                        self._outbound_embeds_supported = _body_mentions(exc, "embed") is False
-                        logger.warning(
-                            "Fluxer embed send rejected (%s); disabling outbound embeds",
-                            exc,
-                        )
+                        self._record_outbound_embed_rejection(exc)
                         chunk_payload.pop("embeds", None)
                         data = await self._request(
                             "POST",
@@ -1806,14 +1813,7 @@ class FluxerAdapter(BasePlatformAdapter):
                                 and _is_body_rejection(parent_exc)
                             ):
                                 raise
-                            self._outbound_embeds_supported = (
-                                _body_mentions(parent_exc, "embed") is False
-                            )
-                            logger.warning(
-                                "Fluxer embed send rejected on parent fallback (%s); "
-                                "disabling outbound embeds",
-                                parent_exc,
-                            )
+                            self._record_outbound_embed_rejection(parent_exc)
                             chunk_payload.pop("embeds", None)
                             data = await self._request(
                                 "POST",
@@ -2020,7 +2020,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 # Same compatibility gate as send(): deliver the edit without
                 # embeds rather than losing it; session-disable only when the
                 # body blames embeds (or is unreadable).
-                self._outbound_embeds_supported = _body_mentions(exc, "embed") is False
+                self._record_outbound_embed_rejection(exc)
                 edit_payload.pop("embeds", None)
                 data = await self._request(
                     "PATCH",

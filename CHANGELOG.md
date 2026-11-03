@@ -14,8 +14,13 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Outbound messages and edits can carry rich embeds through `metadata["embeds"]` (or the `FLUXER_OUTBOUND_EMBEDS` off switch). Builds that reject the field fall back to content-only; the session disables embeds only when the response body blames them. Concurrent sends and thread-gone parent retries use the same payload-based fallback so text is not lost.
 
+### Fixed
+
+- Embed-rejection diagnostics no longer expose request URLs or raw error details, and accurately report whether embeds remain enabled.
+
 ### Verification
 
+- Regression tests cover private embed-rejection diagnostics for direct sends and parent-channel retries.
 - Focused embeds suite covers normalization, first-chunk placement, junk-edit guard, body-blame discrimination, concurrent flag races, and thread-gone parent degrade.
 - Live probe: create + edit with embeds → 200 on the self-hosted build.
 

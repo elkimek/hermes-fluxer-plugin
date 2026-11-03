@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 import adapter as fluxer_adapter
@@ -187,4 +188,47 @@ async def test_thread_gone_parent_embed_rejection_degrades():
     payloads = sent_payloads(adapter)
     assert "embeds" not in payloads[-1]
     assert adapter._outbound_embeds_supported is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_fallback", [False, True])
+async def test_embed_rejection_logs_omit_request_details(caplog, parent_fallback):
+    adapter = make_adapter({"thread_replies": parent_fallback})
+    private_marker = "synthetic-private-request-marker"
+    request = httpx.Request(
+        "POST", f"https://example.invalid/channels/{private_marker}/messages?token={private_marker}"
+    )
+    response = httpx.Response(400, request=request, json={"embeds": ["invalid"]})
+    rejected = httpx.HTTPStatusError(
+        f"request rejected: {private_marker}", request=request, response=response
+    )
+    errors = []
+    if parent_fallback:
+        missing = RuntimeError("10003 UNKNOWN_CHANNEL")
+        missing.response = SimpleNamespace(status_code=404)
+        errors.append(missing)
+        adapter.create_thread = AsyncMock(return_value={"id": "doomed-thread"})
+    adapter._request = AsyncMock(side_effect=[*errors, rejected, {"id": "text"}])
+    with caplog.at_level("WARNING", logger=fluxer_adapter.__name__):
+        result = await adapter.send(
+            "channel", "hi", reply_to="trigger", metadata={"embeds": [{"title": "t"}]}
+        )
+    assert result.success
+    assert private_marker not in caplog.text
+    assert "400" in caplog.text
+    assert "HTTPStatusError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unrelated_body_rejection_log_does_not_claim_embeds_disabled(caplog):
+    adapter = make_adapter()
+    rejected = RuntimeError("400 unrelated body error")
+    rejected.response = SimpleNamespace(status_code=400, text='{"content": "invalid"}')
+    adapter._request = AsyncMock(side_effect=[rejected, {"id": "text"}])
+    with caplog.at_level("WARNING", logger=fluxer_adapter.__name__):
+        result = await adapter.send("channel", "hi", metadata={"embeds": [{"title": "t"}]})
+    assert result.success
+    assert adapter._outbound_embeds_supported is True
+    assert "disabling" not in caplog.text.lower()
+    assert "enabled" in caplog.text.lower()
 
