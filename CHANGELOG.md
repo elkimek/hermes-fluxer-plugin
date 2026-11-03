@@ -20,6 +20,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Replies recover from a stale message reference in the same destination. Text, split replies and uploads drop a rejected reference once; only a genuinely deleted thread falls back to its parent.
 - Automatic thread titles, title polling, typing and `/title` use the triggering thread's session instead of an unrelated parent-channel session. Per-participant routing keeps concurrent conversations separate.
+- Cancelling an optional membership request no longer abandons the new thread's pending title update.
 - `/stop` and goal controls sent from the parent reach the user's own active or paused goal thread. A new goal, its continuations and its notices share one container, while ambiguous destinations are never guessed.
 - Typing, progress and approval prompts share a single thread creator per anchor. Waiting sends retain their lock, and a failed creation keeps later output in the parent for that turn without overriding explicit destinations.
 - Threads that already exist after a restart or cache eviction are adopted instead of abandoned. Their current display name is kept separate from the rename guard, protecting human names while allowing an untouched placeholder to receive its session title. Adoption reads server ownership before granting parent-channel admission or automatic fallback.
