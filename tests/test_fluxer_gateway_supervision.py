@@ -16,7 +16,6 @@ no listener task. These tests pin the three defects that allowed it:
 """
 
 import asyncio
-from unittest.mock import AsyncMock
 
 import pytest
 

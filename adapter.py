@@ -1493,19 +1493,29 @@ class FluxerAdapter(BasePlatformAdapter):
 
         import websockets
 
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
-        current = asyncio.current_task()
-        if self._listener_task and self._listener_task is not current and not self._listener_task.done():
-            self._listener_task.cancel()
+        # Detach before closing: the retired listener's finally must not mark
+        # a healthy replacement disconnected or request another reconnect.
+        old_ws = self._ws
+        old_heartbeat = self._heartbeat_task
+        old_listener = self._listener_task
         self._ws = None
         self._heartbeat_task = None
         self._listener_task = None
+        current = asyncio.current_task()
+        retired_tasks = [
+            task for task in (old_heartbeat, old_listener)
+            if task is not None and task is not current
+        ]
+        for task in retired_tasks:
+            if not task.done():
+                task.cancel()
+        if old_ws is not None:
+            try:
+                await old_ws.close()
+            except Exception:
+                pass
+        if retired_tasks:
+            await asyncio.gather(*retired_tasks, return_exceptions=True)
         self._awaiting_heartbeat_ack = False
         self._last_heartbeat_sent_at = None
         self._last_heartbeat_ack_at = None
@@ -3583,9 +3593,12 @@ class FluxerAdapter(BasePlatformAdapter):
 
     async def _listen_loop(self) -> None:
         assert self._ws is not None
+        ws = self._ws
         reason = "closed"
         try:
-            async for raw in self._ws:
+            async for raw in ws:
+                if self._ws is not ws:
+                    break
                 payload = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
                 await self._handle_gateway_dispatch(payload)
             reason = "websocket closed"
@@ -3596,7 +3609,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 logger.warning("Fluxer listener stopped: %s", exc)
             reason = str(exc)
         finally:
-            if not self._closing:
+            if not self._closing and self._ws is ws:
                 self._last_disconnect_at = datetime.now(tz=timezone.utc)
                 self._mark_disconnected()
                 self._schedule_reconnect(reason)
