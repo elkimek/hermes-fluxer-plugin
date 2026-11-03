@@ -3445,6 +3445,11 @@ def test_thread_inherits_the_parent_channel_allowlist(monkeypatch):
     monkeypatch.delenv("FLUXER_STRICT_MENTION", raising=False)
     adapter = _send_adapter(allowed_channels=["chan-1"], require_mention=True)
     adapter._thread_parents["thread-7"] = "chan-1"
+    # Production only ever records a parent alongside a CONFIRMED bot ownership
+    # (``_remember_thread_id`` pairs the two; ``_resolve_thread_info`` records the
+    # parent only when the owner is the bot). The gate fails closed on an unknown
+    # owner, so the fixture has to record what the create path records.
+    adapter._remember_thread_owner("thread-7", True)
     adapter._mentioned_threads["thread-7"] = None
 
     allowed, _ = adapter._should_process_message(
@@ -3477,6 +3482,9 @@ def test_thread_inherits_free_response_from_its_parent(monkeypatch):
     monkeypatch.delenv("FLUXER_STRICT_MENTION", raising=False)
     adapter = _send_adapter(free_response_channels=["chan-1"], require_mention=True)
     adapter._thread_parents["thread-7"] = "chan-1"
+    # Paired with the parent exactly as the create path pairs them: an unknown
+    # owner inherits nothing, so the fixture records the bot ownership too.
+    adapter._remember_thread_owner("thread-7", True)
 
     allowed, _ = adapter._should_process_message(
         channel_id="thread-7",

@@ -433,7 +433,9 @@ async def test_thread_is_named_from_the_trigger_when_no_title_exists(state_db):
 @pytest.mark.asyncio
 async def test_thread_is_born_with_the_session_title_when_one_exists(state_db):
     adapter = _adapter()
-    _add_session(state_db, title="Deploy the thing", title_source="llm")
+    # The thread's session is keyed on its ANCHOR message id (Fluxer gives the
+    # thread that id), never on the parent channel.
+    _add_session(state_db, chat_id="msg-1", title="Deploy the thing", title_source="llm")
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
     adapter.create_thread = AsyncMock(return_value={"id": "th-1", "name": "Deploy the thing"})
     adapter._schedule_title_rename = lambda *args: None
@@ -447,7 +449,8 @@ async def test_thread_is_born_with_the_session_title_when_one_exists(state_db):
 @pytest.mark.asyncio
 async def test_thread_creation_looks_up_the_triggering_author(store, state_db):
     adapter = _adapter()
-    _add_session(state_db, user_id="user-b", title="B's work", title_source="llm")
+    _add_session(state_db, chat_id="msg-1", user_id="user-b",
+                 title="B's work", title_source="llm")
     adapter._inbound_text_by_message["msg-1"] = "deploy the thing"
     adapter._inbound_author_by_message["msg-1"] = "user-b"
     adapter.create_thread = AsyncMock(return_value={"id": "th-1", "name": "B's work"})
@@ -477,7 +480,9 @@ async def test_thread_without_a_title_yet_is_watched(state_db):
 
     await adapter._start_thread_from_message("chan-1", "msg-1")
 
-    assert watched == [("chan-1", "th-1", "deploy the thing", None)]
+    # Watched on the ANCHOR: that is the container the thread's session is keyed
+    # on, and the only origin allowed to name the thread.
+    assert watched == [("msg-1", "th-1", "deploy the thing", None)]
 
 
 @pytest.mark.asyncio
