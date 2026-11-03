@@ -44,7 +44,7 @@ from gateway.config import PlatformConfig
 # semantics, including core's refusal to guess between live participants). Reusing
 # it here keeps this module honest about the lookup it exercises, instead of
 # pinning behaviour against a stub that always answers.
-from tests.test_fluxer_thread_naming import SESSIONS_DDL, FakeSessionStore, _add_session
+from test_fluxer_thread_naming import SESSIONS_DDL, FakeSessionStore, _add_session
 
 PARENT = "chan-busy"
 ANCHOR = "msg-anchor-fresh"          # Fluxer: the thread's id IS this message's id
