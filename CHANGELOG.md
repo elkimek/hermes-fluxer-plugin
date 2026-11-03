@@ -21,6 +21,8 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Fixed
 
+- Adoption discards stale cached ownership and mention privileges before reading the server. Thread naming, typing and reaction-answer diagnostics retain outcome reasons without logging private identifiers, titles or selected answer text.
+- Structured YAML home-channel settings now reach scheduled notifications and bare-platform sends, retaining environment precedence, scalar compatibility and profile isolation.
 - Replies recover from a stale message reference in the same destination. Text, split replies and uploads drop a rejected reference once; only a genuinely deleted thread falls back to its parent.
 - Automatic thread titles, title polling, typing and `/title` use the triggering thread's session instead of an unrelated parent-channel session. Per-participant routing keeps concurrent conversations separate.
 - Cancelling an optional membership request no longer abandons the new thread's pending title update.
@@ -46,6 +48,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Membership tests cover admitted authors, concurrent participants, failure and timeout delivery, caller cancellation, and ID-free diagnostics.
 - Embed regressions cover normalization, first-chunk placement, concurrent support flags, rejection ordering, reference modes, and no duplicate sends after timeouts or server failures.
 - Tool tests exercise real-host registration, context-local profile isolation, fresh scope checks, argument and response validation, HTTP redirect rejection and bounded output. Search and audit availability remain deployment-dependent.
+- Home-channel regressions cover structured and scalar settings, missing IDs, environment seeding and precedence, profile isolation, and list-based access controls.
 
 ## [0.5.1] - 2026-10-13
 

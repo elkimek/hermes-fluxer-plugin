@@ -384,7 +384,7 @@ async def test_a_typing_tick_never_reverts_to_the_parent_once_the_thread_exists(
     assert calls and all(path == f"/channels/{ANCHOR}/typing" for _m, path in calls)
 
 
-# ── bug 4: a skipped rename says so, with ids and a reason ─────────────────────
+# ── bug 4: a skipped rename says so, with a reason but no private ids ─────────────────────
 
 
 @pytest.mark.asyncio
@@ -397,7 +397,7 @@ async def test_a_thread_that_never_gets_a_title_says_why(state_db, caplog):
         patch.setattr(fluxer_adapter, "_TITLE_RENAME_WINDOW_SECONDS", 0.02)
         await adapter._rename_thread_when_titled(ANCHOR, ANCHOR, "no title yet")
 
-    assert ANCHOR in caplog.text
+    assert ANCHOR not in caplog.text
     assert "no session title" in caplog.text
 
 
@@ -412,7 +412,7 @@ async def test_a_declined_rename_says_the_thread_was_renamed_by_hand(state_db, c
         patch.setattr(fluxer_adapter, "_TITLE_RENAME_POLL_INTERVAL", 0.01)
         await adapter._rename_thread_when_titled(ANCHOR, ANCHOR, "placeholder")
 
-    assert ANCHOR in caplog.text
+    assert ANCHOR not in caplog.text
     assert "no longer carries the placeholder" in caplog.text
 
 
@@ -426,7 +426,8 @@ async def test_typing_logs_the_container_it_armed_on(caplog):
     await _drain_loop()
     await adapter.stop_typing(PARENT, metadata={"thread_id": "thread-explicit"})
 
-    assert "typing indicator armed for container thread-explicit" in caplog.text
+    assert "typing indicator armed for a routed container" in caplog.text
+    assert "thread-explicit" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -438,7 +439,8 @@ async def test_a_title_rename_on_a_thread_key_logs_the_thread_it_reached(state_d
 
     await adapter._rename_thread_for_session(THREAD_KEY, "Renamed by hand")
 
-    assert f"Fluxer thread {ANCHOR} named from /title" in caplog.text
+    assert "Fluxer thread named from /title" in caplog.text
+    assert ANCHOR not in caplog.text
 
 
 # ── the same id space for a parent-channel /stop ───────────────────────────────
