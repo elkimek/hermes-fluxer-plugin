@@ -24,7 +24,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional
 from urllib.parse import quote, urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
@@ -801,6 +801,22 @@ def _thread_id_from_session_key(session_key: Optional[str], platform: str) -> Op
     return parts[4] or None
 
 
+def _thread_already_exists_for_message(exc: BaseException) -> bool:
+    """True when Fluxer refused a thread start because the message already has one.
+
+    Fluxer anchors a thread to the message it was started from and the thread
+    carries that message's id, so this refusal *names* the existing thread. The
+    adapter's anchor map lives in memory only -- a restart, an evicted entry, or a
+    start that raced another send all reach here -- and reading the refusal as
+    "no thread" demotes the whole turn to the parent channel even though the
+    thread is already there.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    return "thread_already_created_for_message" in str(getattr(response, "text", "") or "").lower()
+
+
 def _coerce_reply_to_mode(value: Any, default: str = _DEFAULT_REPLY_TO_MODE) -> str:
     """Normalize an outbound reply-reference mode; unknown values use ``default``."""
     mode = str(value or "").strip().lower()
@@ -1408,9 +1424,15 @@ class FluxerAdapter(BasePlatformAdapter):
         # each creating its own.
         self._threads_by_anchor: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._threads_by_anchor_max = 1000
-        # Typing, progress and approvals may all open the same prospective
-        # container concurrently. Keep one creator, with waiters pinning its lock.
+        # One creator per anchor. Sends for a turn interleave, so without this two
+        # of them both miss the map above, both POST the same thread, and the
+        # loser's turn is demoted to the parent channel by the failure path.
         self._thread_create_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        # Anchors with a send inside, or queued on, their creation lock. The lock
+        # map is bounded, and a bound that evicted a lock still in use would hand
+        # the next send a second lock for the same anchor -- two creators again,
+        # which is the duplicate this lock exists to prevent -- so eviction skips
+        # the anchors listed here.
         self._thread_create_lock_users: Dict[tuple[str, str], int] = {}
         # Parent channel of every thread this adapter created, so a thread
         # inherits its parent's allowlist status and can seed mention memory.
@@ -1547,6 +1569,12 @@ class FluxerAdapter(BasePlatformAdapter):
         # opened last, so /title needs this to rename the session's own thread
         # rather than whoever happened to post most recently.
         self._auto_thread_by_session: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
+        # ``thread_id`` -> the name THIS adapter last wrote to that thread. A rename
+        # guard is an authorisation, not a label: it says "the current name is still
+        # one I chose, so I may replace it". An adopted thread's server name may be a
+        # human's, so it must never be stored here -- it lives in the label maps
+        # above for display only.
+        self._auto_thread_guards: OrderedDict[str, str] = OrderedDict()
         # Live lookups for a thread that is still waiting for its session title.
         self._title_tasks: Dict[str, asyncio.Task] = {}
         # Hermes' session store, opened lazily and read-only (see
@@ -2347,6 +2375,7 @@ class FluxerAdapter(BasePlatformAdapter):
             self._auto_thread_by_session.pop(session_key, None)
         for goal_key in [k for k, v in self._goal_threads.items() if v == tid]:
             self._goal_threads.pop(goal_key, None)
+        self._auto_thread_guards.pop(tid, None)
 
     def _pinned_turn_anchor(self, chat_id: str) -> str:
         """Anchor message pinned when the current turn started, else ``""``."""
@@ -2567,10 +2596,12 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _start_thread_from_message(self, chat_id: str, message_id: str) -> Optional[str]:
         """Best-effort thread start from ``message_id``; ``None`` keeps the channel.
 
-        Thread creation must never cost a reply, so any failure falls back to the
-        parent channel and the message still lands. A thread already opened for
-        this (chat, message) pair is reused, so one turn's progress bubble and its
-        final reply share a thread rather than creating two.
+        Thread creation must never cost a reply, so a failure that leaves no thread
+        behind falls back to the parent channel and the message still lands. A
+        thread already opened for this (chat, message) pair is reused, so one
+        turn's progress bubble and its final reply share a thread rather than
+        creating two -- across interleaved sends, and across a restart, when the
+        thread exists on the server but this process no longer remembers it.
         """
         key = (str(chat_id), str(message_id))
         # An anchor this adapter recorded as a command never opens a thread: the
@@ -2595,17 +2626,45 @@ class FluxerAdapter(BasePlatformAdapter):
             author_id = self._inbound_author_by_message.get(str(message_id)) or None
             title = await asyncio.to_thread(self._session_title_for_chat, str(message_id), author_id)
             thread_name = _collapse_thread_name(title or "") or placeholder
+            adopted = False
             try:
                 data = await self.create_thread(
                     str(chat_id), thread_name, message_id=str(message_id)
                 )
             except Exception as exc:
+                if not _thread_already_exists_for_message(exc):
+                    # AGENTS.md forbids private IDs in logs; report the failure
+                    # class only, never the chat/anchor ids or the response body.
+                    logger.debug(
+                        "Fluxer thread start failed (%s); delivering to the channel",
+                        type(exc).__name__,
+                    )
+                    return None
+                # The refusal names the thread: Fluxer anchors a thread to its
+                # message and gives it that message's id. Adopt it -- falling back
+                # to the channel here is what drops replies out of their thread.
+                adopted = True
+                # Public repo: AGENTS.md forbids private IDs in logs, so the
+                # adoption is recorded without the anchor or thread id.
                 logger.info(
-                    "Fluxer thread start failed for anchor %s in %s (%s); delivering to the channel",
-                    message_id, chat_id, type(exc).__name__,
+                    "Fluxer anchor already has a thread; adopting it instead of "
+                    "falling back to the parent channel"
                 )
-                return None
-            thread_id = self._remember_thread_id(data, chat_id)
+                data = {"id": str(message_id)}
+                server_name = await self._fetch_channel_name(str(message_id))
+                if server_name:
+                    data["name"] = server_name
+            if adopted:
+                # A refusal proves existence, not ownership. Read the server before
+                # granting parent admission, mention memory or automatic fallback.
+                thread_id = str(message_id)
+                self._known_channel_ids.add(thread_id)
+                self._threads_pending.pop(thread_id, None)
+                self._remember_channel_kind(thread_id, {"type": 11})
+                self._thread_info_cache.pop(thread_id, None)
+                await self._resolve_thread_info(thread_id, expect_thread=True)
+            else:
+                thread_id = self._remember_thread_id(data, chat_id)
             if thread_id:
                 self._threads_by_anchor[key] = thread_id
                 self._threads_by_anchor.move_to_end(key)
@@ -2613,28 +2672,107 @@ class FluxerAdapter(BasePlatformAdapter):
                     self._threads_by_anchor.popitem(last=False)
                 created_name = str((data or {}).get("name") or thread_name)
                 self._record_auto_thread(chat_id, thread_id, created_name, author_id)
+                # A guard authorises replacing the server's current name, so it must
+                # be the name this adapter would have written BEFORE any title
+                # rename. For a created thread that is the name just written; for an
+                # adopted one it is the placeholder derived from the anchor message,
+                # which is stable across restarts. ``thread_name`` is wrong here: it
+                # already holds the title when one exists, and comparing a title
+                # against a thread that still carries its placeholder always declines.
+                self._remember_thread_guard(
+                    thread_id, placeholder if adopted else created_name
+                )
                 if created_name != placeholder:
                     self._note_renamed_thread(thread_id, created_name)
-                if not title:
-                    self._schedule_title_rename(str(message_id), thread_id, created_name, author_id)
+                # An adopted thread may have kept a stale placeholder from before a
+                # restart, so run the guarded rename even when a title already
+                # exists -- the guard is what keeps a human's name safe, and a
+                # later send only reuses the cached thread without re-checking.
+                if not title or adopted:
+                    # Guard with the placeholder, never with the name an adopted
+                    # thread already carries: there ``created_name`` is the server's
+                    # current name, which a human may have chosen, and the guard is
+                    # exactly what authorises the overwrite -- so passing it would
+                    # let the session title clobber that human's choice.
+                    self._schedule_title_rename(
+                        str(message_id), thread_id, placeholder if adopted else created_name, author_id
+                    )
             return thread_id
 
     @contextlib.asynccontextmanager
-    async def _thread_creation_slot(self, key: tuple[str, str]):
-        """One creator per anchor; retain the lock until its last waiter leaves."""
-        lock = self._thread_create_locks.setdefault(key, asyncio.Lock())
+    async def _thread_creation_slot(self, key: tuple[str, str]) -> AsyncIterator[None]:
+        """Hold the per-anchor creation lock with the anchor marked in use.
+
+        The mark is taken *before* the lock is awaited, so a send still queued on
+        it pins the lock's entry as well, and released only when the critical
+        section ends. Without the mark the bounded map can evict the lock a send
+        is holding, handing the next send for that anchor a second lock.
+        """
         users = self._thread_create_lock_users
         users[key] = users.get(key, 0) + 1
         try:
-            async with lock:
+            async with self._thread_create_lock(key):
                 yield
         finally:
-            users[key] -= 1
-            if not users[key]:
-                users.pop(key)
-                self._thread_create_locks.pop(key, None)
+            remaining = users.get(key, 1) - 1
+            if remaining > 0:
+                users[key] = remaining
+            else:
+                users.pop(key, None)
+                # The map may have overshot its bound while every candidate was
+                # busy (eviction skips marked anchors), so trim it here as marks
+                # are released. Without this the extra idle locks live until some
+                # later new anchor happens to arrive.
+                self._evict_idle_thread_create_locks()
+
+    def _thread_create_lock(self, key: tuple[str, str]) -> asyncio.Lock:
+        """A stable per-anchor creation lock, bounded like the anchor map."""
+        lock = self._thread_create_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._thread_create_locks[key] = lock
+            self._evict_idle_thread_create_locks()
+        return lock
+
+    def _evict_idle_thread_create_locks(self) -> None:
+        """Drop the oldest idle per-anchor locks until the map is within its bound.
+
+        The map is insertion-ordered, so a bound that evicts purely on age can drop
+        the lock a send is still holding (or waiting on): the next send for that
+        anchor then builds a second lock and POSTs a second thread -- the duplicate
+        this lock exists to prevent. Anchors with a send in flight are skipped, so
+        the map may overshoot its bound while every candidate is busy and shrinks
+        again as those sends finish.
+        """
+        for key in list(self._thread_create_locks):
+            if len(self._thread_create_locks) <= self._threads_by_anchor_max:
+                return
+            if key in self._thread_create_lock_users:
+                continue
+            self._thread_create_locks.pop(key, None)
 
     # ── session-title naming for a thread this adapter opened ───────────────────
+
+    def _remember_thread_guard(self, thread_id: str, name: str) -> None:
+        """Record the name this adapter wrote to a thread, as a rename guard.
+
+        Kept apart from the label maps on purpose: a label is what the thread is
+        called, while a guard is the authorisation to replace it. An adopted
+        thread's current name may be a human's, so only names this adapter itself
+        applied belong here.
+        """
+        tid = str(thread_id)
+        if not tid:
+            return
+        self._auto_thread_guards[tid] = str(name or "")
+        self._auto_thread_guards.move_to_end(tid)
+        while len(self._auto_thread_guards) > 1000:
+            self._auto_thread_guards.popitem(last=False)
+
+    def _thread_rename_guard(self, thread_id: str) -> Optional[str]:
+        """The name this adapter last wrote to ``thread_id``, or ``None``."""
+        guard = self._auto_thread_guards.get(str(thread_id))
+        return guard or None
 
     def _record_auto_thread(
         self, chat_id: str, thread_id: str, name: str, user_id: Optional[str] = None
@@ -2651,6 +2789,10 @@ class FluxerAdapter(BasePlatformAdapter):
         self._auto_thread_by_session.move_to_end(session_key)
         while len(self._auto_thread_by_session) > 1000:
             self._auto_thread_by_session.popitem(last=False)
+        # A thread recorded here was named by this adapter, so that name is also its
+        # rename guard. The adoption path overrides it afterwards: there the label is
+        # the server's existing name, which may be a human's.
+        self._remember_thread_guard(tid, label)
 
     def auto_thread_info_for_chat(self, chat_id: str) -> Optional[tuple[str, str]]:
         """``(thread_id, name)`` of the thread this adapter opened for ``chat_id``, if any."""
@@ -2973,7 +3115,7 @@ class FluxerAdapter(BasePlatformAdapter):
         key = str(session_key or "").strip()
         thread_id = _thread_id_from_session_key(key, str(self.platform.value))
         if thread_id:
-            return thread_id, (self._cached_auto_thread_name(thread_id) or "")
+            return thread_id, (self._thread_rename_guard(thread_id) or "")
         origin = self._session_origin_for_key(key)
         if not origin:
             logger.info(
@@ -2988,7 +3130,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 origin[0], origin[1],
             )
             return "", ""
-        return str(entry[0]), str(entry[1] or "")
+        return str(entry[0]), (self._thread_rename_guard(str(entry[0])) or "")
 
     async def _fetch_channel_name(self, channel_id: str) -> Optional[str]:
         """Current server-side name of a channel or thread, else ``None``."""
@@ -3474,6 +3616,8 @@ class FluxerAdapter(BasePlatformAdapter):
         # context, so a second reference inside it is redundant.
         if reply_to and self._reply_to_mode != "off" and not started_thread:
             payload["message_reference"] = {"message_id": str(reply_to)}
+        if auto_thread_id and self._thread_is_bot_owned(auto_thread_id) is not True:
+            auto_thread_id = None
         return target_chat_id, payload, auto_thread_id
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
@@ -3554,6 +3698,7 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.debug("Fluxer thread rename failed for %s: %s", tid, exc)
             return False
         self._note_renamed_thread(tid, cleaned)
+        self._remember_thread_guard(tid, cleaned)
         return True
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
