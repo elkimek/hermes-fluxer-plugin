@@ -10,6 +10,10 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+### Added
+
+- Automatic replies add the admitted triggering user to a bot-owned reply thread. Membership is best-effort within a two-second total budget, so unavailable member routes do not hold up delivery.
+
 ### Fixed
 
 - Replies recover from a stale message reference in the same destination. Text, split replies and uploads drop a rejected reference once; only a genuinely deleted thread falls back to its parent.
@@ -24,6 +28,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Regression suites cover reference recovery, deleted-thread fallback, concurrent creation and cancellation, bounded lock eviction, thread adoption and ownership, title ownership and guarded renames, queued turns, and goal pause/resume/clear lifecycles. Host-backed tests exercise Hermes routing as well as standalone adapter behavior.
 - Gateway lifecycle tests include real loopback WebSocket Identify/READY/heartbeat traffic, connection replacement, recovery after server close, and joined shutdown.
+- Membership tests cover admitted authors, concurrent participants, failure and timeout delivery, caller cancellation, and ID-free diagnostics.
 
 ## [0.5.1] - 2026-10-13
 

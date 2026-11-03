@@ -56,3 +56,26 @@ async def test_channel_title_resolution_uses_written_guard_not_display_label():
     adapter.rename_thread.assert_awaited_once_with(
         "anchor", "New title", only_if_current_name="Adapter placeholder"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", [None, "human", "bot"])
+async def test_adoption_adds_only_the_admitted_author_to_a_bot_owned_thread(owner):
+    adapter = make_adapter()
+    adapter.bot_user_id = "bot"
+    adapter.create_thread = AsyncMock(side_effect=HttpError(400, "THREAD_ALREADY_CREATED_FOR_MESSAGE"))
+    adapter._fetch_channel_name = AsyncMock(return_value="Placeholder")
+    adapter._fetch_thread_info = AsyncMock(return_value={
+        "type": 11, "parent_id": "parent", **({"owner_id": owner} if owner else {}),
+    })
+    adapter._inbound_author_by_message["anchor"] = "admitted-author"
+    adapter._schedule_title_rename = lambda *args: None
+    adapter._add_thread_member = AsyncMock()
+
+    assert await adapter._start_thread_from_message("parent", "anchor") == "anchor"
+    assert await adapter._start_thread_from_message("parent", "anchor") == "anchor"
+
+    if owner == "bot":
+        adapter._add_thread_member.assert_awaited_once_with("anchor", "admitted-author")
+    else:
+        adapter._add_thread_member.assert_not_awaited()

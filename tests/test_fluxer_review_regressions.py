@@ -1,4 +1,5 @@
-"""Current-review edge cases: sticky fallback, reader retry, handoff limits."""
+"""Current-review edge cases: sticky fallback, reader retry, handoff limits,
+thread member add."""
 
 from unittest.mock import AsyncMock
 
@@ -81,3 +82,27 @@ async def test_handoff_names_follow_shared_utf16_budget_and_empty_fallback(name)
     actual = adapter.create_thread.await_args.args[1]
     assert actual == (fluxer_adapter._collapse_thread_name(name) or fluxer_adapter._DEFAULT_THREAD_NAME)
     assert fluxer_adapter.utf16_len(actual) <= fluxer_adapter._THREAD_NAME_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_adds_the_triggering_author_as_a_member(monkeypatch):
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", lambda home=None: Titles())
+    adapter = make_adapter()
+    adapter.create_thread = AsyncMock(return_value={"id": "auto-thread", "name": "synthetic title"})
+    adapter._inbound_author_by_message["trigger-msg"] = "user-42"
+    assert (await adapter.send("channel", "final", reply_to="trigger-msg")).success
+    puts = [call for call in adapter._request.await_args_list if call.args[0] == "PUT"]
+    assert [(call.args[0], call.args[1]) for call in puts] == [
+        ("PUT", "/channels/auto-thread/thread-members/user-42"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_member_add_failure_never_blocks_delivery(monkeypatch):
+    monkeypatch.setattr(fluxer_adapter, "_open_session_store", lambda home=None: Titles())
+    adapter = make_adapter()
+    adapter.create_thread = AsyncMock(return_value={"id": "auto-thread", "name": "synthetic title"})
+    adapter._inbound_author_by_message["trigger-msg"] = "user-42"
+    adapter._request = AsyncMock(side_effect=[RuntimeError("member route unavailable"), {"id": "output"}])
+    assert (await adapter.send("channel", "final", reply_to="trigger-msg")).success
+    assert adapter._request.await_args.args[1] == "/channels/auto-thread/messages"
