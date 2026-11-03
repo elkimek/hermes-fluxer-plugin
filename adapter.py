@@ -1930,6 +1930,10 @@ class FluxerAdapter(BasePlatformAdapter):
         the caller supplied them (PATCH replaces the whole list, so an edit
         without embeds must leave the message's embeds untouched)."""
         meta = metadata or {}
+        if isinstance(meta.get("embeds"), list) and not meta["embeds"]:
+            # An explicit clear is not creation of a new card: honor it even
+            # when new outbound embeds are disabled for this adapter.
+            return self._outbound_message_payload(content, embeds=[])
         if "embeds" not in meta or not (self._outbound_embeds_enabled and self._outbound_embeds_supported):
             return self._outbound_message_payload(content)
         embeds = self._normalize_outbound_embeds(meta["embeds"])
@@ -2406,7 +2410,13 @@ class FluxerAdapter(BasePlatformAdapter):
                     json=edit_payload,
                 )
             except Exception as exc:
-                if "embeds" not in edit_payload or not _is_body_rejection(exc):
+                if (
+                    "embeds" not in edit_payload
+                    or edit_payload["embeds"] == []
+                    or not _is_body_rejection(exc)
+                ):
+                    # A refused explicit clear must not become a successful
+                    # content-only edit that silently leaves the old card.
                     raise
                 # Same compatibility gate as send(): deliver the edit without
                 # embeds rather than losing it; session-disable only when the
@@ -2438,8 +2448,10 @@ class FluxerAdapter(BasePlatformAdapter):
                 raw_response=raw_response,
             )
         except Exception as exc:
-            logger.warning("Fluxer edit failed for message %s: %s", message_id, exc)
-            return SendResult(success=False, error=str(exc), retryable=True)
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            reason = f"HTTP {status}" if isinstance(status, int) else type(exc).__name__
+            logger.warning("Fluxer edit failed (%s)", reason)
+            return SendResult(success=False, error=f"Fluxer edit failed ({reason})", retryable=True)
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a Fluxer message when gateway cleanup/ephemeral flows ask."""

@@ -28,6 +28,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Dead receive listeners and heartbeat failures trigger recovery instead of silently leaving Fluxer deaf. Connection replacement and shutdown clean up old tasks and sockets.
 - Scheduled notifications and bare-platform sends accept Hermes' structured YAML home-channel settings.
 - Read tools no longer silently discard longer answers. Scope checks, redirect handling, bounded responses and diagnostics protect profile boundaries and private data.
+- Explicit empty-embed edits remove old cards. If a server refuses the clear, the edit reports failure instead of silently claiming success; failure diagnostics omit private request details.
 - Voice cancellation closes stalled speech requests; slow playback does not drop audio. Explicit local transcription never silently uploads audio to a cloud provider, and installed wheels include the voice sidecars.
 
 ### Verification
