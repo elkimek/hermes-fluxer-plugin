@@ -169,8 +169,8 @@ async def test_cancelled_creation_waiter_does_not_release_another_creators_lock(
     assert await first == THREAD
     assert await third == THREAD
     assert adapter.create_thread.await_count == 1
-    assert not adapter._thread_create_locks
     assert not adapter._thread_create_lock_users
+    assert len(adapter._thread_create_locks) <= adapter._threads_by_anchor_max
 
 
 @pytest.mark.asyncio

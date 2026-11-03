@@ -1,0 +1,58 @@
+"""Cross-contribution contracts exercised against the integrated adapter."""
+from unittest.mock import AsyncMock
+
+import pytest
+
+import adapter as fluxer_adapter
+from gateway.config import PlatformConfig
+
+
+class HttpError(Exception):
+    def __init__(self, code, body):
+        self.response = type("Response", (), {"status_code": code, "text": body})()
+        super().__init__(f"HTTP {code}")
+
+
+def make_adapter(**options):
+    return fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra={
+        "bot_token": "app.secret", "allow_all_users": True, "require_mention": False,
+        "thread_replies": True, "delivery_verification": False, **options,
+    }))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", [None, "human", "bot"])
+async def test_adoption_uses_server_ownership_not_the_create_refusal(owner):
+    adapter = make_adapter()
+    adapter.bot_user_id = "bot"
+    adapter.create_thread = AsyncMock(side_effect=HttpError(400, "THREAD_ALREADY_CREATED_FOR_MESSAGE"))
+    adapter._fetch_channel_name = AsyncMock(return_value="Human label")
+    info = {"type": 11, "parent_id": "parent"}
+    if owner is not None:
+        info["owner_id"] = owner
+    adapter._fetch_thread_info = AsyncMock(return_value=info)
+    adapter._schedule_title_rename = lambda *args: None
+    adapter._threads_pending["anchor"] = "parent"
+
+    target, _, automatic = await adapter._resolve_outbound_target("anchor", None, None)
+
+    assert target == "anchor"
+    assert adapter._thread_is_bot_owned("anchor") is (None if owner is None else owner == "bot")
+    assert automatic == ("anchor" if owner == "bot" else None)
+    assert ("anchor" in adapter._mentioned_threads) is (owner == "bot")
+    adapter._fetch_thread_info.assert_awaited_once_with("anchor")
+
+
+@pytest.mark.asyncio
+async def test_channel_title_resolution_uses_written_guard_not_display_label():
+    adapter = make_adapter()
+    adapter._session_origin_for_key = lambda key: ("parent", "user")
+    adapter._record_auto_thread("parent", "anchor", "Human label", "user")
+    adapter._remember_thread_guard("anchor", "Adapter placeholder")
+    adapter.rename_thread = AsyncMock(return_value=False)
+
+    await adapter._rename_thread_for_session("agent:main:fluxer:channel:parent:user", "New title")
+
+    adapter.rename_thread.assert_awaited_once_with(
+        "anchor", "New title", only_if_current_name="Adapter placeholder"
+    )
