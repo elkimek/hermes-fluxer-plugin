@@ -329,11 +329,13 @@ async def stalled_http(mode):
             entered.set()
             while await reader.read(4096):
                 pass
-            disconnected.set()
         finally:
             writer.close()
             await writer.wait_closed()
             handlers.discard(asyncio.current_task())
+            # EOF precedes wait_closed() completion on some supported loops.
+            # Signal only once the test-owned handler is completely drained.
+            disconnected.set()
 
     server = await asyncio.start_server(serve, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
