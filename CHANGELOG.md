@@ -12,6 +12,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Added
 
+- Outbound messages and edits support rich embeds through `metadata["embeds"]`, with `FLUXER_OUTBOUND_EMBEDS` as an off switch. Unsupported builds fall back to text without duplicating ambiguous sends.
 - Automatic replies add the admitted triggering user to a bot-owned reply thread. Membership is best-effort within a two-second total budget, so unavailable member routes do not hold up delivery.
 
 ### Fixed
@@ -25,11 +26,14 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Gateway receive and heartbeat failures reconnect instead of silently losing inbound traffic. Setup, replacement and shutdown retire old sockets and join their tasks without reconnect churn or resource leaks.
 
+- Embed text is shortened at Unicode-aware Fluxer limits. Embed rejection composes with deleted-thread recovery and disables embeds only when the response identifies them as unsupported.
+
 ### Verification
 
 - Regression suites cover reference recovery, deleted-thread fallback, concurrent creation and cancellation, bounded lock eviction, thread adoption and ownership, title ownership and guarded renames, queued turns, and goal pause/resume/clear lifecycles. Host-backed tests exercise Hermes routing as well as standalone adapter behavior.
 - Gateway lifecycle tests include real loopback WebSocket Identify/READY/heartbeat traffic, connection replacement, recovery after server close, and joined shutdown.
 - Membership tests cover admitted authors, concurrent participants, failure and timeout delivery, caller cancellation, and ID-free diagnostics.
+- Embed regressions cover normalization, first-chunk placement, concurrent support flags, rejection ordering, reference modes, and no duplicate sends after timeouts or server failures.
 
 ## [0.5.1] - 2026-10-13
 
