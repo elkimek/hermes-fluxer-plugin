@@ -131,3 +131,26 @@ async def test_clarify_session_anchor_routes_and_registers_in_the_final_containe
     assert posts[-1] == f"/channels/{expected}/messages"
     assert exposed == [expected, expected]
     assert adapter._pending_clarify_cards["clarification"]["chat_id"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("info", [{}, {"type": 11, "parent_id": "parent"}, {"type": 11, "parent_id": "parent", "owner_id": "human"}])
+async def test_adoption_cannot_reuse_stale_bot_privileges_when_fresh_owner_is_unknown(info):
+    adapter = make_adapter()
+    adapter.bot_user_id = "bot"
+    adapter._remember_thread_id({"id": "anchor"}, "parent")
+    adapter.create_thread = AsyncMock(side_effect=HttpError(400, "THREAD_ALREADY_CREATED_FOR_MESSAGE"))
+    adapter._fetch_channel_name = AsyncMock(return_value="Placeholder")
+    adapter._fetch_thread_info = AsyncMock(return_value=info)
+    adapter._inbound_author_by_message["anchor"] = "admitted-author"
+    adapter._add_thread_member = AsyncMock()
+    adapter._schedule_title_rename = lambda *args: None
+
+    assert await adapter._start_thread_from_message("parent", "anchor") == "anchor"
+    target, _, automatic = await adapter._resolve_outbound_target("anchor", None, None)
+
+    assert target == "anchor"
+    assert adapter._thread_is_bot_owned("anchor") is not True
+    assert "anchor" not in adapter._mentioned_threads
+    assert automatic is None
+    adapter._add_thread_member.assert_not_awaited()

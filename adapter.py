@@ -2147,11 +2147,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     ):
                         raise
                     reference_ok = False
-                    logger.info(
-                        "Fluxer message reference %s is unknown; retrying in %s without it",
-                        reply_to,
-                        target,
-                    )
+                    logger.info('Fluxer message reference is unknown; retrying in the same container without it')
                     # Rebuild rather than mutate in place: the dict was already
                     # handed to a request. Later split chunks are built from the
                     # shared payload, so the reference is dropped there too.
@@ -2947,6 +2943,8 @@ class FluxerAdapter(BasePlatformAdapter):
                 self._threads_pending.pop(thread_id, None)
                 self._remember_channel_kind(thread_id, {"type": 11})
                 self._thread_info_cache.pop(thread_id, None)
+                self._thread_owners.pop(thread_id, None)
+                self._mentioned_threads.pop(thread_id, None)
                 await self._resolve_thread_info(thread_id, expect_thread=True)
             else:
                 thread_id = self._remember_thread_id(data, chat_id)
@@ -3147,11 +3145,7 @@ class FluxerAdapter(BasePlatformAdapter):
             if not owner or owner == user_key:
                 return entry
         if candidates:
-            logger.info(
-                "Fluxer /title rename skipped for chat %s user %s: %d auto-thread(s), "
-                "none attributable to this session",
-                chat_key, user_id, len(candidates),
-            )
+            logger.info('Fluxer /title rename skipped: %d auto-thread(s), none attributable to this session', len(candidates))
         return None
 
     def _cached_auto_thread_name(self, thread_id: str) -> Optional[str]:
@@ -3181,7 +3175,7 @@ class FluxerAdapter(BasePlatformAdapter):
         placeholder already says. Acquisition, reads and normalization are all
         best-effort: optional naming must never prevent message delivery.
 
-        A miss is logged at INFO naming the chat and participant. A thread is named
+        A miss is logged at INFO without private identifiers or title text. A thread is named
         from the session keyed on its ANCHOR message id, so a not-yet-created
         session row is the ordinary case for the first seconds of a turn -- the
         caller keeps the placeholder and polls. Logging it is what distinguishes
@@ -3198,17 +3192,11 @@ class FluxerAdapter(BasePlatformAdapter):
                 user_id=str(user_id) if user_id else None,
             )
             if not session_id:
-                logger.info(
-                    "Fluxer no session title for origin %s (user %s): no session row yet",
-                    chat_key, user_id,
-                )
+                logger.info('Fluxer no session title: no session row yet')
                 return None
             source = store.get_session_title_source(session_id)
             if source not in _TITLE_RENAME_SOURCES:
-                logger.info(
-                    "Fluxer no session title for origin %s (session %s): title source %r",
-                    chat_key, session_id, source,
-                )
+                logger.info('Fluxer no session title: source is not a user or model title')
                 return None
             title = store.get_session_title(session_id)
             return str(title).strip() or None
@@ -3326,7 +3314,7 @@ class FluxerAdapter(BasePlatformAdapter):
         Best-effort by design: a session that never gets a title, or a thread a
         human renamed in the meantime (declined by the placeholder guard), simply
         keeps the name it has. Every way out of this loop that leaves the thread
-        under its placeholder says so at INFO with the ids and the reason -- a
+        under its placeholder says so at INFO with the reason, not private ids -- a
         silently unnamed thread was previously indistinguishable from a named one.
         """
         deadline = time.monotonic() + _TITLE_RENAME_WINDOW_SECONDS
@@ -3338,28 +3326,15 @@ class FluxerAdapter(BasePlatformAdapter):
                         thread_id, title, only_if_current_name=placeholder or None
                     )
                 except Exception as exc:
-                    logger.info(
-                        "Fluxer thread %s not renamed (%s) from session title %r of %s",
-                        thread_id, type(exc).__name__, title, chat_id,
-                    )
+                    logger.info('Fluxer thread not renamed from session title (%s)', type(exc).__name__)
                     return
                 if applied:
-                    logger.info(
-                        "Fluxer thread %s named from session title %r", thread_id, title
-                    )
+                    logger.info('Fluxer thread named from session title')
                 else:
-                    logger.info(
-                        "Fluxer thread %s not renamed to %r: it no longer carries the "
-                        "placeholder %r (renamed by hand?)",
-                        thread_id, title, placeholder,
-                    )
+                    logger.info('Fluxer thread not renamed: it no longer carries the placeholder (renamed by hand?)')
                 return
             if time.monotonic() >= deadline:
-                logger.info(
-                    "Fluxer thread %s keeps its placeholder %r: no session title for %s "
-                    "after %.0fs",
-                    thread_id, placeholder, chat_id, _TITLE_RENAME_WINDOW_SECONDS,
-                )
+                logger.info('Fluxer thread keeps its placeholder: no session title after %.0fs', _TITLE_RENAME_WINDOW_SECONDS)
                 return
             await asyncio.sleep(_TITLE_RENAME_POLL_INTERVAL)
 
@@ -3380,7 +3355,7 @@ class FluxerAdapter(BasePlatformAdapter):
             asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception as exc:
             coro.close()
-            logger.debug("Fluxer /title rename could not be scheduled: %s", exc)
+            logger.debug('Fluxer /title rename could not be scheduled (%s)', type(exc).__name__)
 
     async def _rename_thread_for_session(self, session_key: str, title: str) -> None:
         """Rename the thread a ``/title`` belongs to.
@@ -3404,12 +3379,10 @@ class FluxerAdapter(BasePlatformAdapter):
                 thread_id, title, only_if_current_name=guard or None
             )
         except Exception as exc:
-            logger.info(
-                "Fluxer /title rename failed for thread %s (%s)", thread_id, type(exc).__name__
-            )
+            logger.info('Fluxer /title rename failed (%s)', type(exc).__name__)
             return
         if applied:
-            logger.info("Fluxer thread %s named from /title", thread_id)
+            logger.info('Fluxer thread named from /title')
 
     def _resolve_title_rename_target(self, session_key: str) -> tuple[str, str]:
         """``(thread_id, placeholder_guard)`` for a ``/title`` rename, or ``("", "")``.
@@ -3427,17 +3400,11 @@ class FluxerAdapter(BasePlatformAdapter):
             return thread_id, (self._thread_rename_guard(thread_id) or "")
         origin = self._session_origin_for_key(key)
         if not origin:
-            logger.info(
-                "Fluxer /title rename skipped for session %s: no session origin", key
-            )
+            logger.info('Fluxer /title rename skipped: no session origin')
             return "", ""
         entry = self._auto_thread_for_session(origin[0], origin[1])
         if not entry:
-            logger.info(
-                "Fluxer /title rename skipped for channel %s user %s: no thread attributable "
-                "to this session",
-                origin[0], origin[1],
-            )
+            logger.info('Fluxer /title rename skipped: no thread attributable to this session')
             return "", ""
         return str(entry[0]), (self._thread_rename_guard(str(entry[0])) or "")
 
@@ -3448,7 +3415,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 "GET", f"/channels/{_quote_id(channel_id)}", warn_on_error=False
             )
         except Exception as exc:
-            logger.debug("Fluxer channel lookup failed for %s: %s", channel_id, exc)
+            logger.debug('Fluxer channel lookup failed (%s)', type(exc).__name__)
             return None
         if isinstance(data, Mapping):
             return str(data.get("name") or "")
@@ -3996,15 +3963,12 @@ class FluxerAdapter(BasePlatformAdapter):
         if only_if_current_name is not None:
             current = await self._fetch_channel_name(tid)
             if current is None or current.strip() != str(only_if_current_name).strip():
-                logger.debug(
-                    "Fluxer thread %s rename declined: current name %r does not match %r",
-                    tid, current, only_if_current_name,
-                )
+                logger.debug('Fluxer thread rename declined: current name does not match the written guard')
                 return False
         try:
             await self._request("PATCH", f"/channels/{_quote_id(tid)}", json={"name": cleaned})
         except Exception as exc:
-            logger.debug("Fluxer thread rename failed for %s: %s", tid, exc)
+            logger.debug('Fluxer thread rename failed (%s)', type(exc).__name__)
             return False
         self._note_renamed_thread(tid, cleaned)
         self._remember_thread_guard(tid, cleaned)
@@ -4027,15 +3991,11 @@ class FluxerAdapter(BasePlatformAdapter):
         # it through the same resolver as delivery -- opening the prospective thread
         # if it does not exist yet, rather than refreshing the parent channel.
         target = await self._typing_target(chat_id, metadata)
-        # Say which container the indicator was armed on, at INFO. "No indicator
+        # Say whether the indicator uses its own or a routed container at INFO. "No indicator
         # appeared" was previously untraceable: nothing recorded whether the loop
         # picked the thread, the parent, or gave up. Logged once per turn, not per
         # tick, so a long turn does not flood the gateway log.
-        logger.info(
-            "Fluxer typing indicator armed for container %s (turn %s/%s)%s",
-            target or chat_id, chat_key[0], chat_key[1],
-            "" if str(target) != str(chat_id) else ", the turn's own chat",
-        )
+        logger.info('Fluxer typing indicator armed for %s', "the turn's own chat" if str(target) == str(chat_id) else "a routed container")
 
         async def _typing_loop() -> None:
             nonlocal target
@@ -4046,10 +4006,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
-                        logger.info(
-                            "Fluxer typing indicator for %s stopped after an error (%s)",
-                            target, type(exc).__name__,
-                        )
+                        logger.info("Fluxer typing indicator stopped after an error (%s)", type(exc).__name__)
                         return
                     await asyncio.sleep(_TYPING_REFRESH_SECONDS)
                     # Re-resolve on EVERY tick. The turn's container is not fixed
@@ -4062,10 +4019,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     # the follow-up ticks land where the turn actually delivers.
                     next_target = await self._typing_target(chat_id, metadata)
                     if next_target and next_target != target:
-                        logger.info(
-                            "Fluxer typing indicator for this turn moved from %s to %s",
-                            target, next_target,
-                        )
+                        logger.info("Fluxer typing indicator for this turn moved to a new container")
                         target = next_target
             except asyncio.CancelledError:
                 pass
@@ -5108,12 +5062,9 @@ class FluxerAdapter(BasePlatformAdapter):
             from tools import clarify_gateway as _cg
 
             resolved = bool(_cg.resolve_gateway_clarify(clarify_id, choice))
-            logger.info(
-                "Fluxer clarify reaction resolved=%s (id=%s choice=%s user=%s)",
-                resolved, clarify_id, choice, user_id,
-            )
+            logger.info('Fluxer clarify reaction resolved=%s', resolved)
         except Exception as exc:
-            logger.error("Fluxer clarify reaction resolve failed: %s", exc)
+            logger.error('Fluxer clarify reaction resolve failed (%s)', type(exc).__name__)
         notice = f"✅ answered: {choice}" if resolved else "↩️ this prompt has already ended"
         await self.retire_clarify_card(clarify_id, notice)
 
@@ -5137,7 +5088,7 @@ class FluxerAdapter(BasePlatformAdapter):
         if not user_id or user.get("bot") or (self.bot_user_id and user_id == str(self.bot_user_id)):
             return
         if not self._interaction_user_allowed(user_id):
-            logger.info("Fluxer reaction answer ignored for unauthorized user %s", user_id)
+            logger.info('Fluxer reaction answer ignored for unauthorized user')
             return
         if not channel_id or channel_id not in self._known_channel_ids:
             return
@@ -5195,10 +5146,7 @@ class FluxerAdapter(BasePlatformAdapter):
                 timestamp=datetime.now(tz=timezone.utc),
             )
             await self.handle_message(event)
-            logger.info(
-                "Fluxer reaction answer forwarded (message=%s digit=%s user=%s)",
-                message_id, digit, user_id,
-            )
+            logger.info('Fluxer reaction answer forwarded (digit=%s)', digit)
 
             self._reaction_forwards[key] = time.monotonic()
             self._reaction_forwards.move_to_end(key)
