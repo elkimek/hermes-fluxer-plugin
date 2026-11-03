@@ -12,11 +12,11 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Added
 
-- Automatic thread replies now also add the message author who triggered the turn as a member of the new thread (`PUT /channels/{thread_id}/thread-members/{user_id}`). Fluxer threads are member-scoped, so without this the person who asked could not see the reply thread opened for them (Discord adds the anchor's author implicitly). The add is best-effort and never blocks delivery.
+- Automatic thread replies add the person who asked as a member so they can see the reply. Membership is best-effort, with a two-second overall limit so an unavailable member route cannot hold a ready reply back for minutes.
 
 ### Verification
 
-- Regression tests cover the member add on auto-thread creation and continued delivery when the member route fails.
+- Regression tests cover automatic membership, continued delivery when the route fails or stalls, cancelled turns, separate participants, rejected messages, and ID-free failure logs.
 
 ## [0.5.1] - 2026-10-13
 

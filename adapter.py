@@ -89,6 +89,7 @@ _RECONNECT_MAX_DELAY = 60.0
 _HEARTBEAT_ACK_TIMEOUT_FACTOR = 2.5
 _REST_RATE_LIMIT_MAX_ATTEMPTS = 3
 _REST_RATE_LIMIT_MAX_DELAY = 60.0
+_THREAD_MEMBER_ADD_TIMEOUT_SECONDS = 2.0
 _PRESENCE_STATUSES = frozenset({"online", "idle", "dnd", "invisible", "offline"})
 _DEFAULT_PRESENCE_STATUS = "online"
 _DEFAULT_BACKLOG_LIMIT = 25
@@ -2234,17 +2235,21 @@ class FluxerAdapter(BasePlatformAdapter):
         Fluxer threads are member-scoped and do not inherit the author of the
         message the thread was started from (unlike Discord, where the anchor's
         author is implicitly a member). Adding the author keeps the reply thread
-        visible to the person who triggered the turn. Failures never block
-        delivery; the documented route is Thread members, Add thread member.
+        visible to the person who triggered the turn. The overall budget includes
+        HTTP attempts and rate-limit sleeps; ordinary failures must not abort
+        delivery, but caller cancellation still propagates.
         """
         try:
-            await self._request(
-                "PUT",
-                f"/channels/{thread_id}/thread-members/{user_id}",
-                warn_on_error=False,
+            await asyncio.wait_for(
+                self._request(
+                    "PUT",
+                    f"/channels/{thread_id}/thread-members/{user_id}",
+                    warn_on_error=False,
+                ),
+                timeout=_THREAD_MEMBER_ADD_TIMEOUT_SECONDS,
             )
         except Exception:
-            logger.debug("Fluxer thread member add failed for %s", thread_id)
+            logger.debug("Fluxer thread member add failed; continuing delivery")
 
     def _record_auto_thread(
         self, chat_id: str, thread_id: str, name: str, user_id: Optional[str] = None
