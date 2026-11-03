@@ -15,7 +15,7 @@ This project uses simple semantic versioning while the plugin is young:
 ### Added
 
 - Rich message cards for outbound messages and edits, with a text fallback on servers that do not support embeds.
-- Four opt-in, read-only tools for channel history, message search, guild members and audit logs. Reads use the active profile's credentials and stay inside its home guild by default.
+- Four read-only tools for channel history, message search, guild members and audit logs. Reads use the active profile's credentials and stay inside its home guild by default.
 - Tappable numbered reactions for choice prompts, with the answer routed back to the correct conversation.
 - Automatic membership for the person receiving a bot-owned thread reply, so the reply is easier to find. An unavailable membership route does not hold the reply back for minutes.
 - Optional Kokoro speech output, local-only transcription safeguards, voice catch-up after reconnect, and LiveKit E2EE configuration support.
@@ -37,7 +37,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Compatibility notes
 
-- Threads and voice remain opt-in. Read tools require adding `fluxer` to the existing platform toolset list; their authority is the bot's configured guild access, not the requesting user's individual permissions. Search indexing, audit access and server-side features depend on the deployment.
+- Threads and voice remain opt-in. If you use an explicit platform toolset list, append `fluxer` without replacing existing entries; default/full toolsets may expose configured plugin readers automatically. Their authority is the bot's configured guild access, not the requesting user's individual permissions. Search indexing, audit access and server-side features depend on the deployment.
 - Voice remains experimental: basic capture and audible replies passed live acceptance, but clean recovery after interruption is not certified. The validation room did not issue an E2EE key; E2EE is source/SDK tested, not live-certified or a promise of secrecy from the signalling server. Keep auto-join disabled until your own room's acceptance succeeds.
 - Removing choice reactions after typed answers or timeouts depends on the Hermes host's retirement callback. Retired reaction answers are rejected even on older hosts.
 

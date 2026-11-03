@@ -241,8 +241,10 @@ Install elkimek/hermes-fluxer-plugin into my Hermes setup. Read INSTALL_FOR_AGEN
 
 The `fluxer` toolset adds four read-only tools: `flux_recall` (recent channel messages),
 `flux_search` (channel message search), `flux_members` (home-guild members), and
-`flux_audit` (recent home-guild audit entries). To expose them, append `fluxer` to
-your existing `platform_toolsets.fluxer` list. Do not replace the list or enable
+`flux_audit` (recent home-guild audit entries). If you use an explicit
+`platform_toolsets.fluxer` list, append `fluxer` without replacing existing
+entries. Default/full toolsets may expose configured plugin readers
+automatically; verify the effective tool surface on your host. Do not enable
 shell, Discord, or other unrelated toolsets just to enable these readers.
 
 Credentials and policy come from the active profile's `FLUXER_*` secret scope;
