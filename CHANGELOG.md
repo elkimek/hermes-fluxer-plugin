@@ -12,6 +12,9 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Added
 
+- Choice prompts and plain-message option asks expose keycap reactions. Clarify actions are registered before reactions appear and follow the message's final destination; ordinary reaction-answer forwarding is limited to allowed users reacting to this bot in a REST-confirmed one-to-one DM.
+- An explicitly configured OpenAI-compatible Kokoro endpoint provides 24 kHz streaming TTS when the voice loop does not use an xAI key. Endpoint, voice, model and optional key have manifest and YAML configuration; providers retain their own credential requirements.
+- Voice sessions advertise E2EE capability and configure LiveKit from the server grant's key string. Offline protocol and SDK checks verify configuration, not audible encryption or protection from the signalling server.
 - Read-only `flux_recall`, `flux_search`, `flux_members` and `flux_audit` tools use profile-scoped credentials and fresh home-guild authorization. Append `fluxer` to the existing platform toolset list; only an explicit `FLUXER_TOOL_SCOPE=global` widens the guild boundary.
 - Outbound messages and edits support rich embeds through `metadata["embeds"]`, with `FLUXER_OUTBOUND_EMBEDS` as an off switch. Unsupported builds fall back to text without duplicating ambiguous sends.
 - Automatic replies add the admitted triggering user to a bot-owned reply thread. Membership is best-effort within a two-second total budget, so unavailable member routes do not hold up delivery.
@@ -30,8 +33,13 @@ This project uses simple semantic versioning while the plugin is young:
 
 - Read tools preserve bounded message, embed, attachment and audit content, label partial pages, reject invalid identifiers, oversized or malformed responses and credential-bearing redirects, and keep provider errors private.
 
+- Kokoro cancellation closes stalled HTTP streams; playback backpressure preserves audio and the total deadline includes the sink. Local-only STT uses a local backend or fails without uploading to a cloud provider.
+- Initial guild voice states restore opt-in auto-join after reconnect. Voice scripts log to stdout for supervisors, and wheels include those scripts without bundling Hermes-owned namespaces.
+- Clarify cards show every choice, reject missing or wrong channels, and cannot be replayed through DM forwarding after retirement. Typed-answer/timeout affordance cleanup remains dependent on host retirement callbacks.
+
 ### Verification
 
+- Offline voice and loopback HTTP tests cover stream cancellation, deadlines, STT privacy, E2EE options, configuration parity and built-wheel imports. No live voice-room, provider or audible encrypted-voice certification is claimed.
 - Regression suites cover reference recovery, deleted-thread fallback, concurrent creation and cancellation, bounded lock eviction, thread adoption and ownership, title ownership and guarded renames, queued turns, and goal pause/resume/clear lifecycles. Host-backed tests exercise Hermes routing as well as standalone adapter behavior.
 - Gateway lifecycle tests include real loopback WebSocket Identify/READY/heartbeat traffic, connection replacement, recovery after server close, and joined shutdown.
 - Membership tests cover admitted authors, concurrent participants, failure and timeout delivery, caller cancellation, and ID-free diagnostics.

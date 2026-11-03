@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hermes-fluxer-plugin"
 version = "0.5.1"
@@ -25,12 +29,17 @@ realtime = [
 test = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
+  "setuptools>=77",
+  "wheel",
   "PyYAML>=6",
   "tomli>=2; python_version < '3.11'",
 ]
 
 [tool.setuptools]
-py-modules = ["adapter", "agent_tools", "livekit_bridge", "xai_realtime"]
+# Keep the optional voice sidecars beside adapter.py in installed wheels.
+# Do not bundle the standalone tools/ shim: Hermes owns that namespace.
+packages = ["scripts"]
+py-modules = ["adapter", "agent_tools", "kokoro_tts", "livekit_bridge", "xai_realtime"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

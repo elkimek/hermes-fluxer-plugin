@@ -84,6 +84,13 @@ _DEFAULT_BASE_URL = "https://api.fluxer.app/v1"
 _GATEWAY_VERSION = 1
 _VOICE_STATE_UPDATE_OPCODE = 4
 _VOICE_MESSAGE_FLAG = 1 << 13
+
+# Reaction-answerable decisions: choice prompts expose 1-4 keycap reactions, and a keycap
+# reaction on any bot message in a DM is forwarded to the agent as a synthetic user message.
+_CLARIFY_REACTION_EMOJIS = tuple(f"{digit}\ufe0f\u20e3" for digit in "1234")
+_REACTION_ANSWER_DIGITS = {f"{digit}\u20e3": digit for digit in "1234"}
+_REACTION_FORWARD_DEDUPE_SECONDS = 600.0
+
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _HEARTBEAT_ACK_TIMEOUT_FACTOR = 2.5
@@ -254,6 +261,7 @@ def _build_identify_payload(
                 "os": "linux",
                 "browser": "hermes",
                 "device": "hermes",
+                "e2ee_capable": True,
             },
             "presence": {
                 "status": _coerce_presence_status(presence_status),
@@ -327,6 +335,7 @@ def _sanitize_voice_server_update(data: Dict[str, Any], *, matched_pending_join:
         "connection_id": data.get("connection_id"),
         "endpoint": data.get("endpoint"),
         "has_token": bool(data.get("token")),
+        "has_e2ee_key": bool(data.get("e2ee_key")),
         "matched_pending_join": matched_pending_join,
     }
 
@@ -967,6 +976,10 @@ class FluxerVoiceSupervisorProcess:
             "stt_model": "FLUXER_VOICE_STT_MODEL",
             "elevenlabs_language_code": "FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE",
             "tts_voice": "FLUXER_VOICE_TTS_VOICE",
+            "kokoro_url": "FLUXER_VOICE_KOKORO_URL",
+            "kokoro_voice": "FLUXER_VOICE_KOKORO_VOICE",
+            "kokoro_model": "FLUXER_VOICE_KOKORO_MODEL",
+            "kokoro_api_key": "FLUXER_VOICE_KOKORO_API_KEY",
             "context_file": "FLUXER_VOICE_CONTEXT_FILE",
             "session_db": "FLUXER_VOICE_SESSION_DB",
             "turn_log_jsonl": "FLUXER_VOICE_TURN_LOG_JSONL",
@@ -1302,6 +1315,17 @@ def _normalize_reaction_emoji(value: Any) -> str:
     return text.replace(_VARIATION_SELECTOR_16, "")
 
 
+def _keycap_emojis_in_text(content: Any) -> List[str]:
+    """Option keycap emojis (1-4) that a message already spells out in text.
+
+    Matches both the full emoji-presentation form (digit + VS16 + keycap) and
+    the bare keycap form (digit + keycap) so a sender's exact encoding never
+    hides an option. Returns the send form, ordered 1-4 and deduped.
+    """
+    probe = str(content or "").replace(_VARIATION_SELECTOR_16, "")
+    return [emoji for emoji in _CLARIFY_REACTION_EMOJIS if f"{emoji[0]}\u20e3" in probe]
+
+
 def _reaction_choice_map(specs: Any) -> Dict[str, str]:
     return {_normalize_reaction_emoji(emoji): choice for emoji, choice, _label in specs}
 
@@ -1625,6 +1649,12 @@ class FluxerAdapter(BasePlatformAdapter):
         self._pending_exec_approvals: Dict[str, Dict[str, Any]] = {}
         self._pending_component_actions: Dict[str, Dict[str, Any]] = {}
         self._pending_reaction_actions: Dict[str, Dict[str, Any]] = {}
+        self._pending_clarify_cards: Dict[str, Dict[str, Any]] = {}
+        self._reaction_forwards: OrderedDict[str, float] = OrderedDict()
+        self._reaction_forwards_inflight: set[str] = set()
+        # Tombstones keep retired clarification clicks out of the generic DM
+        # fallback. Bounded independently from the active cards/actions.
+        self._clarify_message_ids: OrderedDict[str, None] = OrderedDict()
         self._pending_voice_joins: Dict[str, Dict[str, Any]] = {}
         self._last_voice_server_update: Optional[Dict[str, Any]] = None
         self._voice_server_update_handler: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Any]] = None
@@ -1980,6 +2010,20 @@ class FluxerAdapter(BasePlatformAdapter):
             f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(message_id)}/reactions/{_quote_id(emoji)}/@me",
         )
 
+    async def _attach_keycap_reactions(self, chat_id: str, message_id: str, content: str) -> None:
+        """Make a plain-message decision ask tappable.
+
+        A message that spells its options out as 1-4 keycap emojis gets the
+        same keycaps attached as reactions, so an allowed user can answer with
+        one tap (forwarded via ``_maybe_forward_reaction_answer``). Best effort
+        only: failures are logged and never affect the send.
+        """
+        for emoji in _keycap_emojis_in_text(content):
+            try:
+                await self._add_reaction(chat_id, message_id, emoji)
+            except Exception as exc:  # noqa: BLE001 - affordance must not break sends
+                logger.debug("Fluxer keycap auto-reaction failed (%s)", type(exc).__name__)
+
     async def add_reaction(
         self,
         chat_id: str,
@@ -2182,6 +2226,10 @@ class FluxerAdapter(BasePlatformAdapter):
                         responses[-1] = {**data, "delivery_verified": True, "delivery_readback": verified}
                     else:
                         responses[-1] = {**data, "delivery_verified": False}
+                    if not (metadata or {}).get("_fluxer_clarify"):
+                        await self._attach_keycap_reactions(
+                            target_chat_id, message_id, chunk_payload["content"]
+                        )
 
             return SendResult(
                 success=True,
@@ -4904,14 +4952,273 @@ class FluxerAdapter(BasePlatformAdapter):
         if interaction_type == 2:
             await self._handle_application_command_interaction(data)
 
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Reaction-answerable clarify prompt.
+
+        Choice prompts get one keycap reaction per option (1-4) beside the numbered
+        text; a reaction resolves the clarify through
+        ``tools.clarify_gateway.resolve_gateway_clarify`` exactly like a typed number.
+        Text replies keep working via the gateway intercept. Multi-select and
+        open-ended prompts fall back to the base numbered-text prompt.
+        """
+        chat_id = await self._resolve_thread_container(chat_id, metadata, session_key)
+        if not choices or self._is_multi_select_clarify(clarify_id):
+            return await BasePlatformAdapter.send_clarify(
+                self,
+                chat_id=chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=metadata,
+            )
+        emojis = list(_CLARIFY_REACTION_EMOJIS[: len(choices)])
+        from tools.clarify_gateway import mark_awaiting_text
+
+        mark_awaiting_text(clarify_id)
+        numbered = [
+            f"  {emojis[index] if index < len(emojis) else str(index + 1) + '.'} {choice}"
+            for index, choice in enumerate(choices)
+        ]
+        hint = "React to answer, or reply with the number or your own answer."
+        text = "\n".join([f"❓ {question}", "", *numbered, "", hint])
+        # Register the actions before exposing any reactions. The generic send
+        # auto-affordance otherwise races the clarify registration and can
+        # forward a fast click as an unrelated synthetic message.
+        result = await self.send(
+            chat_id=chat_id, content=text,
+            metadata={**(metadata or {}), "_fluxer_clarify": True},
+        )
+        message_id = str(result.message_id or "") if result.success else ""
+        if not message_id:
+            return result
+        # A reply may land in a thread rather than the caller's channel; the
+        # reactions and the saved card have to name where the message actually
+        # is, or Fluxer reports the thread id back and the answer is rejected as
+        # a channel mismatch.
+        destination = self._destination_for_message(message_id, chat_id)
+        self._register_clarify_card(
+            clarify_id=clarify_id,
+            message_id=message_id,
+            chat_id=str(destination),
+            content=text,
+            emojis=emojis,
+        )
+        for emoji, choice in zip(emojis, choices):
+            self._pending_reaction_actions[f"{message_id}:{_normalize_reaction_emoji(emoji)}"] = {
+                "kind": "clarify",
+                "clarify_id": clarify_id,
+                "session_key": session_key or "",
+                "choice": str(choice),
+                "message_id": message_id,
+                "channel_id": str(destination),
+            }
+        for emoji in emojis:
+            try:
+                await self._add_reaction(destination, message_id, emoji)
+            except Exception:
+                # Missing affordance is cosmetic; the typed reply path still resolves.
+                logger.debug("Fluxer clarify reaction could not be added")
+        return result
+
+    @staticmethod
+    def _is_multi_select_clarify(clarify_id: str) -> bool:
+        try:
+            from tools import clarify_gateway as _cg
+
+            with _cg._lock:
+                return bool(getattr(_cg._entries.get(clarify_id), "multi_select", False))
+        except Exception:
+            return False
+
+    def _register_clarify_card(
+        self,
+        *,
+        clarify_id: str,
+        message_id: str,
+        chat_id: str,
+        content: str,
+        emojis: List[str],
+    ) -> None:
+        self._clarify_message_ids[message_id] = None
+        self._clarify_message_ids.move_to_end(message_id)
+        while len(self._clarify_message_ids) > 1000:
+            self._clarify_message_ids.popitem(last=False)
+        self._pending_clarify_cards[clarify_id] = {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "content": content,
+            "emojis": list(emojis),
+            "created_at": time.time(),
+        }
+        while len(self._pending_clarify_cards) > 200:
+            expired = next(iter(self._pending_clarify_cards))
+            self._pending_clarify_cards.pop(expired, None)
+            for rid, state in list(self._pending_reaction_actions.items()):
+                if state.get("kind") == "clarify" and state.get("clarify_id") == expired:
+                    self._pending_reaction_actions.pop(rid, None)
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str = "") -> None:
+        """Retire a clarify prompt's reaction affordances and mark it ended.
+
+        Called by the gateway when a clarify ends without a click (timeout, prose
+        cancellation) and by this adapter when a reaction resolves it.
+        """
+        card = self._pending_clarify_cards.pop(clarify_id, None)
+        for rid, state in list(self._pending_reaction_actions.items()):
+            if state.get("kind") == "clarify" and state.get("clarify_id") == clarify_id:
+                self._pending_reaction_actions.pop(rid, None)
+        if not card:
+            return
+        card_chat_id = str(card.get("chat_id") or "")
+        message_id = str(card.get("message_id") or "")
+        if not card_chat_id or not message_id:
+            return
+        if notice:
+            try:
+                await self.edit_message(
+                    card_chat_id, message_id, f"{card.get('content') or ''}\n\n{notice}")
+            except Exception:
+                logger.debug("Fluxer clarify card retire edit failed")
+        for emoji in card.get("emojis") or []:
+            try:
+                await self._request(
+                    "DELETE",
+                    f"/channels/{_quote_id(card_chat_id)}/messages/{_quote_id(message_id)}/reactions/{_quote_id(emoji)}/@me",
+                    warn_on_error=False,
+                )
+            except Exception:
+                logger.debug("Fluxer clarify card retire reaction cleanup failed")
+
+    async def _resolve_clarify_action(self, action: Dict[str, Any], *, user_id: str) -> None:
+        clarify_id = str(action.get("clarify_id") or "")
+        choice = str(action.get("choice") or "")
+        if not clarify_id:
+            return
+        resolved = False
+        try:
+            from tools import clarify_gateway as _cg
+
+            resolved = bool(_cg.resolve_gateway_clarify(clarify_id, choice))
+            logger.info(
+                "Fluxer clarify reaction resolved=%s (id=%s choice=%s user=%s)",
+                resolved, clarify_id, choice, user_id,
+            )
+        except Exception as exc:
+            logger.error("Fluxer clarify reaction resolve failed: %s", exc)
+        notice = f"✅ answered: {choice}" if resolved else "↩️ this prompt has already ended"
+        await self.retire_clarify_card(clarify_id, notice)
+
+    async def _maybe_forward_reaction_answer(
+        self, data: Dict[str, Any], *, message_id: str, channel_id: str, emoji: str
+    ) -> None:
+        """Forward a keycap reaction on a bot message in a DM as a synthetic user message.
+
+        The gateway resolves reactions only while a matching pending action exists;
+        decision asks that arrive as plain messages (cron/monitor reports) register no
+        action, so their keycap reactions are re-delivered to the agent as an ordinary
+        message the turn can act on.
+        """
+        digit = _REACTION_ANSWER_DIGITS.get(emoji)
+        if not digit:
+            return
+        if data.get("guild_id") or ((data.get("guild") or {}).get("id")):
+            return
+        user = data.get("user") or ((data.get("member") or {}).get("user") or {})
+        user_id = str(data.get("user_id") or user.get("id") or "")
+        if not user_id or user.get("bot") or (self.bot_user_id and user_id == str(self.bot_user_id)):
+            return
+        if not self._interaction_user_allowed(user_id):
+            logger.info("Fluxer reaction answer ignored for unauthorized user %s", user_id)
+            return
+        if not channel_id or channel_id not in self._known_channel_ids:
+            return
+        if message_id in self._clarify_message_ids:
+            return
+        key = f"{channel_id}:{message_id}:{emoji}:{user_id}"
+        now = time.monotonic()
+        last = self._reaction_forwards.get(key)
+        if key in self._reaction_forwards_inflight or (
+            last is not None and now - last < _REACTION_FORWARD_DEDUPE_SECONDS
+        ):
+            return
+        self._reaction_forwards_inflight.add(key)
+        try:
+            # A missing guild_id is not proof of a DM. Fluxer reaction events
+            # may omit guild context in channels/threads too. Read the channel
+            # and fail closed; never inject their text into a private session.
+            channel = await self._request("GET", f"/channels/{_quote_id(channel_id)}")
+            if channel.get("type") not in (1, "1", "dm", "direct", "private") or channel.get("guild_id"):
+                return
+            message = await self._request(
+                "GET", f"/channels/{_quote_id(channel_id)}/messages/{_quote_id(message_id)}"
+            )
+            author = message.get("author") or {}
+            if not self.bot_user_id or str(author.get("id") or "") != str(self.bot_user_id):
+                return
+            excerpt = " ".join(str(_message_content(message) or "").split())[:600]
+            display_name = str(user.get("username") or user.get("global_name") or user_id)
+            synthetic_id = f"reaction-answer-{message_id}-{emoji[0]}-{user_id}-{time.time_ns()}"
+            text = (
+                f"[reaction answer] {display_name} reacted {digit}\u20e3 to a message from me "
+                f"in this chat (message {message_id}). That message said:\n> {excerpt}\n\n"
+                "Treat the reaction as their answer or selection for that prompt."
+            )
+            source = self.build_source(
+                chat_id=channel_id,
+                chat_name=None,
+                chat_type="dm",
+                user_id=user_id,
+                user_name=display_name,
+                guild_id=None,
+                message_id=synthetic_id,
+            )
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message={
+                    "synthetic": "reaction_answer",
+                    "message_id": message_id,
+                    "emoji": emoji,
+                    "user_id": user_id,
+                },
+                message_id=synthetic_id,
+                timestamp=datetime.now(tz=timezone.utc),
+            )
+            await self.handle_message(event)
+            logger.info(
+                "Fluxer reaction answer forwarded (message=%s digit=%s user=%s)",
+                message_id, digit, user_id,
+            )
+
+            self._reaction_forwards[key] = time.monotonic()
+            self._reaction_forwards.move_to_end(key)
+            while len(self._reaction_forwards) > 256:
+                self._reaction_forwards.popitem(last=False)
+        except Exception as exc:
+            logger.debug("Fluxer reaction answer failed (%s)", type(exc).__name__)
+        finally:
+            self._reaction_forwards_inflight.discard(key)
+
     async def _handle_reaction_add(self, data: Dict[str, Any]) -> None:
         message_id = str(data.get("message_id") or ((data.get("message") or {}).get("id")) or "")
         channel_id = str(data.get("channel_id") or ((data.get("channel") or {}).get("id")) or "")
         emoji = _reaction_emoji_from_event(data)
-        if not message_id or not emoji:
+        if not message_id or not channel_id or not emoji:
             return
         action = self._pending_reaction_actions.get(f"{message_id}:{emoji}")
         if not action:
+            await self._maybe_forward_reaction_answer(
+                data, message_id=message_id, channel_id=channel_id, emoji=emoji)
             return
         user = data.get("user") or ((data.get("member") or {}).get("user") or {})
         user_id = str(data.get("user_id") or user.get("id") or "")
@@ -4928,6 +5235,8 @@ class FluxerAdapter(BasePlatformAdapter):
             await self._resolve_exec_approval_action(action, user_id=user_id)
         elif action.get("kind") == "slash_confirm":
             await self._resolve_slash_confirm_action(action, user_id=user_id)
+        elif action.get("kind") == "clarify":
+            await self._resolve_clarify_action(action, user_id=user_id)
 
     async def _handle_component_interaction(self, data: Dict[str, Any]) -> None:
         interaction_data = data.get("data") or {}
@@ -5113,6 +5422,22 @@ class FluxerAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("Fluxer voice-state update handler failed")
 
+    async def _handle_guild_voice_states(self, data: Dict[str, Any]) -> None:
+        """Replay the guild's initial voice states to the voice-state handler.
+
+        Fluxer includes current voice states in GUILD_CREATE on a fresh
+        session. Forwarding them lets the auto-join supervisor act on a target
+        user who is already in an allowed channel (a join missed while the
+        supervisor was down or restarting) instead of waiting for the next
+        live VOICE_STATE_UPDATE.
+        """
+        states = data.get("voice_states")
+        if not isinstance(states, list) or self._voice_state_update_handler is None:
+            return
+        for state in states:
+            if isinstance(state, dict):
+                await self._handle_voice_state_update(state)
+
     async def _handle_voice_server_update(self, data: Dict[str, Any]) -> None:
         """Capture Fluxer LiveKit server metadata without retaining the token."""
         guild_id = data.get("guild_id")
@@ -5126,9 +5451,10 @@ class FluxerAdapter(BasePlatformAdapter):
         safe_update = _sanitize_voice_server_update(data, matched_pending_join=matched)
         self._last_voice_server_update = safe_update
         logger.info(
-            "Fluxer voice server update captured endpoint=%s has_token=%s matched_pending_join=%s channel=%s guild=%s connection=%s",
+            "Fluxer voice server update captured endpoint=%s has_token=%s has_e2ee_key=%s matched_pending_join=%s channel=%s guild=%s connection=%s",
             safe_url_for_log(str(safe_update.get("endpoint") or "")),
             safe_update.get("has_token"),
+            safe_update.get("has_e2ee_key"),
             matched,
             safe_update.get("channel_id") or "<none>",
             safe_update.get("guild_id") or "<dm>",
@@ -5202,6 +5528,9 @@ class FluxerAdapter(BasePlatformAdapter):
         if event_name == "VOICE_STATE_UPDATE":
             await self._handle_voice_state_update(data)
             return
+        if event_name == "GUILD_CREATE":
+            await self._handle_guild_voice_states(data)
+            return
         if event_name in {"MESSAGE_REACTION_ADD", "REACTION_ADD", "MESSAGE_REACTION_CREATE"}:
             await self._handle_reaction_add(data)
             return
@@ -5259,6 +5588,9 @@ class FluxerAdapter(BasePlatformAdapter):
                 self._pending_reaction_actions.pop(rid, None)
                 if slash_cancel_action is None and state.get("kind") == "slash_confirm":
                     slash_cancel_action = state
+        for clarify_key, card in list(self._pending_clarify_cards.items()):
+            if card.get("message_id") == message_id:
+                self._pending_clarify_cards.pop(clarify_key, None)
         if slash_cancel_action:
             try:
                 from tools.slash_confirm import resolve
@@ -5543,6 +5875,10 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "stt_model": "FLUXER_VOICE_STT_MODEL",
         "elevenlabs_language_code": "FLUXER_VOICE_ELEVENLABS_LANGUAGE_CODE",
         "tts_voice": "FLUXER_VOICE_TTS_VOICE",
+        "kokoro_url": "FLUXER_VOICE_KOKORO_URL",
+        "kokoro_voice": "FLUXER_VOICE_KOKORO_VOICE",
+        "kokoro_model": "FLUXER_VOICE_KOKORO_MODEL",
+        "kokoro_api_key": "FLUXER_VOICE_KOKORO_API_KEY",
         "context_file": "FLUXER_VOICE_CONTEXT_FILE",
         "session_db": "FLUXER_VOICE_SESSION_DB",
         "turn_log_jsonl": "FLUXER_VOICE_TURN_LOG_JSONL",

@@ -137,6 +137,76 @@ async def test_smoke_bridge_connects_with_raw_token_but_only_returns_safe_metada
     assert "ephemeral-livekit-token" not in repr(bridge.__dict__)
 
 
+class FakeE2EEKeyProviderOptions:
+    def __init__(self, shared_key):
+        self.shared_key = shared_key
+
+
+class FakeE2EEOptions:
+    def __init__(self, key_provider_options):
+        self.key_provider_options = key_provider_options
+
+
+class FakeE2EERtc:
+    KeyProviderOptions = FakeE2EEKeyProviderOptions
+    E2EEOptions = FakeE2EEOptions
+    RoomOptions = type("RoomOptions", (), {"__init__": lambda self, **kwargs: None})
+
+
+@pytest.mark.asyncio
+async def test_smoke_bridge_enables_frame_cryptor_when_grant_has_e2ee_key(monkeypatch):
+    rooms = []
+
+    def room_factory():
+        room = FakeRoom()
+        rooms.append(room)
+        return room
+
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", lambda: FakeE2EERtc)
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=room_factory)
+
+    info = await bridge.connect_from_voice_server_update(
+        {
+            "guild_id": "guild-1",
+            "channel_id": "voice-chan",
+            "connection_id": "conn-1",
+            "endpoint": "wss://livekit.fluxer.example",
+            "token": "ephemeral-livekit-token",
+            "e2ee_key": "abcDEF_-urlsafe-base64-key",
+        }
+    )
+
+    _url, _token, options = rooms[0].connected[0]
+    assert options.encryption.key_provider_options.shared_key == b"abcDEF_-urlsafe-base64-key"
+    assert "abcDEF_-urlsafe-base64-key" not in repr(info)
+    assert "abcDEF_-urlsafe-base64-key" not in repr(bridge.__dict__)
+
+
+@pytest.mark.asyncio
+async def test_smoke_bridge_without_e2ee_key_connects_plaintext(monkeypatch):
+    rooms = []
+
+    def room_factory():
+        room = FakeRoom()
+        rooms.append(room)
+        return room
+
+    def boom():
+        raise AssertionError("e2ee helpers must not be loaded without an e2ee_key")
+
+    monkeypatch.setattr(livekit_bridge, "_load_livekit_audio_helpers", boom)
+    bridge = livekit_bridge.FluxerLiveKitSmokeBridge(room_factory=room_factory)
+
+    await bridge.connect_from_voice_server_update(
+        {
+            "endpoint": "wss://livekit.fluxer.example",
+            "token": "ephemeral-livekit-token",
+        }
+    )
+
+    assert rooms[0].connected == [("wss://livekit.fluxer.example", "ephemeral-livekit-token", None)]
+
+
 @pytest.mark.asyncio
 async def test_smoke_bridge_disconnects_existing_room_before_reconnect():
     rooms = []

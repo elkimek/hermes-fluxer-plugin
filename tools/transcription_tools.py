@@ -177,3 +177,7 @@ def transcribe_audio(file_path: str, model: str | None = None) -> dict[str, Any]
             if txt_files:
                 transcript = txt_files[0].read_text(errors="replace").strip()
         return {"success": bool(transcript), "transcript": transcript, "provider": "local", "model": model or "base"}
+
+
+# The standalone shim never dispatches to cloud from transcribe_audio.
+transcribe_audio_local_fallback = transcribe_audio

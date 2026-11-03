@@ -101,6 +101,18 @@ Status: xAI Realtime text-to-voice publishing verified against hosted Fluxer on 
 - Publish assistant audio back to the Fluxer LiveKit room.
 - Add controls: join, leave, mute, listen-only, push-to-talk / wake-word mode.
 
+## Voice E2EE (end-to-end encrypted channels)
+
+Protocol review is grounded in [Fluxer source at `8cc485cf`](https://github.com/fluxerapp/fluxer/tree/8cc485cf8186ada427aa79701c400dc01580ef10), not a certification of any running instance:
+
+- Guild encryption is enabled when rollout scope is `platform_wide` or the guild has `VOICE_E2EE`; private calls require `platform_wide`. A channel is E2EE-active when it has participants and all voice states are capable (`guild_voice_e2ee.erl`). Deployment versions can change this policy.
+- The session advertises `e2ee_capable: true` in **Identify properties**, not in the opcode-4 join payload. Voice placement reads the session context. Non-capable human sessions are refused from active encrypted channels with `VOICE_E2EE_REQUIRED`; bot sessions are exempt. The server's downgrade diagnostic also treats bots specially, so that warning alone does not prove that frames are undecryptable.
+- An encryption-enabled guild grants a capable joiner an `e2ee_key`: 32 random bytes encoded as unpadded URL-safe base64. Source `maybe_room_key_for_reply_guild` gates the grant on capability and guild policy, **not** on the all-participants-active predicate. `has_e2ee_key=true` therefore proves receipt of key material, not that every participant is encrypting.
+- The bridge passes the **key string's UTF-8 bytes**, without base64 decoding, to `RoomOptions.encryption = E2EEOptions(key_provider_options=KeyProviderOptions(shared_key=...))`. This matches the web client's string input to `ExternalE2EEKeyProvider.setKey`: PBKDF2 with salt `LKFrameEncryptionKey`. Offline construction was also checked against the declared minimum Python SDK, LiveKit 1.1.10. The SDK retains the crypto material as required for encryption; the adapter's safe update, return value, and diagnostics contain no key or token.
+- Guild room keys are created on demand, retained while a voice state or pending capable join exists, and forgotten when fully idle. A joiner's grant is not a demonstrated rekey notification for every existing participant.
+
+Diagnostics: `has_e2ee_key` and the bridge's `e2ee=True` log report local configuration only. They do **not** prove successful remote decryption, audible bidirectional speech, privacy against the signalling server that supplies the shared key, or a particular deployment's E2EE rollout. No live voice-room acceptance was performed during this review. A consenting human must still verify encrypted join → targeted capture → STT → reply playback, plus interruption and reconnect/key lifecycle.
+
 ## Open questions
 
 - Does hosted Fluxer allow bot accounts to join voice with the same gateway flow as users, or does it require additional bot permissions/intents?
