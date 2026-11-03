@@ -25,6 +25,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Replies and attachments stay in their intended conversation when references become stale, a thread already exists, or several people talk at once. A genuinely deleted automatic thread still has a safe parent-channel fallback.
 - Thread titles, typing indicators, progress, approval prompts, `/title`, `/stop` and goal controls follow the correct participant and session. Human thread names and explicit destinations are respected.
 - Cancelling an optional membership request no longer abandons the new thread's pending title update.
+- Optional choice reactions and prompt cleanup have a short shared deadline, so rate limits cannot hold replies or resolved approvals up for minutes. Typed answers remain available.
 - Dead receive listeners and heartbeat failures trigger recovery instead of silently leaving Fluxer deaf. Connection replacement and shutdown clean up old tasks and sockets.
 - Scheduled notifications and bare-platform sends accept Hermes' structured YAML home-channel settings.
 - Read tools no longer silently discard longer answers. Scope checks, redirect handling, bounded responses and diagnostics protect profile boundaries and private data.
