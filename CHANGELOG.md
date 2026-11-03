@@ -10,6 +10,14 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+### Fixed
+
+- A reply whose `message_reference` the server cannot resolve no longer escapes its thread or gets dropped. Fluxer answers a stale or cross-container reference with `404 UNKNOWN_MESSAGE`, which the adapter used to read as a deleted thread: the reply was re-posted to the parent channel with the same invalid reference attached, so the fallback failed and the message was lost. The adapter now distinguishes that reference error from a genuinely missing channel/thread and retries once in the same delivery container without the reference, so the reply lands where it was meant to. Text sends, split replies, and file/voice uploads all take that path; a true deleted thread still falls back to the parent channel, the retry is bounded to one attempt, and a reference already known to be bad is never restored on fallback.
+
+### Verification
+
+- Regression tests cover an unknown reference retried in the same thread and in a channel, the single bounded retry, an unrelated network failure not being retried, a genuine `UNKNOWN_CHANNEL` still falling back, the dead-thread fallback not restoring a rejected reference, uploads taking the same retry path (in-thread and after a parent-channel fallback), and a rejected reference being dropped from the remaining chunks of a split reply. Nine fail against the pre-fix adapter.
+
 ## [0.5.1] - 2026-10-13
 
 ### Fixed

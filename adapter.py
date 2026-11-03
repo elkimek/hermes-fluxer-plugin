@@ -639,6 +639,21 @@ def _open_session_store(home: Optional[Path] = None) -> Optional[Any]:
         return None
 
 
+def _is_unknown_message_error(exc: BaseException) -> bool:
+    """True when Fluxer rejected the outbound message as unknown.
+
+    Fluxer answers a ``message_reference`` that points at a message it cannot see
+    (a stale anchor, or one that lives in another container) with
+    ``404 UNKNOWN_MESSAGE``. That names the reference, not the channel or thread
+    the request was sent to, so the caller retries in the SAME container without
+    the reference instead of abandoning the delivery target.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    body = str(getattr(response, "text", "") or "").lower()
+    return status == 404 and ("unknown message" in body or "unknown_message" in body)
+
+
 def _is_missing_channel_error(exc: BaseException) -> bool:
     """True when ``exc`` means the target channel or thread no longer exists.
 
@@ -646,6 +661,13 @@ def _is_missing_channel_error(exc: BaseException) -> bool:
     thread has to be abandoned rather than failing the send. The status is read
     off the httpx error the REST helpers raise; any other failure is a real
     delivery problem and must not be silently redirected to the parent channel.
+
+    A 404 is deliberately NOT classified by body here: Fluxer answers a stale
+    ``message_reference`` with 404 ``UNKNOWN_MESSAGE`` and, because a thread's id
+    is its anchor message's id, a genuinely deleted thread can answer the same
+    way. Callers must therefore retry the reference first (see
+    :func:`_is_unknown_message_error` and ``send``); this predicate only decides
+    whether a *remaining* failure means the container is gone.
     """
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
@@ -1634,6 +1656,39 @@ class FluxerAdapter(BasePlatformAdapter):
             message_ids: List[str] = []
             responses: List[Dict[str, Any]] = []
 
+            # A stale or cross-container ``message_reference`` answers 404
+            # UNKNOWN_MESSAGE. That names the reference, not the delivery
+            # container, so retry ONCE in the same container without it instead
+            # of reading the 404 as a deleted thread (which used to escape to the
+            # parent with the invalid reference still attached) or dropping the
+            # message outright.
+            reference_ok = True
+
+            async def _post_chunk(target: str, body: Dict[str, Any]) -> Dict[str, Any]:
+                nonlocal reference_ok
+                url = f"/channels/{_quote_id(target)}/messages"
+                try:
+                    return await self._request("POST", url, json=body)
+                except Exception as exc:
+                    if not (
+                        reference_ok
+                        and _is_unknown_message_error(exc)
+                        and "message_reference" in body
+                    ):
+                        raise
+                    reference_ok = False
+                    logger.info(
+                        "Fluxer message reference %s is unknown; retrying in %s without it",
+                        reply_to,
+                        target,
+                    )
+                    # Rebuild rather than mutate in place: the dict was already
+                    # handed to a request. Later split chunks are built from the
+                    # shared payload, so the reference is dropped there too.
+                    body = {k: v for k, v in body.items() if k != "message_reference"}
+                    payload.pop("message_reference", None)
+                    return await self._request("POST", url, json=body)
+
             for index, chunk in enumerate(chunks):
                 chunk_payload = self._outbound_message_payload(chunk, **payload)
                 if index > 0 and self._reply_to_mode != "all":
@@ -1644,11 +1699,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     chunk_payload.pop("message_reference", None)
 
                 try:
-                    data = await self._request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        json=chunk_payload,
-                    )
+                    data = await _post_chunk(target_chat_id, chunk_payload)
                 except Exception as exc:
                     # A thread this adapter chose can be deleted between the
                     # progress bubble and the reply. Abandon it and post to the
@@ -1665,7 +1716,12 @@ class FluxerAdapter(BasePlatformAdapter):
                     auto_thread_id = None
                     target_chat_id = str(chat_id)
                     self._known_channel_ids.add(target_chat_id)
-                    if reply_to and self._reply_to_mode != "off":
+                    # A reference already proven unknown is NOT restored: the
+                    # fallback would fail on it for the same reason. Strip it
+                    # everywhere first, then re-add only for a usable reference.
+                    payload.pop("message_reference", None)
+                    chunk_payload.pop("message_reference", None)
+                    if reply_to and self._reply_to_mode != "off" and reference_ok:
                         # Restore the reference in the shared payload as well: the
                         # remaining chunks of a split reply are rebuilt from it, so
                         # patching only this chunk would leave every later one
@@ -1675,11 +1731,7 @@ class FluxerAdapter(BasePlatformAdapter):
                         chunk_payload["message_reference"] = {"message_id": str(reply_to)}
                         if index > 0 and self._reply_to_mode != "all":
                             chunk_payload.pop("message_reference", None)
-                    data = await self._request(
-                        "POST",
-                        f"/channels/{_quote_id(target_chat_id)}/messages",
-                        json=chunk_payload,
-                    )
+                    data = await _post_chunk(target_chat_id, chunk_payload)
                 responses.append(data)
                 if data.get("id"):
                     message_id = str(data["id"])
@@ -2820,37 +2872,77 @@ class FluxerAdapter(BasePlatformAdapter):
         payload["attachments"] = [attachment]
 
         try:
-            try:
-                data = await self._multipart_request(
-                    "POST",
-                    f"/channels/{_quote_id(target_chat_id)}/messages",
-                    payload=payload,
-                    files=[("files[0]", path, filename)],
-                )
-            except Exception as exc:
-                # Same deleted-thread fallback as text sends: an upload must not
-                # fail just because the thread this adapter chose was removed.
-                if not (auto_thread_id and _is_missing_channel_error(exc)):
-                    raise
-                logger.info(
-                    "Fluxer thread %s is gone; uploading to channel %s instead",
-                    auto_thread_id,
-                    chat_id,
-                )
-                self._forget_thread(auto_thread_id)
-                self._disable_turn_thread(chat_id, reply_to, metadata)
-                auto_thread_id = None
-                target_chat_id = str(chat_id)
-                self._known_channel_ids.add(target_chat_id)
-                payload.pop("message_reference", None)
-                if reply_to and self._reply_to_mode != "off":
-                    payload["message_reference"] = {"message_id": str(reply_to)}
-                data = await self._multipart_request(
-                    "POST",
-                    f"/channels/{_quote_id(target_chat_id)}/messages",
-                    payload=payload,
-                    files=[("files[0]", path, filename)],
-                )
+            # Two attempts maximum, mirroring text sends: a 404 UNKNOWN_MESSAGE
+            # names the message_reference, so retry once in the SAME container
+            # without it rather than abandoning the thread.
+            reference_rejected = False
+            for attempt in range(2):
+                try:
+                    data = await self._multipart_request(
+                        "POST",
+                        f"/channels/{_quote_id(target_chat_id)}/messages",
+                        payload=payload,
+                        files=[("files[0]", path, filename)],
+                    )
+                    break
+                except Exception as exc:
+                    if (
+                        attempt == 0
+                        and _is_unknown_message_error(exc)
+                        and "message_reference" in payload
+                    ):
+                        logger.info(
+                            "Fluxer message reference %s is unknown; retrying upload in %s without it",
+                            reply_to,
+                            target_chat_id,
+                        )
+                        reference_rejected = True
+                        payload = {
+                            k: v for k, v in payload.items() if k != "message_reference"
+                        }
+                        continue
+                    # Same deleted-thread fallback as text sends: an upload must
+                    # not fail just because the thread this adapter chose was
+                    # removed.
+                    if not (auto_thread_id and _is_missing_channel_error(exc)):
+                        raise
+                    logger.info(
+                        "Fluxer thread %s is gone; uploading to channel %s instead",
+                        auto_thread_id,
+                        chat_id,
+                    )
+                    self._forget_thread(auto_thread_id)
+                    self._disable_turn_thread(chat_id, reply_to, metadata)
+                    auto_thread_id = None
+                    target_chat_id = str(chat_id)
+                    self._known_channel_ids.add(target_chat_id)
+                    payload.pop("message_reference", None)
+                    # A reference already proven unknown is not restored: it
+                    # would fail the fallback for the same reason.
+                    if reply_to and self._reply_to_mode != "off" and not reference_rejected:
+                        payload["message_reference"] = {"message_id": str(reply_to)}
+                    try:
+                        data = await self._multipart_request(
+                            "POST",
+                            f"/channels/{_quote_id(target_chat_id)}/messages",
+                            payload=payload,
+                            files=[("files[0]", path, filename)],
+                        )
+                    except Exception as fallback_exc:
+                        if not (
+                            _is_unknown_message_error(fallback_exc)
+                            and "message_reference" in payload
+                        ):
+                            raise
+                        reference_rejected = True
+                        payload = {k: v for k, v in payload.items() if k != "message_reference"}
+                        data = await self._multipart_request(
+                            "POST",
+                            f"/channels/{_quote_id(target_chat_id)}/messages",
+                            payload=payload,
+                            files=[("files[0]", path, filename)],
+                        )
+                    break
             message_id = str(data.get("id")) if data.get("id") else None
             # Edits/deletes must target the thread, not the caller's channel.
             self._remember_message_destination(message_id, target_chat_id)

@@ -3059,6 +3059,285 @@ async def test_a_non_missing_failure_is_not_redirected_to_the_channel(monkeypatc
     assert adapter._threads_by_anchor[("chan-1", "user-msg-1")] == "thread-1"
 
 
+UNKNOWN_MESSAGE_BODY = '{"code":"UNKNOWN_MESSAGE","message":"Unknown Message"}'
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_reference_retries_in_the_same_thread_without_it(monkeypatch):
+    """A cross-container message_reference must not cost the thread delivery.
+
+    Fluxer answers a reference it cannot resolve with 404 UNKNOWN_MESSAGE. An
+    in-thread reply references an inbound message that lives in the parent
+    channel, so this is the ordinary shape of that failure: the thread is alive
+    and the reply must land in it, unlinked, instead of being dropped or pushed
+    out to the parent channel.
+    """
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            {"id": "reply-1"},
+        ]
+    )
+
+    result = await adapter.send(
+        "chan-1", "the reply", reply_to="stale-msg", metadata={"thread_id": "thread-7"}
+    )
+
+    assert result.success is True
+    assert result.message_id == "reply-1"
+    calls = adapter._request.await_args_list
+    assert [c.args for c in calls] == [
+        ("POST", "/channels/thread-7/messages"),
+        ("POST", "/channels/thread-7/messages"),
+    ]
+    assert calls[0].kwargs["json"]["message_reference"] == {"message_id": "stale-msg"}
+    assert "message_reference" not in calls[1].kwargs["json"]
+    # The thread stays the destination, so later edits/typing do not escape it.
+    assert adapter._destination_for_message("reply-1", "chan-1") == "thread-7"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_reference_in_the_channel_retries_in_that_channel(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            {"id": "reply-1"},
+        ]
+    )
+
+    result = await adapter.send("chan-1", "the reply", reply_to="stale-msg")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    assert [c.args for c in calls] == [
+        ("POST", "/channels/chan-1/messages"),
+        ("POST", "/channels/chan-1/messages"),
+    ]
+    assert calls[0].kwargs["json"]["message_reference"] == {"message_id": "stale-msg"}
+    assert "message_reference" not in calls[1].kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_reference_retry_is_bounded(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+        ]
+    )
+
+    result = await adapter.send(
+        "chan-1", "the reply", reply_to="stale-msg", metadata={"thread_id": "thread-7"}
+    )
+
+    # Exactly one retry, then the failure surfaces. No loop, no parent-channel post.
+    assert result.success is False
+    assert result.retryable is True
+    assert [c.args for c in adapter._request.await_args_list] == [
+        ("POST", "/channels/thread-7/messages"),
+        ("POST", "/channels/thread-7/messages"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_reference_in_first_split_chunk_is_removed_from_later_chunks(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(reply_to_mode="all")
+    adapter._verify_delivery = AsyncMock(return_value=None)
+    state = {"calls": 0}
+
+    async def _request(_method, _path, **_kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise _RestStatusError(404, UNKNOWN_MESSAGE_BODY)
+        return {"id": f"chunk-{state['calls']}"}
+
+    adapter._request = AsyncMock(side_effect=_request)
+
+    result = await adapter.send(
+        "chan-1", "line\n" * 2000, reply_to="stale-msg", metadata={"thread_id": "thread-7"}
+    )
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    posts = [call for call in calls if call.args == ("POST", "/channels/thread-7/messages")]
+    assert len(posts) > 3
+    assert posts[0].kwargs["json"]["message_reference"] == {"message_id": "stale-msg"}
+    assert all("message_reference" not in post.kwargs["json"] for post in posts[1:])
+
+
+@pytest.mark.asyncio
+async def test_a_network_failure_after_an_unknown_reference_is_not_retried(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+    adapter._request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            RuntimeError("connection reset"),
+        ]
+    )
+
+    result = await adapter.send(
+        "chan-1", "the reply", reply_to="stale-msg", metadata={"thread_id": "thread-7"}
+    )
+
+    assert result.success is False
+    assert len(adapter._request.await_args_list) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_second_unknown_message_after_the_reference_is_dropped_is_a_dead_thread(monkeypatch):
+    """Once the reference is gone, a remaining 404 cannot be about the reference.
+
+    The retried body carries no ``message_reference``, so a second 404 means the
+    delivery container itself is gone and the deleted-thread fallback must rescue
+    the send -- without reattaching the reference it just proved bad.
+    """
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+
+    async def _target(_chat_id, _reply_to, _metadata):
+        return "thread-1", {"message_reference": {"message_id": "stale-msg"}}, "thread-1"
+
+    monkeypatch.setattr(adapter, "_resolve_outbound_target", _target)
+    adapter._request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            {"id": "fallback-1"},
+        ]
+    )
+
+    result = await adapter.send("chan-1", "the reply", reply_to="stale-msg")
+
+    assert result.success is True
+    assert result.message_id == "fallback-1"
+    calls = adapter._request.await_args_list
+    assert [c.args[1] for c in calls] == [
+        "/channels/thread-1/messages",
+        "/channels/thread-1/messages",
+        "/channels/chan-1/messages",
+    ]
+    # A reference the server already rejected is never restored on fallback.
+    assert "message_reference" not in calls[2].kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_unknown_channel_still_falls_back_to_the_parent(monkeypatch):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._request = AsyncMock(
+        side_effect=[
+            {"id": "thread-1"},
+            _RestStatusError(404, '{"code":"UNKNOWN_CHANNEL"}'),
+            {"id": "fallback-1"},
+        ]
+    )
+
+    result = await adapter.send("chan-1", "the reply", reply_to="user-msg-1")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    assert calls[2].args == ("POST", "/channels/chan-1/messages")
+    assert calls[2].kwargs["json"]["message_reference"] == {"message_id": "user-msg-1"}
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_reference_is_not_restored_when_the_thread_is_also_gone(monkeypatch):
+    """A reference already proven unknown must not be reattached on fallback.
+
+    ``send`` can receive a thread destination and a reference together (an
+    explicit thread id with a reply reference). If the thread turns out to be
+    gone after the reference was rejected, restoring the reference would fail the
+    parent-channel delivery for exactly the same reason.
+    """
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    adapter = _send_adapter()
+
+    async def _target(_chat_id, _reply_to, _metadata):
+        return "thread-1", {"message_reference": {"message_id": "stale-msg"}}, "thread-1"
+
+    monkeypatch.setattr(adapter, "_resolve_outbound_target", _target)
+    adapter._request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            _RestStatusError(404, '{"code":"UNKNOWN_CHANNEL"}'),
+            {"id": "fallback-1"},
+        ]
+    )
+
+    result = await adapter.send("chan-1", "the reply", reply_to="stale-msg")
+
+    assert result.success is True
+    calls = adapter._request.await_args_list
+    assert calls[1].args == ("POST", "/channels/thread-1/messages")
+    assert "message_reference" not in calls[1].kwargs["json"]
+    assert calls[2].args == ("POST", "/channels/chan-1/messages")
+    assert "message_reference" not in calls[2].kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_reference_during_an_upload_retries_in_the_same_thread(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    adapter = _send_adapter()
+    adapter._multipart_request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            {"id": "file-1"},
+        ]
+    )
+
+    result = await adapter._send_file_message(
+        "chan-1", str(document), reply_to="stale-msg", metadata={"thread_id": "thread-7"}
+    )
+
+    assert result.success is True
+    uploads = adapter._multipart_request.await_args_list
+    assert uploads[0].args[1] == "/channels/thread-7/messages"
+    assert uploads[0].kwargs["payload"]["message_reference"] == {"message_id": "stale-msg"}
+    assert uploads[1].args[1] == "/channels/thread-7/messages"
+    assert "message_reference" not in uploads[1].kwargs["payload"]
+    assert result.message_id == "file-1"
+
+
+@pytest.mark.asyncio
+async def test_upload_unknown_reference_on_parent_fallback_retries_without_it(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
+    document = tmp_path / "report.pdf"
+    document.write_bytes(b"%PDF-1.4")
+    adapter = _send_adapter(thread_reply_channels=["chan-1"])
+    adapter._last_inbound_by_chat["chan-1"] = "user-msg-1"
+    adapter._request = AsyncMock(return_value={"id": "thread-1"})
+    adapter._multipart_request = AsyncMock(
+        side_effect=[
+            _RestStatusError(404),
+            _RestStatusError(404, UNKNOWN_MESSAGE_BODY),
+            {"id": "file-1"},
+        ]
+    )
+
+    result = await adapter._send_file_message("chan-1", str(document), reply_to="user-msg-1")
+
+    assert result.success is True
+    calls = adapter._multipart_request.await_args_list
+    assert [call.args[1] for call in calls] == [
+        "/channels/thread-1/messages",
+        "/channels/chan-1/messages",
+        "/channels/chan-1/messages",
+    ]
+    assert calls[1].kwargs["payload"]["message_reference"] == {"message_id": "user-msg-1"}
+    assert "message_reference" not in calls[2].kwargs["payload"]
+
+
 @pytest.mark.asyncio
 async def test_a_deleted_thread_during_an_upload_falls_back_to_the_channel(monkeypatch, tmp_path):
     monkeypatch.delenv("FLUXER_THREAD_REPLIES", raising=False)
