@@ -10,6 +10,14 @@ This project uses simple semantic versioning while the plugin is young:
 
 ## [Unreleased]
 
+### Fixed
+
+- Scheduled notifications and bare-platform sends now use the correct home channel when it is configured in Hermes' structured YAML format. Existing environment overrides, scalar channel settings, and profile isolation are preserved.
+
+### Verification
+
+- Regression tests cover structured home channels, standalone environment seeding, missing channel IDs, environment precedence, profile isolation, and list-based access settings.
+
 ## [0.5.1] - 2026-10-13
 
 ### Fixed

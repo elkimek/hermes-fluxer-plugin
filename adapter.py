@@ -4044,7 +4044,19 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
     }
     for key, env_name in scalar_env.items():
         if not scoped_load and key in cfg:
-            _set_env_default(env_name, cfg.get(key))
+            value = cfg.get(key)
+            if key == "home_channel" and isinstance(value, dict):
+                # Hermes' canonical home channel is structured. Only its chat
+                # ID belongs in the environment seed used by standalone sends.
+                channel_id = value.get("chat_id")
+                if not isinstance(channel_id, (str, int)) or isinstance(channel_id, bool):
+                    continue
+                _set_env_default(env_name, channel_id)
+                name = value.get("name")
+                if isinstance(name, str):
+                    _set_env_default("FLUXER_HOME_CHANNEL_NAME", name)
+            else:
+                _set_env_default(env_name, value)
 
     voice_raw = cfg.get("voice")
     voice: dict = voice_raw if isinstance(voice_raw, dict) else {}
