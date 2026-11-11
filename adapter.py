@@ -2734,6 +2734,11 @@ class FluxerAdapter(BasePlatformAdapter):
             self._turn_context.reset(marker)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+        # Idle-session expiry (SimpleX parity): a route quiet past the configured window is
+        # suspended now; the runner's next get_or_create_session auto-resets it, so the message
+        # that woke it starts the fresh session. Lazy by design — nothing fires while idle, and
+        # an active session never expires mid-work.
+        self._maybe_idle_reset(session_key, event.source)
         # Pending drains can run in the previous turn's task. Rebind to their
         # actual event, keeping ownership until final/footer/media delivery ends.
         marker = self._turn_context.set((event, session_key))
@@ -2750,6 +2755,54 @@ class FluxerAdapter(BasePlatformAdapter):
                 self._turn_anchor.pop(key, None)
                 self._turn_thread_disabled.discard(key)
                 self._turn_context.reset(marker)
+
+    def _idle_reset_window_seconds(self) -> float:
+        """Idle window before a quiet session is suspended for a fresh start; 0 disables.
+
+        Config: platforms.fluxer.extra.idle_reset_hours (default 3).
+        """
+        return self._coerce_float_extra("idle_reset_hours", 3.0, min_value=0.0, max_value=24.0) * 3600.0
+
+    def _maybe_idle_reset(self, session_key: str, source: Any) -> None:
+        """Suspend a session idle past the window so the current message starts a fresh one.
+
+        Mirrors the SimpleX-era behaviour: the session is NOT torn down while idle (it would
+        just re-expire and re-announce); it is suspended lazily, and the runner's
+        get_or_create_session turns the suspension into an auto-reset for the waking message.
+        """
+        store = getattr(self, "_session_store", None)
+        window = self._idle_reset_window_seconds()
+        if store is None or window <= 0:
+            return
+        try:
+            entry = store.lookup_by_session_key(session_key)
+            if entry is None or getattr(entry, "suspended", False):
+                return
+            if not getattr(entry, "last_prompt_tokens", 0):
+                return  # never had a real turn; nothing to reset
+            updated = getattr(entry, "updated_at", None)
+            if not isinstance(updated, datetime):
+                return
+            age = (datetime.now() - updated).total_seconds()  # store clock is local-naive
+            if age <= window:
+                return
+            if store.suspend_session(session_key):
+                hours = age / 3600.0
+                logger.info(
+                    "fluxer: route %s idle %.1fh — suspended; this message starts fresh",
+                    session_key, hours,
+                )
+                chat_id = str(getattr(source, "chat_id", "") or "").strip()
+                if chat_id:
+                    asyncio.create_task(self._notify_idle_reset(chat_id, hours))
+        except Exception:
+            logger.debug("fluxer: idle-reset check failed", exc_info=True)
+
+    async def _notify_idle_reset(self, chat_id: str, hours: float) -> None:
+        try:
+            await self.send(chat_id, f"⏳ {hours:.1f}h of quiet — closed that session. This message starts a fresh one.")
+        except Exception:
+            logger.debug("fluxer: idle-reset notice failed", exc_info=True)
 
     def _register_active_auto_thread(self, source: Any) -> Optional[tuple[str, str, str]]:
         """Track a turn executing in this adapter's own thread, for parent commands.
