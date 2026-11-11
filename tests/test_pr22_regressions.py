@@ -57,11 +57,13 @@ async def test_reaction_forward_rejects_other_bots():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("channel_type", [0, 2, 3, 11])
-async def test_reaction_forward_checks_channel_not_missing_guild(channel_type):
+async def test_reaction_forward_includes_guild_channels(channel_type):
     adapter = reaction_adapter()
     requests_for(adapter, channel_type=channel_type)
     await adapter._handle_reaction_add(reaction_data())
-    adapter.handle_message.assert_not_awaited()
+    # Decision reactions are now forwarded in guild channels too, not just DMs:
+    # the answer is routed through the same handle_message path as in a DM.
+    adapter.handle_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio

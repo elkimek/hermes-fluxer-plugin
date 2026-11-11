@@ -3994,7 +3994,12 @@ async def test_reaction_forward_guards(monkeypatch):
         data, message_id="m-9", channel_id="chan-unknown", emoji="1\u20e3"
     )
 
-    assert forwarded == []
+    # The guild-channel keycap and the DM approve both forward now (the old
+    # DM-only gate is gone); the stranger and the unknown-channel reactions are
+    # still blocked by the security gates.
+    assert len(forwarded) == 2
+    forwarded_emojis = sorted(event.raw_message["emoji"] for event in forwarded)
+    assert forwarded_emojis == sorted(["2\u20e3", "\u2705"])
 
 
 @pytest.mark.asyncio
