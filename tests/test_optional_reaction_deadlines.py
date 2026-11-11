@@ -217,7 +217,7 @@ async def test_resolved_approval_ui_cannot_stall_event_dispatch(instance, resolv
     await within_budget(method(action, user_id="user", interaction=data))
     assert entered == [("POST" if interaction else "PATCH", 0, 1)]
     if kind == "exec":
-        resolvers[1].resolve_gateway_approval.assert_called_once_with("session", "once")
+        resolvers[1].resolve_gateway_approval.assert_called_once_with("session", "once", request_id=None)
     else:
         resolvers[2].resolve.assert_awaited_once_with("session", "confirm", "once")
     assert_no_new_tasks(before)
