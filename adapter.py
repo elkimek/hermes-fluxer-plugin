@@ -2263,30 +2263,28 @@ class FluxerAdapter(BasePlatformAdapter):
             logger.warning("Fluxer send failed: %s", exc)
             return SendResult(success=False, error=str(exc), retryable=True)
 
-    async def send_exec_approval(
-        self,
-        chat_id: str,
-        command: str,
-        session_key: str,
-        description: str = "dangerous command",
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Send a dangerous-command approval prompt with clickable reactions."""
-        target_id = await self._resolve_thread_container(chat_id, metadata, session_key)
-        cmd_display = command if len(command) <= 3200 else command[:3197] + "..."
-        reaction_hint = " • ".join(f"{emoji} {label}" for emoji, _choice, label in _EXEC_APPROVAL_REACTIONS)
-        content = (
-            "**Command approval required**\n"
-            f"```\n{cmd_display}\n```\n"
-            f"Reason: {description}\n\n"
-            f"React: {reaction_hint}\n"
-            "Reply with `/approve once`, `/approve session`, `/approve always`, or `/deny`."
-        )
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        """Native exec-approval render: the base ``send_exec_approval`` builds ``prompt``
+        (shared localized wording, tier set honouring allow_permanent/allow_session/
+        smart_denied); this hook renders it with buttons + decision reactions. Overriding
+        the hook is what makes ``supports_exec_approval_buttons()`` true, so the runner
+        stops sending the plain-text ``/approve`` fallback."""
+        session_key = str(prompt.session_key or "")
+        request_id = getattr(prompt, "request_id", None)
+        target_id = await self._resolve_thread_container(prompt.chat_id, prompt.metadata, session_key)
+        choice_emoji = {choice: emoji for emoji, choice, _label in _EXEC_APPROVAL_REACTIONS}
+        actions = [
+            (label, choice, style)
+            for label, choice, style in prompt.actions
+            if choice_emoji.get(choice)
+        ]
+        reaction_hint = " • ".join(f"{choice_emoji[c]} {c}" for _l, c, _s in actions)
+        content = f"{prompt.text}\n\nReact: {reaction_hint}"
         try:
             self._known_channel_ids.add(target_id)
             buttons, component_actions = _fluxer_action_buttons(
                 prefix="fluxer_exec",
-                specs=_EXEC_APPROVAL_REACTIONS,
+                specs=tuple((choice_emoji[c], c, label) for label, c, _s in actions),
                 danger_choice="deny",
             )
             data, components_enabled = await self._post_message_with_optional_components(
@@ -2298,14 +2296,14 @@ class FluxerAdapter(BasePlatformAdapter):
             if not message_id:
                 return SendResult(success=False, error="Fluxer approval message missing id", retryable=True)
 
-            pending = {
+            self._pending_exec_approvals[message_id] = {
                 "session_key": session_key,
                 "channel_id": target_id,
                 "created_at": time.time(),
                 "content": content,
                 "resolved": False,
+                "request_id": request_id,
             }
-            self._pending_exec_approvals[message_id] = pending
             if components_enabled:
                 self._register_component_actions(
                     component_actions,
@@ -2313,17 +2311,20 @@ class FluxerAdapter(BasePlatformAdapter):
                     message_id=message_id,
                     session_key=session_key,
                     channel_id=target_id,
+                    request_id=request_id,
                 )
-            for emoji, choice, _label in _EXEC_APPROVAL_REACTIONS:
+            for label, choice, _style in actions:
+                emoji = choice_emoji[choice]
                 self._pending_reaction_actions[f"{message_id}:{_normalize_reaction_emoji(emoji)}"] = {
                     "kind": "exec_approval",
                     "message_id": message_id,
                     "session_key": session_key,
                     "channel_id": target_id,
                     "choice": choice,
+                    "request_id": request_id,
                 }
             await self._add_optional_reactions(
-                target_id, message_id, [emoji for emoji, _choice, _label in _EXEC_APPROVAL_REACTIONS]
+                target_id, message_id, [choice_emoji[c] for _l, c, _s in actions]
             )
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
@@ -4401,6 +4402,7 @@ class FluxerAdapter(BasePlatformAdapter):
         channel_id: str,
         session_key: str,
         confirm_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> None:
         """Register Fluxer native button custom IDs for a pending prompt."""
         for custom_id, choice in actions:
@@ -4413,6 +4415,8 @@ class FluxerAdapter(BasePlatformAdapter):
             }
             if confirm_id is not None:
                 state["confirm_id"] = confirm_id
+            if request_id is not None:
+                state["request_id"] = request_id
             self._pending_component_actions[custom_id] = state
 
     async def _post_message_with_optional_components(
@@ -5262,7 +5266,7 @@ class FluxerAdapter(BasePlatformAdapter):
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, choice)
+            count = resolve_gateway_approval(session_key, choice, request_id=action.get("request_id"))
             logger.info("Fluxer approval action resolved %d approval(s) for session %s (choice=%s user=%s)", count, session_key, choice, user_id)
         except Exception as exc:
             logger.error("Fluxer component approval resolve failed: %s", exc)
