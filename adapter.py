@@ -635,6 +635,53 @@ def _state_db_path(home: Optional[Path] = None) -> Optional[Path]:
     return path if path.exists() else None
 
 
+_INBOUND_WATERMARK_FILE = "fluxer_watermark.json"
+
+
+def _inbound_watermark_path(home: Optional[Path] = None) -> Path:
+    return (Path(home) if home is not None else _current_session_home()) / _INBOUND_WATERMARK_FILE
+
+
+def _load_inbound_watermarks(home: Optional[Path] = None) -> Dict[str, int]:
+    """Channel -> highest inbound message ID already handled, from disk.
+
+    The in-process ``_seen_message_ids`` set is memory-only, so a gateway
+    restart wipes it and backlog recovery redelivers — and re-executes —
+    anything still sitting in a channel (a ``/restart`` typed in chat once
+    restarted the gateway forever). The persisted watermark is what stops
+    that. A missing, unreadable, or malformed file degrades to an empty
+    watermark: recovery falls back to the old behaviour, never to a dead
+    channel.
+    """
+    try:
+        raw = json.loads(_inbound_watermark_path(home).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    channels = raw.get("channels") if isinstance(raw, dict) else None
+    if not isinstance(channels, dict):
+        return {}
+    out: Dict[str, int] = {}
+    for channel_id, value in channels.items():
+        try:
+            out[str(channel_id)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_inbound_watermarks(watermarks: Dict[str, int], home: Optional[Path] = None) -> None:
+    """Persist watermarks atomically; a failed write is logged and retried next mark."""
+    target = _inbound_watermark_path(home)
+    payload = json.dumps({"version": 1, "channels": watermarks}, separators=(",", ":"))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        logger.debug("Fluxer watermark persist failed (%s)", type(exc).__name__)
+
+
 def _open_session_store(home: Optional[Path] = None) -> Optional[Any]:
     """Hermes' own session store, opened read-only, or ``None`` when unavailable.
 
@@ -1611,6 +1658,12 @@ class FluxerAdapter(BasePlatformAdapter):
         self._awaiting_heartbeat_ack = False
         self._closing = False
         self._seen_message_ids: OrderedDict[str, None] = OrderedDict()
+        # Persistent counterpart of ``_seen_message_ids``: per-channel, the
+        # highest inbound message ID already handled, surviving gateway
+        # restarts. Backlog recovery consults it so a restart cannot
+        # re-action a command that is still sitting in the channel.
+        self._watermark_home = _current_session_home()
+        self._inbound_watermarks: Dict[str, int] = _load_inbound_watermarks(self._watermark_home)
         self._last_inbound_by_chat: OrderedDict[str, str] = OrderedDict()
         # Text of the most recent inbound messages, keyed by message id: the thread
         # a turn opens is named from the message that triggered it.
@@ -4392,6 +4445,42 @@ class FluxerAdapter(BasePlatformAdapter):
             self._seen_message_ids.popitem(last=False)
         return True
 
+    def _mark_inbound_seen(self, channel_id: str, message_id: str) -> None:
+        """Raise this channel's persistent watermark past an inbound message ID.
+
+        Fluxer message IDs are snowflakes (time-ordered), so the per-channel
+        maximum is a valid "everything up to here was handled" marker.
+        Non-numeric IDs leave the watermark untouched; a failed persist is
+        swallowed (the next mark retries) — dedup within the process is
+        unaffected either way.
+        """
+        if not channel_id:
+            return
+        try:
+            number = int(message_id)
+        except (TypeError, ValueError):
+            return
+        current = self._inbound_watermarks.get(channel_id)
+        if current is not None and number <= current:
+            return
+        self._inbound_watermarks[channel_id] = number
+        _save_inbound_watermarks(self._inbound_watermarks, self._watermark_home)
+
+    def _backlog_already_handled(self, channel_id: str, message_id: str) -> bool:
+        """True when recovery may skip a message: seen this process, or at/below
+        the persisted watermark from a previous one."""
+        if not message_id:
+            return False
+        if message_id in self._seen_message_ids:
+            return True
+        watermark = self._inbound_watermarks.get(channel_id)
+        if watermark is None:
+            return False
+        try:
+            return int(message_id) <= watermark
+        except (TypeError, ValueError):
+            return False
+
     def _register_component_actions(
         self,
         actions: List[tuple[str, str]],
@@ -4757,7 +4846,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     if not message.get("channel_id"):
                         message = {**message, "channel_id": channel_id}
                     msg_id = str(message.get("id") or "")
-                    if msg_id and msg_id in self._seen_message_ids:
+                    if msg_id and self._backlog_already_handled(channel_id, msg_id):
                         continue
                     await self._handle_message_create(
                         message,
@@ -5636,6 +5725,7 @@ class FluxerAdapter(BasePlatformAdapter):
         if not channel_id:
             return
         self._known_channel_ids.add(channel_id)
+        self._mark_inbound_seen(channel_id, msg_id)
         reply_to_message_id, reply_to_text = await self._resolve_reply_context(data, channel_id)
         chat_type = _chat_type(data.get("channel_type") or (data.get("channel") or {}).get("type"))
         # Fluxer's own MESSAGE_CREATE carries no ``channel_type`` and no nested
