@@ -89,6 +89,9 @@ _VOICE_MESSAGE_FLAG = 1 << 13
 # reaction on any bot message in a DM is forwarded to the agent as a synthetic user message.
 _CLARIFY_REACTION_EMOJIS = tuple(f"{digit}\ufe0f\u20e3" for digit in "1234")
 _REACTION_ANSWER_DIGITS = {f"{digit}\u20e3": digit for digit in "1234"}
+# Decision reactions forwarded for messages with no pending action (drafts,
+# reports, cron outputs): approve/deny. Normalized forms (VS16 stripped).
+_DECISION_REACTION_LABELS = {"\u2705": "approve", "\u274c": "deny"}
 _REACTION_FORWARD_DEDUPE_SECONDS = 600.0
 
 _RECONNECT_BASE_DELAY = 2.0
@@ -5110,17 +5113,18 @@ class FluxerAdapter(BasePlatformAdapter):
     async def _maybe_forward_reaction_answer(
         self, data: Dict[str, Any], *, message_id: str, channel_id: str, emoji: str
     ) -> None:
-        """Forward a keycap reaction on a bot message in a DM as a synthetic user message.
+        """Forward decision reactions on a bot message as a synthetic user message.
 
         The gateway resolves reactions only while a matching pending action exists;
         decision asks that arrive as plain messages (cron/monitor reports) register no
-        action, so their keycap reactions are re-delivered to the agent as an ordinary
-        message the turn can act on.
+        action, so their keycap (1-4) and approve/deny (✅/❌) reactions are
+        re-delivered to the agent as an ordinary message the turn can act on.
+        Works in DMs and guild channels alike; the security gates are the
+        allowed-user check and the bot-author check on the reacted message.
         """
         digit = _REACTION_ANSWER_DIGITS.get(emoji)
-        if not digit:
-            return
-        if data.get("guild_id") or ((data.get("guild") or {}).get("id")):
+        label = _DECISION_REACTION_LABELS.get(emoji)
+        if not digit and not label:
             return
         user = data.get("user") or ((data.get("member") or {}).get("user") or {})
         user_id = str(data.get("user_id") or user.get("id") or "")
@@ -5142,12 +5146,10 @@ class FluxerAdapter(BasePlatformAdapter):
             return
         self._reaction_forwards_inflight.add(key)
         try:
-            # A missing guild_id is not proof of a DM. Fluxer reaction events
-            # may omit guild context in channels/threads too. Read the channel
-            # and fail closed; never inject their text into a private session.
-            channel = await self._request("GET", f"/channels/{_quote_id(channel_id)}")
-            if channel.get("type") not in (1, "1", "dm", "direct", "private") or channel.get("guild_id"):
-                return
+            # A missing guild_id is not proof of a DM — and channels are fine:
+            # the message-author check below is the real gate. Fail closed on
+            # a missing/unreadable message; never inject foreign text into a
+            # private session.
             message = await self._request(
                 "GET", f"/channels/{_quote_id(channel_id)}/messages/{_quote_id(message_id)}"
             )
@@ -5157,18 +5159,38 @@ class FluxerAdapter(BasePlatformAdapter):
             excerpt = " ".join(str(_message_content(message) or "").split())[:600]
             display_name = str(user.get("username") or user.get("global_name") or user_id)
             synthetic_id = f"reaction-answer-{message_id}-{emoji[0]}-{user_id}-{time.time_ns()}"
+            reaction_desc = f"{digit}\u20e3" if digit else f"{emoji} ({label})"
             text = (
-                f"[reaction answer] {display_name} reacted {digit}\u20e3 to a message from me "
+                f"[reaction answer] {display_name} reacted {reaction_desc} to a message from me "
                 f"in this chat (message {message_id}). That message said:\n> {excerpt}\n\n"
-                "Treat the reaction as their answer or selection for that prompt."
+                "Treat the reaction as their answer, selection, or approve/deny decision for that prompt."
             )
+            # Route the answer to the session that owns this chat: the session key
+            # carries the chat type, and a hardcoded "dm" split guild-channel
+            # reactions into a phantom DM session the user never reads. Resolve the
+            # kind exactly as the MESSAGE_CREATE path does, and normalize threads.
+            # A reaction event carries no content/id, so _resolve_thread_source
+            # passes channels through untouched.
+            chat_type = _chat_type(data.get("channel_type") or (data.get("channel") or {}).get("type"))
+            if not (data.get("channel_type") or (data.get("channel") or {}).get("type")):
+                known_kind = self._classify_untyped_event(channel_id)
+                if known_kind is None:
+                    known_kind = await self._resolve_channel_kind(channel_id)
+                if known_kind:
+                    chat_type = known_kind
+            source_chat_id, source_chat_type, parent_chat_id, pending_parent = await self._resolve_thread_source(
+                data, channel_id, chat_type
+            )
+            if pending_parent:
+                self._threads_pending[source_chat_id] = pending_parent
             source = self.build_source(
-                chat_id=channel_id,
+                chat_id=source_chat_id,
                 chat_name=None,
-                chat_type="dm",
+                chat_type=source_chat_type,
                 user_id=user_id,
                 user_name=display_name,
-                guild_id=None,
+                guild_id=data.get("guild_id") or (data.get("channel") or {}).get("guild_id"),
+                parent_chat_id=parent_chat_id,
                 message_id=synthetic_id,
             )
             event = MessageEvent(
