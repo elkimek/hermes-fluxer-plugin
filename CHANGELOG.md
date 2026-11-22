@@ -12,7 +12,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Fixed
 
-- Fluxer shows approval buttons on Hermes hosts that supply a request ID. A button or reaction settles only the request shown in its message, subject to the host's approval permissions.
+- Fluxer shows approval buttons on Hermes hosts that supply a request ID. A button or reaction settles only the request shown in its message, subject to the host's approval permissions. A slow response to a rejected click uses the same short time limit as other optional approval updates.
 
 ## [0.6.0] - 2026-11-03
 

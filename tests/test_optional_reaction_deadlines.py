@@ -3,7 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
@@ -220,6 +220,118 @@ async def test_resolved_approval_ui_cannot_stall_event_dispatch(instance, resolv
         resolvers[1].resolve_gateway_approval.assert_called_once_with("session", "once")
     else:
         resolvers[2].resolve.assert_awaited_once_with("session", "confirm", "once")
+    assert_no_new_tasks(before)
+
+
+@pytest.fixture
+def shared_approval(instance, resolvers, monkeypatch):
+    base_send = Mock()
+    resolver = Mock(return_value=1)
+    resolvers[1].resolve_gateway_approval_card = resolver
+
+    async def send(adapter, chat_id, command, session_key, description, metadata, **flags):
+        base_send(chat_id, command, session_key, description, metadata, **flags)
+        return await adapter._send_exec_approval_prompt(SimpleNamespace(
+            chat_id=chat_id,
+            session_key=session_key,
+            metadata=metadata,
+            text=command,
+            request_id=flags["request_id"],
+            actions=[("Approve once", "once", ""), ("Deny", "deny", "")],
+        ))
+
+    monkeypatch.setattr(fluxer.BasePlatformAdapter, "supports_exec_approval_buttons", lambda: True, raising=False)
+    monkeypatch.setattr(fluxer.BasePlatformAdapter, "send_exec_approval", send, raising=False)
+    instance._post_message_with_optional_components = AsyncMock(side_effect=[
+        ({"id": "message-first"}, True),
+        ({"id": "message-second"}, True),
+    ])
+    instance._add_optional_reactions = AsyncMock()
+    return base_send, resolver
+
+
+def approval_interaction(instance, message_id, user_id):
+    custom_id = next(key for key, action in instance._pending_component_actions.items()
+                     if action["message_id"] == message_id and action["choice"] == "once")
+    return {"id": "interaction", "token": "test-only", "channel_id": "thread",
+            "message": {"id": message_id}, "user": {"id": user_id}, "data": {"custom_id": custom_id}}
+
+
+@pytest.mark.asyncio
+async def test_shared_approval_preserves_host_choices_and_binds_the_click(instance, shared_approval):
+    base_send, resolve = shared_approval
+    metadata = {"thread_id": "thread"}
+    for request_id in ("first", "second"):
+        result = await instance.send_exec_approval(
+            "channel", "echo test", "session", "test", metadata,
+            allow_permanent=False, allow_session=False, smart_denied=True, request_id=request_id,
+        )
+        assert result.success
+
+    base_send.assert_called_with(
+        "channel", "echo test", "session", "test", metadata,
+        allow_permanent=False, allow_session=False, smart_denied=True, request_id="second",
+    )
+    assert {action["choice"] for action in instance._pending_component_actions.values()} == {"once", "deny"}
+    assert {action["choice"] for action in instance._pending_reaction_actions.values()} == {"once", "deny"}
+
+    instance._interaction_user_allowed = Mock(return_value=True)
+    instance._respond_to_interaction = AsyncMock()
+    resolve.side_effect = [0, 1]
+    unrelated = approval_interaction(instance, "message-second", "unrelated")
+    owner = approval_interaction(instance, "message-second", "owner")
+    await instance._handle_component_interaction(unrelated)
+    resolve.assert_called_once_with("session", "once", "second", actor_id="unrelated", extra=instance.config.extra)
+    assert instance._respond_to_interaction.await_args.kwargs["ephemeral"] is True
+    assert set(instance._pending_exec_approvals) == {"message-first", "message-second"}
+
+    await instance._handle_component_interaction(owner)
+    await instance._handle_component_interaction(owner)
+    resolve.assert_called_with("session", "once", "second", actor_id="owner", extra=instance.config.extra)
+    assert resolve.call_count == 2
+    assert set(instance._pending_exec_approvals) == {"message-first"}
+
+
+@pytest.mark.asyncio
+async def test_deleted_shared_approval_denies_only_its_request(instance, shared_approval, resolvers):
+    _, resolve = shared_approval
+    for request_id in ("first", "second"):
+        result = await instance.send_exec_approval("thread", "echo test", "session", request_id=request_id)
+        assert result.success
+
+    await instance._handle_message_delete({"id": "message-second"})
+    await instance._handle_message_delete({"id": "message-second"})
+    resolve.assert_called_once_with("session", "deny", "second")
+    resolvers[1].resolve_gateway_approval.assert_not_called()
+    assert set(instance._pending_exec_approvals) == {"message-first"}
+    assert {action["message_id"] for action in instance._pending_component_actions.values()} == {"message-first"}
+    assert {action["message_id"] for action in instance._pending_reaction_actions.values()} == {"message-first"}
+
+
+@pytest.mark.asyncio
+async def test_rejected_shared_approval_notice_cannot_stall_event_dispatch(instance, shared_approval):
+    _, resolve = shared_approval
+    resolve.return_value = 0
+    result = await instance.send_exec_approval("thread", "echo test", "session", request_id="first")
+    assert result.success
+    instance._interaction_user_allowed = Mock(return_value=True)
+    cancelled = asyncio.Event()
+
+    async def stall(method, path, *, json):
+        assert method == "POST"
+        assert json["type"] == 4 and json["data"]["flags"] == 64
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    instance._request = stall
+    before = asyncio.all_tasks()
+    await within_budget(instance._handle_component_interaction(
+        approval_interaction(instance, "message-first", "unrelated"),
+    ))
+    assert cancelled.is_set()
+    assert "message-first" in instance._pending_exec_approvals
     assert_no_new_tasks(before)
 
 

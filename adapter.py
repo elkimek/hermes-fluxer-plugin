@@ -5302,9 +5302,11 @@ class FluxerAdapter(BasePlatformAdapter):
             count = resolve_gateway_approval(session_key, choice)
         if not count:
             if interaction:
-                await self._respond_to_interaction(
-                    interaction, content="This approval is no longer pending or you cannot answer it.",
-                    ephemeral=True,
+                await self._run_optional_ui(
+                    self._respond_to_interaction(
+                        interaction, content="This approval is no longer pending or you cannot answer it.",
+                        ephemeral=True,
+                    )
                 )
             return
         self._pending_exec_approvals.pop(message_id)
