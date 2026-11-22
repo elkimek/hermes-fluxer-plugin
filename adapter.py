@@ -2268,11 +2268,20 @@ class FluxerAdapter(BasePlatformAdapter):
         chat_id: str,
         command: str,
         session_key: str,
-        description: str = "dangerous command",
+        description: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+        request_id: Optional[str] = None,
     ) -> SendResult:
-        """Send a dangerous-command approval prompt with clickable reactions."""
-        target_id = await self._resolve_thread_container(chat_id, metadata, session_key)
+        if hasattr(BasePlatformAdapter, "supports_exec_approval_buttons"):
+            return await super().send_exec_approval(
+                chat_id, command, session_key, description, metadata,
+                allow_permanent=allow_permanent, allow_session=allow_session,
+                smart_denied=smart_denied, request_id=request_id,
+            )
+        description = "dangerous command" if description is None else description
         cmd_display = command if len(command) <= 3200 else command[:3197] + "..."
         reaction_hint = " • ".join(f"{emoji} {label}" for emoji, _choice, label in _EXEC_APPROVAL_REACTIONS)
         content = (
@@ -2282,11 +2291,29 @@ class FluxerAdapter(BasePlatformAdapter):
             f"React: {reaction_hint}\n"
             "Reply with `/approve once`, `/approve session`, `/approve always`, or `/deny`."
         )
+        return await self._send_fluxer_exec_approval(
+            chat_id, session_key, metadata, content, _EXEC_APPROVAL_REACTIONS,
+        )
+
+    async def _send_exec_approval_prompt(self, prompt) -> SendResult:
+        if not prompt.request_id:
+            return SendResult(success=False, error="Fluxer approval requires a request ID")
+        allowed_choices = {choice for _label, choice, _style in prompt.actions}
+        specs = tuple(spec for spec in _EXEC_APPROVAL_REACTIONS if spec[1] in allowed_choices)
+        return await self._send_fluxer_exec_approval(
+            prompt.chat_id, prompt.session_key, prompt.metadata, prompt.text, specs,
+            request_id=prompt.request_id,
+        )
+
+    async def _send_fluxer_exec_approval(
+        self, chat_id, session_key, metadata, content, specs, *, request_id=None,
+    ) -> SendResult:
+        target_id = await self._resolve_thread_container(chat_id, metadata, session_key)
         try:
             self._known_channel_ids.add(target_id)
             buttons, component_actions = _fluxer_action_buttons(
                 prefix="fluxer_exec",
-                specs=_EXEC_APPROVAL_REACTIONS,
+                specs=specs,
                 danger_choice="deny",
             )
             data, components_enabled = await self._post_message_with_optional_components(
@@ -2301,9 +2328,8 @@ class FluxerAdapter(BasePlatformAdapter):
             pending = {
                 "session_key": session_key,
                 "channel_id": target_id,
-                "created_at": time.time(),
                 "content": content,
-                "resolved": False,
+                "request_id": request_id,
             }
             self._pending_exec_approvals[message_id] = pending
             if components_enabled:
@@ -2314,7 +2340,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     session_key=session_key,
                     channel_id=target_id,
                 )
-            for emoji, choice, _label in _EXEC_APPROVAL_REACTIONS:
+            for emoji, choice, _label in specs:
                 self._pending_reaction_actions[f"{message_id}:{_normalize_reaction_emoji(emoji)}"] = {
                     "kind": "exec_approval",
                     "message_id": message_id,
@@ -2323,7 +2349,7 @@ class FluxerAdapter(BasePlatformAdapter):
                     "choice": choice,
                 }
             await self._add_optional_reactions(
-                target_id, message_id, [emoji for emoji, _choice, _label in _EXEC_APPROVAL_REACTIONS]
+                target_id, message_id, [emoji for emoji, _choice, _label in specs]
             )
             return SendResult(success=True, message_id=message_id, raw_response=data)
         except Exception as exc:
@@ -4928,12 +4954,17 @@ class FluxerAdapter(BasePlatformAdapter):
         user = data.get("user") or ((data.get("member") or {}).get("user") or {})
         return str(user.get("id") or "")
 
-    async def _respond_to_interaction(self, data: Dict[str, Any], *, content: str, components: Optional[List[Dict[str, Any]]] = None) -> None:
+    async def _respond_to_interaction(
+        self, data: Dict[str, Any], *, content: str,
+        components: Optional[List[Dict[str, Any]]] = None, ephemeral: bool = False,
+    ) -> None:
         interaction_id = str(data.get("id") or "")
         token = str(data.get("token") or "")
         if not interaction_id or not token:
             return
-        payload: Dict[str, Any] = {"type": 7, "data": self._outbound_message_payload(content)}
+        payload: Dict[str, Any] = {"type": 4 if ephemeral else 7, "data": self._outbound_message_payload(content)}
+        if ephemeral:
+            payload["data"]["flags"] = 64
         if components is not None:
             payload["data"]["components"] = components
         await self._request("POST", f"/interactions/{_quote_id(interaction_id)}/{_quote_id(token)}/callback", json=payload)
@@ -5245,27 +5276,41 @@ class FluxerAdapter(BasePlatformAdapter):
         if action_channel_id and interaction_channel_id and interaction_channel_id != action_channel_id:
             logger.warning("Fluxer component action %s ignored for mismatched channel %s", custom_id, interaction_channel_id)
             return
-        self._pending_component_actions.pop(custom_id, None)
         if action.get("kind") == "exec_approval":
             await self._resolve_exec_approval_action(action, user_id=user_id, interaction=data)
         elif action.get("kind") == "slash_confirm":
+            self._pending_component_actions.pop(custom_id, None)
             await self._resolve_slash_confirm_action(action, user_id=user_id, interaction=data)
 
     async def _resolve_exec_approval_action(self, action: Dict[str, Any], *, user_id: str, interaction: Optional[Dict[str, Any]] = None) -> None:
         message_id = str(action.get("message_id") or (((interaction or {}).get("message") or {}).get("id")) or "")
-        pending = self._pending_exec_approvals.pop(message_id, None)
-        if not pending or pending.get("resolved"):
+        pending = self._pending_exec_approvals.get(message_id)
+        if not pending:
             return
-        pending["resolved"] = True
-        session_key = str(action.get("session_key") or pending.get("session_key") or "")
+        session_key = pending["session_key"]
+        request_id = pending.get("request_id")
         choice = str(action.get("choice") or "deny")
-        try:
+        if request_id:
+            from tools.approval import resolve_gateway_approval_card
+
+            count = resolve_gateway_approval_card(
+                session_key, choice, request_id, actor_id=user_id, extra=self.config.extra,
+            )
+        else:
             from tools.approval import resolve_gateway_approval
 
             count = resolve_gateway_approval(session_key, choice)
-            logger.info("Fluxer approval action resolved %d approval(s) for session %s (choice=%s user=%s)", count, session_key, choice, user_id)
-        except Exception as exc:
-            logger.error("Fluxer component approval resolve failed: %s", exc)
+        if not count:
+            if interaction:
+                await self._run_optional_ui(
+                    self._respond_to_interaction(
+                        interaction, content="This approval is no longer pending or you cannot answer it.",
+                        ephemeral=True,
+                    )
+                )
+            return
+        self._pending_exec_approvals.pop(message_id)
+        logger.info("Fluxer approval settled (request_id=%s, choice=%s)", request_id, choice)
         for cid, state in list(self._pending_component_actions.items()):
             if state.get("message_id") == message_id:
                 self._pending_component_actions.pop(cid, None)
@@ -5598,14 +5643,19 @@ class FluxerAdapter(BasePlatformAdapter):
                 logger.info("Fluxer deleted slash-confirm prompt cancelled confirm %s", slash_cancel_action.get("confirm_id"))
             except Exception as exc:
                 logger.error("Fluxer deleted slash-confirm prompt cancel failed: %s", exc)
-        if not pending or pending.get("resolved"):
+        if not pending:
             return
-        pending["resolved"] = True
-        session_key = str(pending.get("session_key") or "")
+        session_key = pending["session_key"]
+        request_id = pending.get("request_id")
         try:
-            from tools.approval import resolve_gateway_approval
+            if request_id:
+                from tools.approval import resolve_gateway_approval_card
 
-            count = resolve_gateway_approval(session_key, "deny")
+                count = resolve_gateway_approval_card(session_key, "deny", request_id)
+            else:
+                from tools.approval import resolve_gateway_approval
+
+                count = resolve_gateway_approval(session_key, "deny")
             logger.info(
                 "Fluxer deleted approval prompt denied %d approval(s) for session %s",
                 count,
